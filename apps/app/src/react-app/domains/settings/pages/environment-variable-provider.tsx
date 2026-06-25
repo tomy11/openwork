@@ -9,6 +9,12 @@ import type { EnvironmentVariableItem } from "./environment-variable-table";
 
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const RESERVED_PREFIXES = ["OPENWORK_", "OPENCODE_"] as const;
+const PERSISTABLE_INTERNAL_KEYS = new Set([
+  "OPENWORK_API_KEY",
+  "OPENWORK_MODELS_API_KEY",
+  "OPENWORK_INFERENCE_BASE_URL",
+  "OPENWORK_MODELS_BASE_URL",
+]);
 
 export type ApplyEnvironmentChangesResult = { statusMessage?: string } | void;
 
@@ -26,7 +32,7 @@ function validateKey(key: string): string | null {
   if (!KEY_PATTERN.test(trimmed)) {
     return t("settings.environment.validation_shape");
   }
-  if (RESERVED_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) {
+  if (RESERVED_PREFIXES.some((prefix) => trimmed.startsWith(prefix)) && !PERSISTABLE_INTERNAL_KEYS.has(trimmed)) {
     return t("settings.environment.validation_reserved");
   }
   return null;
@@ -70,6 +76,8 @@ export interface RemoveAsyncOptions {
 }
 
 interface EnvironmentVariableContextValue {
+  canModify: boolean;
+  canApplyChanges: boolean;
   isPendingChanges: boolean;
   applyAsync: UseMutateFunction<ApplyEnvironmentChangesResult | undefined, Error, void, unknown>;
   modifyAsync: UseMutateFunction<unknown, Error, EnvironmentEditorDraft, unknown>;
@@ -180,6 +188,8 @@ export function EnvironmentVariableProvider({ children, client, runtimeKey, onAp
     },
   });
   const value = useMemo<EnvironmentVariableContextValue>(() => ({
+    canModify: client !== null,
+    canApplyChanges: onApplyChanges !== undefined,
     isPendingChanges: data === true,
     applyAsync,
     modifyAsync,
@@ -191,6 +201,8 @@ export function EnvironmentVariableProvider({ children, client, runtimeKey, onAp
     modifyError,
     removeError,
   }), [
+    client,
+    onApplyChanges,
     applyAsync,
     modifyAsync,
     removeAsync,
@@ -256,4 +268,10 @@ export function useIsEnvironmentVariableChangesPending() {
   const { isPendingChanges } = useEnvironmentVariableContext();
 
   return isPendingChanges;
+}
+
+export function useEnvironmentVariableAvailability() {
+  const { canModify, canApplyChanges } = useEnvironmentVariableContext();
+
+  return { canModify, canApplyChanges };
 }

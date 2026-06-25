@@ -89,6 +89,22 @@ export const GOOGLE_WORKSPACE_EXTENSION_ACTIONS = [
   },
   {
     extensionId: GOOGLE_WORKSPACE_EXTENSION_ID,
+    action: "gmail_create_reply_draft",
+    title: "Create Gmail reply draft",
+    description: "Create a Gmail draft reply in an existing thread. This does not send email. Requires Gmail read access (gmail.readonly scope).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string", description: "Gmail message id to reply to." },
+        body: { type: "string", description: "Plain text reply body." },
+        replyAll: { type: "boolean", description: "Reply to everyone on the original message. Defaults to true." },
+      },
+      required: ["messageId", "body"],
+      additionalProperties: false,
+    },
+  },
+  {
+    extensionId: GOOGLE_WORKSPACE_EXTENSION_ID,
     action: "gmail_list_messages",
     title: "List Gmail messages",
     description: "List recent Gmail messages for the connected account. Requires Gmail read access (gmail.readonly scope).",
@@ -105,13 +121,28 @@ export const GOOGLE_WORKSPACE_EXTENSION_ACTIONS = [
     extensionId: GOOGLE_WORKSPACE_EXTENSION_ID,
     action: "gmail_get_message",
     title: "Read Gmail message",
-    description: "Read a Gmail message by id, including its plain text body. Requires Gmail read access (gmail.readonly scope).",
+    description: "Read a Gmail message by id, including its plain text body and attachment metadata. Requires Gmail read access (gmail.readonly scope).",
     inputSchema: {
       type: "object",
       properties: {
         messageId: { type: "string", description: "Gmail message id." },
       },
       required: ["messageId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    extensionId: GOOGLE_WORKSPACE_EXTENSION_ID,
+    action: "gmail_download_attachment",
+    title: "Download Gmail attachment",
+    description: "Download a Gmail attachment by message id and attachment id. Returns base64-encoded attachment bytes. Requires Gmail read access (gmail.readonly scope).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string", description: "Gmail message id." },
+        attachmentId: { type: "string", description: "Gmail attachment id from gmail_get_message attachment metadata." },
+      },
+      required: ["messageId", "attachmentId"],
       additionalProperties: false,
     },
   },
@@ -585,16 +616,78 @@ function stringArrayField(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
 }
 
-function gmailRawMessage(input: { to: string[]; cc?: string[]; bcc?: string[]; subject: string; body: string }): string {
+function gmailRawMessage(input: { to: string[]; cc?: string[]; bcc?: string[]; subject: string; body: string; headers?: { name: string; value: string }[] }): string {
   return [
     `To: ${input.to.join(", ")}`,
     input.cc?.length ? `Cc: ${input.cc.join(", ")}` : null,
     input.bcc?.length ? `Bcc: ${input.bcc.join(", ")}` : null,
     `Subject: ${input.subject}`,
+    ...(input.headers ?? []).map((header) => `${header.name}: ${header.value}`),
     "Content-Type: text/plain; charset=UTF-8",
     "",
     input.body,
   ].filter((line): line is string => typeof line === "string").join("\r\n");
+}
+
+function splitEmailHeader(value: string): string[] {
+  const entries: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  let angleDepth = 0;
+  for (const character of value) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quoted) {
+      current += character;
+      escaped = true;
+      continue;
+    }
+    if (character === "\"") quoted = !quoted;
+    if (!quoted && character === "<") angleDepth += 1;
+    if (!quoted && character === ">" && angleDepth > 0) angleDepth -= 1;
+    if (character === "," && !quoted && angleDepth === 0) {
+      const entry = current.trim();
+      if (entry) entries.push(entry);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  const entry = current.trim();
+  if (entry) entries.push(entry);
+  return entries;
+}
+
+function emailHeaderKey(value: string): string {
+  const match = /<([^<>]+)>/.exec(value);
+  return (match?.[1] ?? value).trim().toLowerCase();
+}
+
+function uniqueEmailHeaders(values: string[], exclude: string[]): string[] {
+  const seen = new Set(exclude.map((value) => value.trim().toLowerCase()).filter(Boolean));
+  const recipients: string[] = [];
+  for (const value of values.flatMap(splitEmailHeader)) {
+    const key = emailHeaderKey(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    recipients.push(value);
+  }
+  return recipients;
+}
+
+function gmailReplySubject(subject: string): string {
+  const trimmed = subject.trim();
+  if (!trimmed) return "Re:";
+  return /^re\s*:/i.test(trimmed) ? trimmed : `Re: ${trimmed}`;
+}
+
+function gmailReplyReferences(references: string, messageId: string): string {
+  const entries = references.trim().split(/\s+/).filter(Boolean);
+  return entries.includes(messageId) ? entries.join(" ") : [...entries, messageId].join(" ");
 }
 
 function requireScope(record: Record<string, unknown>, scope: string, code: string, message: string) {
@@ -634,8 +727,12 @@ function gmailMessageSummary(message: unknown) {
   };
 }
 
+function decodeBase64Url(data: string): Buffer {
+  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
 function decodeGmailBody(data: string): string {
-  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+  return decodeBase64Url(data).toString("utf8");
 }
 
 function gmailMessageText(payload: unknown, mimePrefix = "text/plain"): string {
@@ -649,6 +746,27 @@ function gmailMessageText(payload: unknown, mimePrefix = "text/plain"): string {
     if (text) return text;
   }
   return "";
+}
+
+function gmailAttachmentMetadata(payload: unknown) {
+  const attachments: { attachmentId: string; filename: string; mimeType: string; size: number | null }[] = [];
+  const visit = (part: unknown) => {
+    if (!isRecord(part)) return;
+    const body = isRecord(part.body) ? part.body : null;
+    const attachmentId = typeof body?.attachmentId === "string" ? body.attachmentId : "";
+    if (attachmentId) {
+      attachments.push({
+        attachmentId,
+        filename: typeof part.filename === "string" ? part.filename : "",
+        mimeType: typeof part.mimeType === "string" ? part.mimeType : "",
+        size: typeof body?.size === "number" ? body.size : null,
+      });
+    }
+    const parts = Array.isArray(part.parts) ? part.parts : [];
+    for (const child of parts) visit(child);
+  };
+  visit(payload);
+  return attachments;
 }
 
 async function googleWorkspaceListMessages(config: ServerConfig, args: Record<string, unknown>) {
@@ -684,7 +802,28 @@ async function googleWorkspaceGetMessage(config: ServerConfig, args: Record<stri
   );
   const payload = isRecord(message) ? message.payload : null;
   const body = gmailMessageText(payload) || gmailMessageText(payload, "text/html");
-  return { ...gmailMessageSummary(message), body };
+  return { ...gmailMessageSummary(message), body, attachments: gmailAttachmentMetadata(payload) };
+}
+
+async function googleWorkspaceDownloadAttachment(config: ServerConfig, args: Record<string, unknown>) {
+  const messageId = readStringField(args, "messageId");
+  const attachmentId = readStringField(args, "attachmentId");
+  if (!messageId || !attachmentId) throw new ApiError(400, "invalid_payload", "messageId and attachmentId are required");
+  const { record, accessToken } = await googleWorkspaceAccessToken(config);
+  requireGmailReadScope(record);
+  const attachment = await fetchGoogleJson(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!isRecord(attachment) || typeof attachment.data !== "string") throw new Error("Gmail attachment download did not return data.");
+  const data = attachment.data;
+  const content = decodeBase64Url(data);
+  return {
+    messageId,
+    attachmentId,
+    size: isRecord(attachment) && typeof attachment.size === "number" ? attachment.size : content.byteLength,
+    dataBase64: content.toString("base64"),
+  };
 }
 
 async function googleWorkspaceListEvents(config: ServerConfig, args: Record<string, unknown>) {
@@ -714,6 +853,48 @@ async function googleWorkspaceCreateDraft(config: ServerConfig, args: Record<str
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ message: { raw: base64UrlString(gmailRawMessage({ to, cc, bcc, subject, body })) } }),
+  });
+}
+
+async function googleWorkspaceCreateReplyDraft(config: ServerConfig, args: Record<string, unknown>) {
+  const messageId = readStringField(args, "messageId");
+  const body = typeof args.body === "string" ? args.body : "";
+  const replyAll = args.replyAll !== false;
+  if (!messageId || !body.trim()) throw new ApiError(400, "invalid_payload", "messageId and body are required");
+  const { record, accessToken } = await googleWorkspaceAccessToken(config);
+  requireGmailReadScope(record);
+  const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}`);
+  url.searchParams.set("format", "metadata");
+  for (const header of ["Message-ID", "References", "Reply-To", "Subject", "From", "To", "Cc"]) url.searchParams.append("metadataHeaders", header);
+  const message = await fetchGoogleJson(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
+  const payload = isRecord(message) ? message.payload : null;
+  const threadId = isRecord(message) && typeof message.threadId === "string" ? message.threadId : "";
+  const originalMessageId = gmailHeader(payload, "Message-ID");
+  if (!threadId || !originalMessageId) throw new Error("Gmail message is missing thread metadata required to create a reply draft.");
+  const account = googleWorkspaceSafeAccount(record.account);
+  const ownEmail = typeof account?.email === "string" ? account.email : "";
+  const replyTarget = gmailHeader(payload, "Reply-To") || gmailHeader(payload, "From");
+  const to = uniqueEmailHeaders(replyAll ? [replyTarget, gmailHeader(payload, "To")] : [replyTarget], [ownEmail]);
+  const cc = replyAll ? uniqueEmailHeaders([gmailHeader(payload, "Cc")], [ownEmail, ...to.map(emailHeaderKey)]) : [];
+  if (!to.length) throw new ApiError(400, "invalid_payload", "Original message does not include reply recipients");
+  return fetchGoogleJson("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: {
+        threadId,
+        raw: base64UrlString(gmailRawMessage({
+          to,
+          cc,
+          subject: gmailReplySubject(gmailHeader(payload, "Subject")),
+          body,
+          headers: [
+            { name: "In-Reply-To", value: originalMessageId },
+            { name: "References", value: gmailReplyReferences(gmailHeader(payload, "References"), originalMessageId) },
+          ],
+        })),
+      },
+    }),
   });
 }
 
@@ -835,8 +1016,10 @@ export async function callGoogleWorkspaceExtensionAction(config: ServerConfig, a
   }
   if (action === "calendar_list_events") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceListEvents(config, args), context };
   if (action === "gmail_create_draft") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceCreateDraft(config, args), context };
+  if (action === "gmail_create_reply_draft") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceCreateReplyDraft(config, args), context };
   if (action === "gmail_list_messages") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceListMessages(config, args), context };
   if (action === "gmail_get_message") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceGetMessage(config, args), context };
+  if (action === "gmail_download_attachment") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceDownloadAttachment(config, args), context };
   if (action === "drive_search_files") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceSearchFiles(config, args), context };
   if (action === "drive_read_file") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceReadFile(config, args), context };
   if (action === "drive_update_file") return { ok: true, extensionId: GOOGLE_WORKSPACE_EXTENSION_ID, action, result: await googleWorkspaceUpdateFile(config, args), context };

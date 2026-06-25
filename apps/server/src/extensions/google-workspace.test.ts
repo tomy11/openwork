@@ -212,7 +212,10 @@ describe("Google Workspace extension", () => {
         payload: {
           mimeType: "multipart/alternative",
           headers: [{ name: "Subject", value: "Greetings" }],
-          parts: [{ mimeType: "text/plain", body: { data: bodyData } }],
+          parts: [
+            { mimeType: "text/plain", body: { data: bodyData } },
+            { filename: "report.pdf", mimeType: "application/pdf", body: { attachmentId: "att-1", size: 42 } },
+          ],
         },
       }), { status: 200 }),
       { preconnect: previousFetch.preconnect },
@@ -221,6 +224,106 @@ describe("Google Workspace extension", () => {
     const result = await callGoogleWorkspaceExtensionAction(config, "gmail_get_message", { messageId: "m1" }, {});
     expect(result?.ok).toBe(true);
     expect(result?.result).toMatchObject({ id: "m1", subject: "Greetings", body: "Hello from Gmail" });
+    expect(result?.result).toMatchObject({ attachments: [{ attachmentId: "att-1", filename: "report.pdf", mimeType: "application/pdf", size: 42 }] });
+  });
+
+  test("gmail_download_attachment decodes attachment data", async () => {
+    process.env.OPENWORK_DEV_MODE = "1";
+    process.env.OPENWORK_GOOGLE_WORKSPACE_ALLOW_PLAINTEXT_VAULT = "1";
+    process.env.GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET = "secret";
+    const config = createTestConfig();
+    await writePlaintextVault(config, {
+      version: 2,
+      activeAccountId: "sub-one",
+      accounts: [accountRecord("one@example.com", "sub-one", ["openid", "https://www.googleapis.com/auth/gmail.readonly"])],
+    });
+    const attachmentData = Buffer.from("attachment bytes", "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const requestedUrls: string[] = [];
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request) => {
+        requestedUrls.push(String(input instanceof Request ? input.url : input));
+        return new Response(JSON.stringify({ data: attachmentData, size: 16 }), { status: 200 });
+      },
+      { preconnect: previousFetch.preconnect },
+    );
+
+    const result = await callGoogleWorkspaceExtensionAction(config, "gmail_download_attachment", { messageId: "m1", attachmentId: "att-1" }, {});
+    expect(result?.ok).toBe(true);
+    expect(result?.result).toEqual({
+      messageId: "m1",
+      attachmentId: "att-1",
+      size: 16,
+      dataBase64: Buffer.from("attachment bytes", "utf8").toString("base64"),
+    });
+    expect(requestedUrls[0]).toBe("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/att-1");
+  });
+
+  test("gmail_create_reply_draft rejects accounts without the gmail.readonly scope", async () => {
+    process.env.OPENWORK_DEV_MODE = "1";
+    process.env.OPENWORK_GOOGLE_WORKSPACE_ALLOW_PLAINTEXT_VAULT = "1";
+    process.env.GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET = "secret";
+    const config = createTestConfig();
+    await writePlaintextVault(config, {
+      version: 2,
+      activeAccountId: "sub-one",
+      accounts: [accountRecord("one@example.com", "sub-one")],
+    });
+
+    expect(callGoogleWorkspaceExtensionAction(config, "gmail_create_reply_draft", { messageId: "m1", body: "Thanks" }, {})).rejects.toThrow(
+      new ApiError(403, "google_gmail_read_not_granted", "Gmail read access is not granted for this account. Reconnect Google Workspace with Gmail read access enabled."),
+    );
+  });
+
+  test("gmail_create_reply_draft creates a threaded reply all draft", async () => {
+    process.env.OPENWORK_DEV_MODE = "1";
+    process.env.OPENWORK_GOOGLE_WORKSPACE_ALLOW_PLAINTEXT_VAULT = "1";
+    process.env.GOOGLE_WORKSPACE_OAUTH_CLIENT_SECRET = "secret";
+    const config = createTestConfig();
+    await writePlaintextVault(config, {
+      version: 2,
+      activeAccountId: "sub-one",
+      accounts: [accountRecord("one@example.com", "sub-one", ["openid", "https://www.googleapis.com/auth/gmail.readonly"])],
+    });
+    const requests: { url: string; body: string }[] = [];
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url.includes("/messages/m1")) {
+          return new Response(JSON.stringify({
+            id: "m1",
+            threadId: "thread-1",
+            payload: {
+              headers: [
+                { name: "Message-ID", value: "<message-1@example.com>" },
+                { name: "References", value: "<root@example.com>" },
+                { name: "Subject", value: "Project update" },
+                { name: "From", value: "Alice <alice@example.com>" },
+                { name: "To", value: "One <one@example.com>, Bob <bob@example.com>" },
+                { name: "Cc", value: "Carol <carol@example.com>" },
+              ],
+            },
+          }), { status: 200 });
+        }
+        requests.push({ url, body: typeof init?.body === "string" ? init.body : "" });
+        return new Response(JSON.stringify({ id: "draft-1", message: { id: "draft-message-1", threadId: "thread-1" } }), { status: 200 });
+      },
+      { preconnect: previousFetch.preconnect },
+    );
+
+    const result = await callGoogleWorkspaceExtensionAction(config, "gmail_create_reply_draft", { messageId: "m1", body: "Thanks for the update.", replyAll: true }, {});
+    expect(result?.ok).toBe(true);
+    expect(result?.result).toMatchObject({ id: "draft-1" });
+    expect(requests[0]?.url).toBe("https://gmail.googleapis.com/gmail/v1/users/me/drafts");
+    expect(requests[0]?.body).toContain('"threadId":"thread-1"');
+    const raw = requests[0]?.body.match(/"raw":"([^"]+)"/)?.[1] ?? "";
+    const decoded = Buffer.from(raw.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    expect(decoded).toContain("To: Alice <alice@example.com>, Bob <bob@example.com>");
+    expect(decoded).toContain("Cc: Carol <carol@example.com>");
+    expect(decoded).toContain("Subject: Re: Project update");
+    expect(decoded).toContain("In-Reply-To: <message-1@example.com>");
+    expect(decoded).toContain("References: <root@example.com> <message-1@example.com>");
+    expect(decoded).toContain("Thanks for the update.");
+    expect(decoded).not.toContain("one@example.com");
   });
 
   test("calendar_create_event rejects accounts without the calendar.events scope", async () => {

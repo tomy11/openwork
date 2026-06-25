@@ -79,8 +79,14 @@ export default {
       name: "OpenWork Cloud Control appears as a configured app",
       run: async (ctx) => {
         await ctx.navigateHash("/settings/extensions/mcp");
-        await ctx.waitForText("OpenWork Cloud Control", { timeoutMs: 30_000 });
-        await ctx.screenshot("cloud-mcp-configured");
+        await ctx.expectHashIncludes("/settings/extensions/mcp");
+        await ctx.expectText("OpenWork Cloud Control", { timeoutMs: 30_000 });
+        await ctx.screenshot("cloud-mcp-configured", {
+          claim: "OpenWork Cloud Control appears in MCP settings after cloud sign-in sync.",
+          requireText: ["OpenWork Cloud Control"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/extensions/mcp",
+        });
       },
     },
   ],

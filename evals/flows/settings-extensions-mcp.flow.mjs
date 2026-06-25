@@ -19,18 +19,15 @@ export default {
       name: "Navigate to Settings -> Extensions -> MCP",
       run: async (ctx) => {
         await ctx.navigateHash("/settings/extensions/mcp");
-        await ctx.waitFor(
-          "window.location.hash.includes('/settings/extensions/mcp')",
-          { label: "settings MCP route" },
-        );
+        await ctx.expectHashIncludes("/settings/extensions/mcp");
       },
     },
     {
       name: "Extensions surface renders tabs and custom app entry",
       run: async (ctx) => {
-        await ctx.waitForText("My Extensions", { timeoutMs: 30_000 });
-        await ctx.waitForText("Marketplace");
-        await ctx.waitForText("Add Custom App");
+        await ctx.expectText("My Extensions", { timeoutMs: 30_000 });
+        await ctx.expectText("Marketplace");
+        await ctx.expectText("Add Custom App");
       },
     },
     {
@@ -46,10 +43,15 @@ export default {
     {
       name: "Unconfigured directory entries are discoverable",
       run: async (ctx) => {
-        await ctx.waitForText("OpenWork Cloud Control", { timeoutMs: 15_000 });
+        await ctx.expectText("OpenWork Cloud Control", { timeoutMs: 15_000 });
         const hasDirectoryEntry = (await ctx.hasText("Notion")) || (await ctx.hasText("Linear"));
         ctx.assert(hasDirectoryEntry, "Expected at least one MCP directory entry (Notion/Linear) in quick connect.");
-        await ctx.screenshot("mcp-view");
+        await ctx.screenshot("mcp-view", {
+          claim: "MCP settings shows the built-in cloud control app and directory entries.",
+          requireText: ["OpenWork Cloud Control"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/extensions/mcp",
+        });
       },
     },
   ],

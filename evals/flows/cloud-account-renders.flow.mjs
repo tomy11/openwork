@@ -18,10 +18,7 @@ export default {
       name: "Navigate to Settings -> Cloud -> Account",
       run: async (ctx) => {
         await ctx.navigateHash("/settings/cloud-account");
-        await ctx.waitFor(
-          "window.location.hash.includes('/settings/cloud-account')",
-          { label: "cloud account route" },
-        );
+        await ctx.expectHashIncludes("/settings/cloud-account");
       },
     },
     {
@@ -38,7 +35,12 @@ export default {
         );
         const signedIn = await ctx.hasText("Sign out");
         ctx.log(`cloud account state: ${signedIn ? "signed in" : "signed out"}`);
-        await ctx.screenshot("cloud-account");
+        await ctx.screenshot("cloud-account", {
+          claim: "Cloud Account renders either signed-in controls or the signed-out paste-code entry point.",
+          requireText: [signedIn ? "Sign out" : "Paste sign-in code"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/cloud-account",
+        });
       },
     },
   ],

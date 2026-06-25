@@ -72,7 +72,10 @@ export default {
           "window.__openwork.events(200).filter((e) => e.name.startsWith('analytics.')).map((e) => e.name)",
         );
         ctx.log(`analytics events: ${JSON.stringify(events)}`);
-        await ctx.screenshot("task-created");
+        await ctx.screenshot("task-created", {
+          claim: "The app remains visibly usable after task creation analytics are captured.",
+          rejectText: ["Something went wrong"],
+        });
       },
     },
   ],

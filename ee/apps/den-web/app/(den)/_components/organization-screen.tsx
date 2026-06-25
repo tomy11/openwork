@@ -3,8 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { LogOut, Settings } from "lucide-react";
-import { getErrorMessage, requestJson } from "../_lib/den-flow";
-import { type DenOrgSummary, formatRoleLabel, getMarketplaceOnboardingRoute, getOrgDashboardRoute, parseOrgListPayload } from "../_lib/den-org";
+import { getErrorMessage, normalizeAuthIntentParam, PENDING_AUTH_INTENT_STORAGE_KEY, requestJson } from "../_lib/den-flow";
+import { type DenOrgSummary, formatRoleLabel, getInferenceRoute, getMarketplaceOnboardingRoute, getOrgDashboardRoute, parseOrgListPayload } from "../_lib/den-org";
 import { useDenFlow } from "../_providers/den-flow-provider";
 
 type SettingsTab = "profile" | "organizations";
@@ -99,6 +99,13 @@ export function OrganizationScreen() {
 
       if (!nextSlug) {
         throw new Error("Organization was created, but no slug was returned.");
+      }
+
+      const pendingIntent = normalizeAuthIntentParam(window.sessionStorage.getItem(PENDING_AUTH_INTENT_STORAGE_KEY));
+      if (pendingIntent === "models") {
+        window.sessionStorage.removeItem(PENDING_AUTH_INTENT_STORAGE_KEY);
+        router.push(getInferenceRoute(nextSlug));
+        return;
       }
 
       router.push(getMarketplaceOnboardingRoute(nextSlug));

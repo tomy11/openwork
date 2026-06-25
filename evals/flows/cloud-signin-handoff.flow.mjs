@@ -43,6 +43,7 @@ export default {
       name: "Open Settings -> Cloud -> Account",
       run: async (ctx) => {
         await ctx.navigateHash("/settings/cloud-account");
+        await ctx.expectHashIncludes("/settings/cloud-account");
         await ctx.waitFor(
           `(() => {
             const text = document.body.innerText;
@@ -66,12 +67,17 @@ export default {
     {
       name: "Session is connected",
       run: async (ctx) => {
-        await ctx.waitForText("Sign out", { timeoutMs: 45_000 });
+        await ctx.expectText("Sign out", { timeoutMs: 45_000 });
         const token = await ctx.eval(
           "localStorage.getItem('openwork.den.authToken') ?? ''",
         );
         ctx.assert(typeof token === "string" && token.trim().length > 0, "No persisted den auth token.");
-        await ctx.screenshot("signed-in");
+        await ctx.screenshot("signed-in", {
+          claim: "Cloud Account shows a connected session after desktop handoff.",
+          requireText: ["Sign out"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/cloud-account",
+        });
       },
     },
   ],

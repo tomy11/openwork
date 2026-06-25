@@ -40,7 +40,9 @@ export default {
         await ctx.waitFor("document.body.innerText.trim().length > 40", {
           label: "rendered body text",
         });
-        await ctx.screenshot("booted");
+        await ctx.screenshot("booted", {
+          claim: "The app rendered meaningful visible content after boot.",
+        });
       },
     },
   ],

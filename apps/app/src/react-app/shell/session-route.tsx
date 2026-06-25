@@ -122,7 +122,7 @@ import {
 } from "@/react-app/domains/workspace/remote-workspace-diagnostics";
 import { useShareWorkspaceState } from "@/react-app/domains/workspace/share-workspace-state";
 import { ModelPickerModal } from "@/react-app/domains/session/modals/model-picker-modal";
-import { CommandPalette, type PaletteItem, type SessionOption as PaletteSessionOption } from "./command-palette";
+import { CommandPalette, type PaletteItem, type SessionGroupOption, type SessionOption as PaletteSessionOption } from "./command-palette";
 import { SessionSearchDialog } from "./session-search-dialog";
 import type { SessionMessageFetcher } from "@/react-app/domains/session/search/session-search";
 import { getDisplaySessionTitle } from "@/app/lib/session-title";
@@ -455,7 +455,7 @@ export function SessionRoute() {
     onSettingsChanged: () => setOpenworkServerSettingsVersion((value) => value + 1),
   });
 
-  const { engineReloadVersion, routeEngineInfo } = useEngineReload({
+  const { engineReloadVersion, routeEngineInfo, reloadWorkspaceEngineFromUi } = useEngineReload({
     client,
     workspaceId: selectedWorkspaceId,
     workspace: selectedWorkspace,
@@ -464,6 +464,31 @@ export function SessionRoute() {
     onError: setRouteError,
     refreshRouteState,
   });
+
+  const environmentRuntimeKey = useMemo(
+    () => buildOpenworkEnvRuntimeKey({
+      baseUrl: client?.baseUrl ?? null,
+      pid: openworkServerHostInfoState?.pid ?? null,
+      port: openworkServerHostInfoState?.port ?? null,
+    }),
+    [client?.baseUrl, openworkServerHostInfoState?.pid, openworkServerHostInfoState?.port],
+  );
+
+  const handleApplyEnvironmentChanges = useCallback(async () => {
+    if (!isDesktopRuntime()) {
+      throw new Error(t("settings.environment.apply_unavailable"));
+    }
+    if (activeReloadBlockingSessions.length > 0) {
+      throw new Error(t("settings.environment.apply_blocked_active_tasks"));
+    }
+    if (!selectedWorkspaceRoot) {
+      throw new Error(t("settings.environment.apply_no_local_workspace"));
+    }
+    const reloaded = await reloadWorkspaceEngineFromUi();
+    if (!reloaded) {
+      throw new Error(t("app.error_connect_first"));
+    }
+  }, [activeReloadBlockingSessions.length, reloadWorkspaceEngineFromUi, selectedWorkspaceRoot]);
 
   const shareWorkspaceState = useShareWorkspaceState({
     workspaces,
@@ -487,6 +512,10 @@ export function SessionRoute() {
     [errorsByWorkspaceId, retryingWorkspaceIds, sessionsByWorkspaceId, workspaces],
   );
   useSessionGroupSync({ workspaces, endpointForWorkspace });
+  const selectedWorkspaceGroupState = sessionManagementStore((state) => (
+    selectedWorkspaceId ? state.groupsByWorkspace[selectedWorkspaceId] : undefined
+  ));
+  const assignSessionToGroup = sessionManagementStore((state) => state.assignGroup);
   const seedWorkspaceActivitySessions = useSessionActivityStore((state) => state.seedWorkspaceSessions);
   const sessionActivityByWorkspaceId = useSessionActivityStore((state) => state.statusesByWorkspaceId);
 
@@ -823,14 +852,9 @@ export function SessionRoute() {
         }
 
         const parts = await draftToParts(draft, selectedWorkspaceRoot);
-        const envRuntimeKey = buildOpenworkEnvRuntimeKey({
-          baseUrl: client?.baseUrl ?? null,
-          pid: openworkServerHostInfoState?.pid ?? null,
-          port: openworkServerHostInfoState?.port ?? null,
-        });
         const envSystemContext = await buildOpenworkEnvSystemContext(client, {
           cacheKey: targetSessionId,
-          runtimeKey: envRuntimeKey,
+          runtimeKey: environmentRuntimeKey,
         });
         const result = await opencodeClient.session.promptAsync({
           sessionID: targetSessionId,
@@ -922,12 +946,18 @@ export function SessionRoute() {
             : null,
         }));
       },
+      environmentRuntimeKey,
+      onApplyEnvironmentChanges: isDesktopRuntime() && selectedWorkspace?.workspaceType !== "remote"
+        ? handleApplyEnvironmentChanges
+        : undefined,
     };
   }, [
     client,
     modelPicker.compactOpen,
     handleOpenSettings,
     hasUsableModel,
+    handleApplyEnvironmentChanges,
+    environmentRuntimeKey,
     local,
     listAgents,
     listSlashCommands,
@@ -1139,6 +1169,35 @@ export function SessionRoute() {
     }
   }, [baseUrl, loading, navigateToWorkspaceSession, refreshRouteState, rememberPendingCreatedSession, retryingWorkspaceIds, token, workspaces]);
 
+  // Latest session-list state for prev/next session tab navigation. Updated
+  // during render (see below, after `paletteSessionOptions` is computed) so the
+  // stable callbacks below always read fresh data without re-subscribing the
+  // global keydown listener.
+  const sessionTabNavRef = useRef<{
+    options: PaletteSessionOption[];
+    workspaceId: string;
+    sessionId: string | null;
+    navigate: (workspaceId: string, sessionId?: string | null) => void;
+  }>({ options: [], workspaceId: "", sessionId: null, navigate: () => {} });
+
+  const goToSessionTabByOffset = useCallback((offset: number) => {
+    const { options, workspaceId, sessionId, navigate } = sessionTabNavRef.current;
+    const scoped = options.filter((option) => option.workspaceId === workspaceId);
+    if (scoped.length === 0) return;
+    const currentIndex = sessionId
+      ? scoped.findIndex((option) => option.sessionId === sessionId)
+      : -1;
+    const nextIndex = currentIndex === -1
+      ? offset > 0 ? 0 : scoped.length - 1
+      : (currentIndex + offset + scoped.length) % scoped.length;
+    const target = scoped[nextIndex];
+    if (!target || target.sessionId === sessionId) return;
+    navigate(target.workspaceId, target.sessionId);
+  }, []);
+
+  const goToNextSessionTab = useCallback(() => goToSessionTabByOffset(1), [goToSessionTabByOffset]);
+  const goToPrevSessionTab = useCallback(() => goToSessionTabByOffset(-1), [goToSessionTabByOffset]);
+
   const {
     commandPaletteOpen,
     setCommandPaletteOpen,
@@ -1150,6 +1209,8 @@ export function SessionRoute() {
     canCreateTask,
     workspaceId: selectedWorkspaceId,
     onCreateTask: handleCreateTaskInWorkspace,
+    onNextSessionTab: goToNextSessionTab,
+    onPrevSessionTab: goToPrevSessionTab,
   });
   useReactRenderWatchdog("SessionRoute", {
     selectedSessionId,
@@ -1265,6 +1326,37 @@ export function SessionRoute() {
     return out;
   }, [sessionsByWorkspaceId, selectedWorkspaceId, workspaces]);
 
+  // Keep the prev/next session tab navigation ref in sync with the latest
+  // session list, current selection, and navigator. Read by the stable
+  // callbacks above so the global keydown handler never goes stale.
+  sessionTabNavRef.current = {
+    options: paletteSessionOptions,
+    workspaceId: selectedWorkspaceId,
+    sessionId: selectedSessionId,
+    navigate: navigateToWorkspaceSession,
+  };
+
+  const paletteSessionGroups = useMemo<SessionGroupOption[]>(
+    () => selectedWorkspaceGroupState?.groups ?? [],
+    [selectedWorkspaceGroupState?.groups],
+  );
+
+  const currentSessionForGroupMove = useMemo(() => {
+    if (!selectedWorkspaceId || !selectedSessionId) return null;
+    return paletteSessionOptions.find(
+      (session) => session.workspaceId === selectedWorkspaceId && session.sessionId === selectedSessionId,
+    ) ?? null;
+  }, [paletteSessionOptions, selectedSessionId, selectedWorkspaceId]);
+
+  const currentSessionGroupId = selectedSessionId
+    ? selectedWorkspaceGroupState?.assignments[selectedSessionId] ?? null
+    : null;
+
+  const handleMoveCurrentSessionToGroup = useCallback((groupId: string) => {
+    if (!selectedWorkspaceId || !selectedSessionId) return;
+    assignSessionToGroup(selectedWorkspaceId, selectedSessionId, groupId);
+  }, [assignSessionToGroup, selectedSessionId, selectedWorkspaceId]);
+
   const sessionSearchFetcher = useMemo<SessionMessageFetcher | null>(() => {
     if (!client) return null;
     // Cap the transcript fetch to keep multi-workspace scans fast; matches in
@@ -1315,6 +1407,30 @@ export function SessionRoute() {
       });
     },
   }), [developerMode]);
+
+  const nextSessionTabPaletteItem = useMemo<PaletteItem>(() => ({
+    id: "session-tab.next",
+    title: "Next session tab",
+    detail: "Switch to the next session in this workspace",
+    meta: "Cmd/Ctrl+T",
+    searchText: "next session tab switch forward",
+    action: () => {
+      setCommandPaletteOpen(false);
+      goToNextSessionTab();
+    },
+  }), [goToNextSessionTab]);
+
+  const prevSessionTabPaletteItem = useMemo<PaletteItem>(() => ({
+    id: "session-tab.previous",
+    title: "Previous session tab",
+    detail: "Switch to the previous session in this workspace",
+    meta: "Cmd/Ctrl+Shift+T",
+    searchText: "previous session tab switch back",
+    action: () => {
+      setCommandPaletteOpen(false);
+      goToPrevSessionTab();
+    },
+  }), [goToPrevSessionTab]);
 
   const handleReorderWorkspaces = useCallback((workspaceIds: string[]) => {
     const activeWorkspaceIds = new Set(workspacesRef.current.map((workspace) => workspace.id));
@@ -1511,6 +1627,7 @@ export function SessionRoute() {
       clientConnected={canCreateTask}
       openworkServerStatus={client ? "connected" : "disconnected"}
       openworkServerClient={selectedWorkspaceEndpoint?.client ?? client}
+      environmentClient={client}
       openworkServerToken={selectedWorkspaceServerToken}
       developerMode={developerMode}
       headerStatus={canCreateTask ? t("status.connected") : t("session.loading_detail")}
@@ -1820,6 +1937,12 @@ export function SessionRoute() {
       }}
       onOpenSession={(workspaceId, sessionId) => navigateToWorkspaceSession(workspaceId, sessionId)}
       onOpenSettings={(route) => handleOpenSettings(route ?? "/settings/general")}
+      onOpenModelPicker={() => {
+        modelPicker.setQuery("");
+        modelPicker.setRecentProviderIds(new Set());
+        window.requestAnimationFrame(() => modelPicker.setOpen(true));
+      }}
+      selectedModelLabel={modelLabel}
       accessibleTargets={paletteAccessibleTargets}
       onOpenAccessibleTarget={(target) => {
         try {
@@ -1836,7 +1959,11 @@ export function SessionRoute() {
         }
       }}
       sessions={paletteSessionOptions}
-      extraItems={[sessionSearchPaletteItem, ...terminalPaletteItems, developerModePaletteItem]}
+      sessionGroups={paletteSessionGroups}
+      currentSessionForGroupMove={currentSessionForGroupMove}
+      currentSessionGroupId={currentSessionGroupId}
+      onMoveCurrentSessionToGroup={handleMoveCurrentSessionToGroup}
+      extraItems={[sessionSearchPaletteItem, ...terminalPaletteItems, developerModePaletteItem, nextSessionTabPaletteItem, prevSessionTabPaletteItem]}
       listAgents={listAgents}
       selectedAgent={selectedAgent}
       onSelectAgent={setSelectedAgent}

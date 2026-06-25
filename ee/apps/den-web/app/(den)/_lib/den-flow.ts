@@ -176,11 +176,14 @@ export const LAST_WORKER_STORAGE_KEY = "openwork:web:last-worker";
 export const PENDING_SOCIAL_SIGNUP_STORAGE_KEY = "openwork:web:pending-social-signup";
 export const AUTH_TOKEN_STORAGE_KEY = "openwork:web:auth-token";
 export const ONBOARDING_INTENT_STORAGE_KEY = "openwork:web:onboarding-intent";
+export const PENDING_AUTH_INTENT_STORAGE_KEY = "openwork:web:pending-auth-intent";
 export const WORKER_STATUS_POLL_MS = DEN_WORKER_POLL_INTERVAL_MS;
 export const DEFAULT_AUTH_NAME = "OpenWork User";
 export const DEFAULT_WORKER_NAME = "My Worker";
 export const OPENWORK_APP_CONNECT_BASE_URL = (process.env.NEXT_PUBLIC_OPENWORK_APP_CONNECT_URL ?? "").trim();
 export const OPENWORK_AUTH_CALLBACK_BASE_URL = (process.env.NEXT_PUBLIC_OPENWORK_AUTH_CALLBACK_URL ?? "").trim();
+
+export type AuthIntent = "models";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -243,6 +246,10 @@ export function normalizeAuthModeParam(value: string | null | undefined): AuthMo
   return value === "sign-in" || value === "sign-up" ? value : null;
 }
 
+export function normalizeAuthIntentParam(value: string | null | undefined): AuthIntent | null {
+  return value === "models" ? value : null;
+}
+
 export function getSocialProviderLabel(provider: SocialAuthProvider): string {
   return provider === "github" ? "GitHub" : "Google";
 }
@@ -271,7 +278,7 @@ export function getSocialCallbackUrl(): string {
     const callbackUrl = new URL("/", origin);
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
-      for (const key of ["mode", "desktopAuth", "desktopScheme", "invite"]) {
+      for (const key of ["mode", "desktopAuth", "desktopScheme", "invite", "intent"]) {
         const value = params.get(key)?.trim() ?? "";
         if (value) {
           callbackUrl.searchParams.set(key, value);

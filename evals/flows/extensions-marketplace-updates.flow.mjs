@@ -25,18 +25,15 @@ export default {
       name: "Navigate to Settings -> Marketplace",
       run: async (ctx) => {
         await ctx.navigateHash("/settings/cloud-marketplaces");
-        await ctx.waitFor(
-          "window.location.hash.includes('/settings/cloud-marketplaces')",
-          { label: "cloud marketplaces route" },
-        );
+        await ctx.expectHashIncludes("/settings/cloud-marketplaces");
       },
     },
     {
       name: "Marketplace header and status filters render",
       run: async (ctx) => {
-        await ctx.waitForText("Extension Marketplace", { timeoutMs: 30_000 });
-        await ctx.waitForText("Installed");
-        await ctx.waitForText("Updates");
+        await ctx.expectText("Extension Marketplace", { timeoutMs: 30_000 });
+        await ctx.expectText("Installed");
+        await ctx.expectText("Updates");
       },
     },
     {
@@ -52,17 +49,26 @@ export default {
           signedOutNotice || hasRows,
           "Expected either the signed-out notice or marketplace rows to render",
         );
-        await ctx.screenshot("marketplace-view");
+        await ctx.screenshot("marketplace-view", {
+          claim: "Marketplace view renders a coherent signed-out notice or marketplace rows.",
+          requireText: ["Extension Marketplace"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/cloud-marketplaces",
+        });
       },
     },
     {
       name: "Updates filter is interactive and view stays stable",
       run: async (ctx) => {
         await ctx.clickText("Updates");
-        await ctx.waitForText("Extension Marketplace");
-        const crashed = await ctx.hasText("Something went wrong");
-        ctx.assert(!crashed, "Marketplace view crashed after selecting Updates filter");
-        await ctx.screenshot("updates-filter");
+        await ctx.expectText("Extension Marketplace");
+        await ctx.expectNoText("Something went wrong");
+        await ctx.screenshot("updates-filter", {
+          claim: "Selecting Updates keeps the Marketplace view stable.",
+          requireText: ["Extension Marketplace", "Updates"],
+          rejectText: ["Something went wrong"],
+          hashIncludes: "/settings/cloud-marketplaces",
+        });
       },
     },
   ],

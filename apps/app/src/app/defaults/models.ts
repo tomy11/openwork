@@ -17,6 +17,7 @@ export const RECOMMENDED_MODEL_PATTERNS: string[] = [
   "claude-opus-4",
   "gpt-5.5",
   "kimi-k2.6",
+  "glm-5.2",
 ];
 
 /**

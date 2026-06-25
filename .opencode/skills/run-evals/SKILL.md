@@ -1,6 +1,6 @@
 ---
 name: run-evals
-description: Run OpenWork UI evals on a Daytona sandbox or local Electron instance. Handles sandbox creation, service startup, and eval execution via CDP browser tools.
+description: do e2e tests, run e2e, validate feature, prove it works, PR proof, frame proof, pnpm evals. Runs OpenWork UI evals on Daytona or local Electron with CDP and validated HTML frame evidence.
 ---
 
 # Skill: Run Evals
@@ -9,9 +9,9 @@ Run the OpenWork UI evaluation flows against a real Electron app. Prefer a fresh
 
 ## When to use
 
-- User says "run evals on Daytona" or "run this flow on Daytona"
-- User wants to verify a UI change end-to-end
-- User wants to test the onboarding, session, or settings flows
+- User says "do e2e tests for <feature>", "run e2e", "validate feature", "prove it works", "PR proof", "frame proof", or "run evals on Daytona".
+- User wants to verify a UI change end-to-end against the real Electron app.
+- User wants to test onboarding, session, settings, cloud, Marketplace, provider, or voice flows.
 
 ## Prerequisites
 
@@ -33,13 +33,13 @@ Use these Daytona skills when an eval touches a specific area:
 - `daytona-secrets-volume` for adding or checking provider keys and eval secrets.
 - `daytona-recording-artifacts` for screenshots, recordings, before/after videos, and PR evidence.
 
-### Preferred path: helper script
+### Preferred path: helper script + coded eval runner
 
 Use the repo helper unless you need to debug a specific Daytona step manually:
 
 ```bash
 daytona organization use "<org-name>"
-bash .devcontainer/test-on-daytona.sh <branch-or-commit>
+bash .devcontainer/test-on-daytona.sh <branch-or-commit> --artifacts-volume
 ```
 
 The helper creates a fresh VNC-capable Daytona sandbox from the reusable
@@ -47,7 +47,9 @@ The helper creates a fresh VNC-capable Daytona sandbox from the reusable
 `openwork-eval-secrets:/daytona-secrets` volume, mounts the reusable
 `openwork-eval-pnpm-store` pnpm cache volume, starts XFCE/noVNC, Vite, and
 Electron with Daytona-safe graphics flags, waits for CDP, then prints the CDP
-and noVNC URLs. If the snapshot is missing, create it before rerunning.
+and noVNC URLs. `--artifacts-volume` mounts `/daytona-artifacts` and serves it
+on port 8090 so UI validation can publish frame proof. If the snapshot is
+missing, create it before rerunning.
 
 Refresh the snapshot when dependencies or base setup change:
 
@@ -99,7 +101,41 @@ If the app shows the Welcome page, create a workspace:
 
 ### Step 6: Run the requested eval
 
-Read the eval file from `evals/` and execute each step using the browser tools.
+Prefer coded flows under `evals/flows/` and run them through the eval runner:
+
+```bash
+pnpm evals --list
+pnpm evals --flow <flow-id> --cdp-url <printed-electron-cdp-url>
+```
+
+The runner uses CDP directly, produces machine-checkable assertions, validates
+proof screenshots, and writes `report.json`, `report.md`, screenshots, and a
+browseable `index.html` frame proof under `evals/results/<run-id>/`.
+
+If no coded flow exists yet for the UI behavior under test, add or adapt a
+`evals/flows/*.flow.mjs` file and use the runner helpers:
+
+- `ctx.clickText("Button label")`
+- `ctx.fill("input-or-textarea-selector", "value")`
+- `ctx.waitFor("JavaScript condition")`
+- `ctx.expectText("Visible text")`
+- `ctx.expectNoText("Error text")`
+- `ctx.expectHashIncludes("/route")`
+- `ctx.control("action.id", args)`
+- `ctx.prove("claim", { action, assert, screenshot })`
+- `ctx.screenshot("checkpoint-name", { claim, requireText, rejectText, hashIncludes })`
+
+For PR evidence, do not leave screenshots as a loose gallery. Each important
+frame should have a claim and validation checks. If screenshot validation fails,
+repair the visible state and recapture before reporting `Passed`.
+
+Use manual browser tools only to debug/prototype a flow or when product UI
+cannot expose the needed state yet. Do not report ad hoc browser calls as the
+preferred PR evidence when a coded flow can be created.
+
+When manually replaying a markdown-only eval, execute each step using the
+browser tools and convert the flow to `evals/flows/` if it becomes repeated PR
+coverage.
 
 For each step:
 1. Observe the current state with `browser_snapshot` or `browser_eval`.
@@ -109,9 +145,13 @@ For each step:
 5. Capture screenshot/recording evidence when the visible state matters.
 
 Use the `daytona-flow-validator` skill for pass/fail decisions. If there is no
-post-action assertion, report `Incomplete`, not `Passed`.
+post-action assertion or the frame evidence does not visibly support the claim,
+report `Incomplete`, not `Passed`.
 
-### Key techniques
+### Manual browser-tool fallback techniques
+
+Use these only when debugging, prototyping a flow, or bridging a product gap.
+For repeatable UI proof, prefer `pnpm evals` and `ctx.*` helpers above.
 
 **Clicking buttons:**
 ```

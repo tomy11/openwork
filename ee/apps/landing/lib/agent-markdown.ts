@@ -109,27 +109,6 @@ const enterprise = `# A privacy-first alternative to Claude Cowork for your orga
 - See [Pricing](https://openworklabs.com/pricing) for tier comparison
 `
 
-const download = `# Get Started with OpenWork
-
-> Create a free OpenWork Cloud account first, then use the guided desktop app access flow.
-
-## Start here
-
-- [Get Started for free](https://app.openworklabs.com?mode=sign-up)
-- Create or select your workspace.
-- Follow the Cloud app's desktop app access flow.
-
-## Supported platforms
-
-- macOS
-- Windows
-- Linux
-
-## After signing up
-
-Once the desktop app is running, use the [workspace-guide skill](https://openworklabs.com/.well-known/agent-skills/workspace-guide/SKILL.md) for first-run orientation.
-`
-
 const trust = `# Trust & Security
 
 > How OpenWork handles data, what subprocessors are involved, and how to reach the security team.
@@ -166,12 +145,63 @@ const trust = `# Trust & Security
 Omar McAdam — team+security@openworklabs.com
 `
 
+const glm52 = `# GLM 5.2 is now in OpenWork — with 2x usage
+
+> GLM 5.2 is available through OpenWork Models, and we're doubling your usage so you can run real agent work on an open model at a fraction of the cost.
+
+## What's new
+
+- **GLM 5.2 in OpenWork Models** — managed OSS model access with 2x usage, no keys required
+- **Run your day from chat** — tasks organize into In progress / Done / Requires attention; move them by asking
+- **Split screen** — two windows side by side, less tab-switching
+- **Voice mode** — control the OpenWork UI by voice
+- **Advanced analytics on OpenWork Cloud** — usage, activity, and team behavior in one view
+
+## How it works
+
+1. **Sign up** — [Get Started for free](https://app.openworklabs.com?mode=sign-up&intent=models)
+2. **Subscribe** — OpenWork Models at $10/user/mo includes GLM 5.2 with 2x usage
+3. **Open the app** — switch to GLM 5.2 from the model picker
+
+## What to try first
+
+Open OpenWork, switch to GLM 5.2, and ask the chat to organize your tasks.
+
+## Links
+
+- [Try GLM 5.2 in OpenWork](https://app.openworklabs.com?mode=sign-up&intent=models)
+- [Download the app](https://openworklabs.com/download)
+- [Full changelog](https://openworklabs.com/docs/changelog)
+`
+
+const download = `# Get Started with OpenWork
+
+> Create a free OpenWork Cloud account first, then use the guided desktop app access flow.
+
+## Start here
+
+- [Get Started for free](https://app.openworklabs.com?mode=sign-up)
+- Create or select your workspace.
+- Follow the Cloud app's desktop app access flow.
+
+## Supported platforms
+
+- macOS
+- Windows
+- Linux
+
+## After signing up
+
+Once the desktop app is running, use the [workspace-guide skill](https://openworklabs.com/.well-known/agent-skills/workspace-guide/SKILL.md) for first-run orientation.
+`
+
 export const agentMarkdown: Record<string, string> = {
   "/": home,
   "/pricing": pricing,
   "/enterprise": enterprise,
   "/download": download,
   "/trust": trust,
+  "/glm-5.2": glm52,
 }
 
 export const agentMarkdownRoutes = Object.keys(agentMarkdown)

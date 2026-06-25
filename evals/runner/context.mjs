@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { captureScreenshot, evaluate } from "./cdp.mjs";
@@ -8,6 +9,20 @@ const POLL_INTERVAL_MS = 250;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class EvalError extends Error {}
+
+function pngDimensions(buffer) {
+  const signature = buffer.subarray(0, 8).toString("hex");
+  if (signature !== "89504e470d0a1a0a" || buffer.length < 24) return null;
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
+function slug(value) {
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "") || "frame";
+}
 
 /**
  * Per-flow execution context handed to every step's `run(ctx)`.
@@ -22,8 +37,24 @@ export class EvalContext {
     this.flowId = flowId;
     this.env = env;
     this.screenshots = [];
+    this.evidenceFrames = [];
     this.logs = [];
     this.screenshotIndex = 0;
+    this.currentStepName = null;
+    this.currentStepEvidence = [];
+    this.lastScreenshotHash = null;
+  }
+
+  beginStep(name) {
+    this.currentStepName = name;
+    this.currentStepEvidence = [];
+  }
+
+  endStep() {
+    const evidence = this.currentStepEvidence;
+    this.currentStepName = null;
+    this.currentStepEvidence = [];
+    return evidence;
   }
 
   log(message) {
@@ -36,6 +67,56 @@ export class EvalContext {
 
   assert(condition, message) {
     if (!condition) throw new EvalError(message);
+  }
+
+  recordEvidence(entry) {
+    const next = {
+      step: this.currentStepName,
+      at: new Date().toISOString(),
+      ...entry,
+    };
+    this.currentStepEvidence.push(next);
+    return next;
+  }
+
+  async expectText(text, options = {}) {
+    await this.waitForText(text, options);
+    return this.recordEvidence({ type: "assertion", status: "passed", assertion: `Visible text includes ${JSON.stringify(text)}` });
+  }
+
+  async expectNoText(text) {
+    const present = await this.hasText(text);
+    if (present) {
+      this.recordEvidence({ type: "assertion", status: "failed", assertion: `Visible text does not include ${JSON.stringify(text)}` });
+      throw new EvalError(`Unexpected visible text: ${text}`);
+    }
+    return this.recordEvidence({ type: "assertion", status: "passed", assertion: `Visible text does not include ${JSON.stringify(text)}` });
+  }
+
+  async expectHashIncludes(fragment) {
+    const hash = await this.eval("window.location.hash");
+    const passed = typeof hash === "string" && hash.includes(fragment);
+    this.recordEvidence({
+      type: "assertion",
+      status: passed ? "passed" : "failed",
+      assertion: `URL hash includes ${JSON.stringify(fragment)}`,
+      actual: hash,
+    });
+    if (!passed) throw new EvalError(`Expected URL hash to include ${fragment}, got ${hash}`);
+  }
+
+  async prove(name, options) {
+    const claim = options?.claim ?? name;
+    this.recordEvidence({ type: "claim", status: "running", name, claim });
+    if (typeof options?.action === "function") await options.action();
+    if (typeof options?.assert === "function") await options.assert();
+    if (options?.screenshot) {
+      const screenshot = typeof options.screenshot === "string"
+        ? { name: options.screenshot }
+        : options.screenshot;
+      await this.screenshot(screenshot.name ?? slug(name), { claim, ...screenshot });
+    }
+    this.recordEvidence({ type: "claim", status: "passed", name, claim });
   }
 
   /**
@@ -149,13 +230,48 @@ export class EvalContext {
     return result.result;
   }
 
-  async screenshot(name) {
+  async screenshot(name, options = {}) {
     this.screenshotIndex += 1;
-    const fileName = `${this.flowId}-${String(this.screenshotIndex).padStart(2, "0")}-${name}.png`;
+    const fileName = `${this.flowId}-${String(this.screenshotIndex).padStart(2, "0")}-${slug(name)}.png`;
     const buffer = await captureScreenshot(this.client);
     await writeFile(join(this.outDir, fileName), buffer);
     this.screenshots.push(fileName);
+    const bodyText = await this.eval("document.body.innerText").catch(() => "");
+    const url = await this.eval("location.href").catch(() => "");
+    const hash = createHash("sha256").update(buffer).digest("hex");
+    const dimensions = pngDimensions(buffer);
+    const validations = [
+      { label: "PNG exists and is non-empty", passed: buffer.length > 0, detail: `${buffer.length} bytes` },
+      { label: "PNG dimensions are sane", passed: Boolean(dimensions?.width && dimensions?.height), detail: dimensions ? `${dimensions.width}x${dimensions.height}` : "unknown" },
+      { label: "Frame is not a duplicate of the previous capture", passed: this.lastScreenshotHash !== hash, detail: hash.slice(0, 12) },
+    ];
+    for (const text of options.requireText ?? []) {
+      validations.push({ label: `Required visible text: ${text}`, passed: typeof bodyText === "string" && bodyText.includes(text) });
+    }
+    for (const text of options.rejectText ?? []) {
+      validations.push({ label: `Rejected visible text: ${text}`, passed: !(typeof bodyText === "string" && bodyText.includes(text)) });
+    }
+    if (options.hashIncludes) {
+      validations.push({ label: `URL hash includes ${options.hashIncludes}`, passed: typeof url === "string" && url.includes(options.hashIncludes), detail: url });
+    }
+    const passed = validations.every((item) => item.passed);
+    this.lastScreenshotHash = hash;
+    const frame = {
+      type: "frame",
+      status: passed ? "passed" : "failed",
+      file: fileName,
+      name,
+      claim: options.claim ?? null,
+      url,
+      validations,
+    };
+    this.evidenceFrames.push(frame);
+    this.recordEvidence(frame);
     this.log(`Screenshot: ${fileName}`);
+    if (!passed && options.allowInvalid !== true) {
+      const failed = validations.filter((item) => !item.passed).map((item) => item.label).join(", ");
+      throw new EvalError(`Screenshot evidence failed validation: ${failed}`);
+    }
     return fileName;
   }
 }
