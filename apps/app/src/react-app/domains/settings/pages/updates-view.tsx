@@ -98,6 +98,11 @@ export function UpdatesView(props: UpdatesViewProps) {
   const updateDownloadedBytes = props.updateStatus?.downloadedBytes ?? null;
   const updateTotalBytes = props.updateStatus?.totalBytes ?? null;
   const updateErrorMessage = props.updateStatus?.message ?? null;
+  const updateErrorTitle = props.updateStatus?.failedAction === "install"
+    ? t("settings.update_install_failed")
+    : props.updateStatus?.failedAction === "download"
+      ? t("settings.update_download_failed")
+      : t("settings.update_check_failed");
   const updateNotes = props.updateStatus?.notes ?? null;
 
   const updateRestartActiveRunsMessage =
@@ -122,16 +127,18 @@ export function UpdatesView(props: UpdatesViewProps) {
                     ? t("settings.update_checking")
                     : updateState === "available"
                       ? t("settings.update_available_version", undefined, { version: updateVersion ?? "" })
+                      : updateState === "blocked"
+                        ? t("settings.update_blocked_version", undefined, { version: updateVersion ?? "" })
                       : updateState === "downloading"
                         ? t("settings.update_downloading")
                         : updateState === "ready"
                           ? t("settings.update_ready_version", undefined, { version: updateVersion ?? "" })
                           : updateState === "error"
-                            ? t("settings.update_check_failed")
+                            ? updateErrorTitle
                             : t("settings.update_uptodate")}
                 </LayoutSectionItemTitle>
                 <LayoutSectionItemDescription>
-                  {updateState === "idle" && updateLastCheckedAt
+                  {(updateState === "idle" || updateState === "blocked") && updateLastCheckedAt
                     ? t("settings.update_last_checked", undefined, {
                         time: formatRelativeTime(updateLastCheckedAt),
                       })
@@ -186,6 +193,13 @@ export function UpdatesView(props: UpdatesViewProps) {
               {updateState === "error" && updateErrorMessage ? (
                 <Alert variant="destructive">
                   <CircleAlert />
+                  <AlertDescription>{updateErrorMessage}</AlertDescription>
+                </Alert>
+              ) : null}
+
+              {updateState === "blocked" && updateErrorMessage ? (
+                <Alert>
+                  <Info />
                   <AlertDescription>{updateErrorMessage}</AlertDescription>
                 </Alert>
               ) : null}

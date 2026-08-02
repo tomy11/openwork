@@ -60,61 +60,37 @@ const targetVersion = async () => {
 const updatePackageJson = async (nextVersion) => {
   const uiPath = path.join(ROOT, "package.json");
   const tauriPath = path.join(REPO_ROOT, "apps", "desktop", "package.json");
-  const orchestratorPath = path.join(
-    REPO_ROOT,
-    "apps",
-    "orchestrator",
-    "package.json",
-  );
   const serverPath = path.join(REPO_ROOT, "apps", "server", "package.json");
-  const opencodeRouterPath = path.join(
-    REPO_ROOT,
-    "apps",
-    "opencode-router",
-    "package.json",
-  );
   const uiData = await readJson(uiPath);
   const tauriData = await readJson(tauriPath);
-  const orchestratorData = await readJson(orchestratorPath);
   const serverData = await readJson(serverPath);
-  const opencodeRouterData = await readJson(opencodeRouterPath);
   uiData.version = nextVersion;
   tauriData.version = nextVersion;
-  // Desktop pins opencodeRouterVersion for sidecar bundling; keep it aligned.
-  tauriData.opencodeRouterVersion = nextVersion;
-  orchestratorData.version = nextVersion;
-
-  // Ensure openwork-orchestrator uses the same openwork-server/opencode-router versions.
-  orchestratorData.dependencies = orchestratorData.dependencies ?? {};
-  orchestratorData.dependencies["openwork-server"] = nextVersion;
-  orchestratorData.dependencies["opencode-router"] = nextVersion;
 
   serverData.version = nextVersion;
-  opencodeRouterData.version = nextVersion;
   if (!isDryRun) {
     await writeFile(uiPath, JSON.stringify(uiData, null, 2) + "\n");
     await writeFile(tauriPath, JSON.stringify(tauriData, null, 2) + "\n");
-    await writeFile(
-      orchestratorPath,
-      JSON.stringify(orchestratorData, null, 2) + "\n",
-    );
     await writeFile(serverPath, JSON.stringify(serverData, null, 2) + "\n");
-    await writeFile(
-      opencodeRouterPath,
-      JSON.stringify(opencodeRouterData, null, 2) + "\n",
-    );
   }
 };
 
-// apps/orchestrator pins exact versions of workspace packages, so the lockfile
-// must be resynced after a bump or CI's --frozen-lockfile install fails.
-const syncLockfile = () => {
-  const result = spawnSync("pnpm", ["install", "--lockfile-only"], {
-    cwd: REPO_ROOT,
-    stdio: "inherit",
-  });
+const syncDesktopVersions = (nextVersion) => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.join(REPO_ROOT, "scripts", "release", "generate-desktop-versions.mjs"),
+      "--version",
+      nextVersion,
+      ...(isDryRun ? ["--dry-run"] : []),
+    ],
+    {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+    },
+  );
   if (result.status !== 0) {
-    throw new Error("pnpm install --lockfile-only failed");
+    throw new Error("desktop version inventory generation failed");
   }
 };
 
@@ -128,7 +104,7 @@ const main = async () => {
 
   const nextVersion = await targetVersion();
   await updatePackageJson(nextVersion);
-  if (!isDryRun) syncLockfile();
+  syncDesktopVersions(nextVersion);
 
   console.log(
     JSON.stringify(
@@ -139,10 +115,8 @@ const main = async () => {
         files: [
           "apps/app/package.json",
           "apps/desktop/package.json",
-          "apps/orchestrator/package.json",
           "apps/server/package.json",
-          "apps/opencode-router/package.json",
-          "pnpm-lock.yaml",
+          "ee/apps/den-api/src/generated/desktop-versions.ts",
         ],
       },
       null,

@@ -35,6 +35,7 @@ interface RegisterSessionRoutesOptions {
   ensureWritable: (config: ServerConfig) => void;
   requireClientScope: (ctx: RequestContext, required: TokenScope) => void;
   resolveWorkspace: (config: ServerConfig, id: string) => Promise<WorkspaceInfo>;
+  resolveWorkspaceWithoutBootstrap: (config: ServerConfig, id: string) => Promise<WorkspaceInfo>;
   createWorkspaceOpencodeClient: (config: ServerConfig, workspace: WorkspaceInfo) => WorkspaceOpencodeClient;
   unwrapOpencodeResult: UnwrapOpencodeResult;
 }
@@ -55,6 +56,7 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
     ensureWritable,
     requireClientScope,
     resolveWorkspace,
+    resolveWorkspaceWithoutBootstrap,
     createWorkspaceOpencodeClient,
     unwrapOpencodeResult,
   } = options;
@@ -95,6 +97,35 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
     } catch (error) {
       remapSessionReadError(error);
     }
+  }
+
+  async function createWorkspaceSession(
+    workspace: WorkspaceInfo,
+    input: { title: string; prompt?: string },
+  ) {
+    const opencode = createWorkspaceOpencodeClient(config, workspace);
+    const session = buildSession(
+      unwrapOpencodeResult(
+        await opencode.session.create({ title: input.title }),
+        "/session",
+      ),
+    );
+
+    if (input.prompt) {
+      const result = await opencode.session.promptAsync({
+        sessionID: session.id,
+        parts: [{ type: "text", text: input.prompt }],
+      });
+      if (result.error !== undefined) {
+        throw new ApiError(502, "opencode_request_failed", "OpenCode request failed", {
+          status: result.response.status,
+          body: result.error,
+          path: `/session/${encodeURIComponent(session.id)}/prompt_async`,
+        });
+      }
+    }
+
+    return { item: session, started: Boolean(input.prompt) };
   }
 
   async function readWorkspaceSession(workspace: WorkspaceInfo, sessionId: string) {
@@ -169,6 +200,32 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
     return value.trim();
   }
 
+  function optionalStringField(body: Record<string, unknown>, field: string): string | undefined {
+    const value = body[field];
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value !== "string" || !value.trim()) {
+      throw new ApiError(400, "invalid_payload", `${field} must be a non-empty string`);
+    }
+    return value.trim();
+  }
+
+  addRoute(routes, "POST", "/workspace/:id/sessions", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const title = requireStringField(body, "title");
+    if (title.length > 120) {
+      throw new ApiError(400, "invalid_payload", "title must be 120 characters or fewer");
+    }
+    const prompt = optionalStringField(body, "prompt");
+    if (prompt && prompt.length > 100_000) {
+      throw new ApiError(400, "invalid_payload", "prompt must be 100000 characters or fewer");
+    }
+    const result = await createWorkspaceSession(workspace, { title, ...(prompt ? { prompt } : {}) });
+    return jsonResponse(result, 201);
+  });
+
   addRoute(routes, "GET", "/workspace/:id/sessions", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const items = await listWorkspaceSessions(workspace, {
@@ -181,7 +238,7 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
   });
 
   addRoute(routes, "GET", "/workspace/:id/session-groups", "client", async (ctx) => {
-    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const workspace = await resolveWorkspaceWithoutBootstrap(config, ctx.params.id);
     const result = await readSessionGroupState(config, workspace.id);
     return jsonResponse({ state: result.state, updatedAt: result.updatedAt });
   });
@@ -284,10 +341,18 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const groupId = (ctx.params.groupId ?? "").trim();
     if (!groupId) throw new ApiError(400, "invalid_payload", "groupId is required");
+    const requestedDestinationGroupId = ctx.url.searchParams.get("destinationGroupId")?.trim() || null;
     const result = await updateWorkspaceSessionGroups(workspace.id, (current) => {
+      const destinationGroupId = requestedDestinationGroupId && current.groups.some(
+        (group) => group.id === requestedDestinationGroupId && group.id !== groupId,
+      ) ? requestedDestinationGroupId : null;
       const assignments: Record<string, string> = {};
       for (const [sessionId, assignedGroupId] of Object.entries(current.assignments)) {
-        if (assignedGroupId !== groupId) assignments[sessionId] = assignedGroupId;
+        if (assignedGroupId !== groupId) {
+          assignments[sessionId] = assignedGroupId;
+        } else if (destinationGroupId) {
+          assignments[sessionId] = destinationGroupId;
+        }
       }
       return {
         groups: current.groups.filter((group) => group.id !== groupId),
@@ -299,7 +364,7 @@ export function registerSessionRoutes(options: RegisterSessionRoutesOptions): vo
   });
 
   addRoute(routes, "GET", "/workspace/:id/session-groups/events", "client", async (ctx) => {
-    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const workspace = await resolveWorkspaceWithoutBootstrap(config, ctx.params.id);
     const sinceRaw = ctx.url.searchParams.get("since");
     const since = sinceRaw ? Number(sinceRaw) : undefined;
     const items = sessionGroupEvents.list(workspace.id, since);

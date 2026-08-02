@@ -4,9 +4,19 @@ import { mkdir } from "node:fs/promises";
 
 import { parseCliArgs, printHelp, resolveServerConfig } from "./config.js";
 import { createManagedOpencodeServer, type ManagedOpencodeServer } from "./managed-opencode.js";
-import { createServerLogger, startServer, syncAllWorkspacesRuntimeMcpToEngine } from "./server.js";
-import { ensureWorkspaceFiles } from "./workspace-init.js";
+import {
+  clearTrustedOpencodeProcess,
+  createServerLogger,
+  registerTrustedOpencodeProcess,
+  startServer,
+  syncAllWorkspacesRuntimeMcpToEngine,
+} from "./server.js";
+import { ensureLocalWorkspaceFiles } from "./workspace-init.js";
+import { findManagedEngineWorkspace } from "./workspaces.js";
 import { keepOpenworkRuntimeConfigFileFresh, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
+import { sweepLegacyOpenCodeConfig } from "./legacy-config-sweep.js";
+import { resolveOpencodeModelsUrl } from "./opencode-models-url.js";
+import { startWorkerActivityHeartbeat } from "./worker-activity-heartbeat.js";
 import pkg from "../package.json" with { type: "json" };
 
 const args = parseCliArgs(process.argv.slice(2));
@@ -25,23 +35,24 @@ const config = await resolveServerConfig(args);
 const logger = createServerLogger(config);
 const serverUrl = `http://${config.host === "0.0.0.0" ? "127.0.0.1" : config.host}:${config.port}`;
 let managedOpencode: ManagedOpencodeServer | null = null;
+let managedOpencodeIdentity: string | null = null;
 
 if (!config.readOnly) {
-  for (const workspace of config.workspaces) {
-    await ensureWorkspaceFiles(workspace.path, workspace.preset ?? "starter");
-  }
+  await ensureLocalWorkspaceFiles(config.workspaces);
 }
 
 if (!config.opencodeBaseUrl && process.env.OPENWORK_MANAGE_OPENCODE === "1") {
-  const workspace = config.workspaces[0];
-  if (workspace?.path) {
+  const workspace = findManagedEngineWorkspace(config.workspaces);
+  if (workspace) {
     // Server-managed config file: the engine re-reads it from disk on every
-    // instance rebuild, and keepOpenworkRuntimeConfigFileFresh rewrites it
+    // instance rebuild, and keepOpenworkRuntimeConfigFileFresh synchronizes it
     // on every runtime-DB write — so disposes always pick up current state.
-    const runtimeConfigPath = await writeOpenworkRuntimeConfigFile(config, workspace.id);
+    const { path: runtimeConfigPath } = await writeOpenworkRuntimeConfigFile(config, workspace.id);
     keepOpenworkRuntimeConfigFileFresh(config, workspace.id);
     const managedOpencodeCwd = process.env.OPENWORK_MANAGED_OPENCODE_CWD?.trim() || workspace.path;
     await mkdir(managedOpencodeCwd, { recursive: true });
+    await sweepLegacyOpenCodeConfig(config).catch(() => undefined);
+    const opencodeModelsUrl = await resolveOpencodeModelsUrl();
     managedOpencode = await createManagedOpencodeServer({
       bin: process.env.OPENWORK_OPENCODE_BIN,
       cwd: managedOpencodeCwd,
@@ -52,6 +63,7 @@ if (!config.opencodeBaseUrl && process.env.OPENWORK_MANAGE_OPENCODE === "1") {
         OPENWORK_SERVER_URL: serverUrl,
         OPENWORK_SERVER_TOKEN: config.token,
         OPENCODE_CONFIG: runtimeConfigPath,
+        OPENCODE_MODELS_URL: opencodeModelsUrl,
       },
     });
     config.opencodeBaseUrl = managedOpencode.url;
@@ -63,11 +75,22 @@ if (!config.opencodeBaseUrl && process.env.OPENWORK_MANAGE_OPENCODE === "1") {
       entry.opencodePassword ??= managedOpencode.password;
       entry.directory ??= entry.path;
     }
+    managedOpencodeIdentity = [
+      managedOpencode.pid ?? "unknown",
+      managedOpencode.username,
+      managedOpencode.password,
+    ].join(":");
+    registerTrustedOpencodeProcess(config, {
+      baseUrl: managedOpencode.url,
+      identity: managedOpencodeIdentity,
+      isAlive: managedOpencode.isAlive,
+    });
     logger.log("info", `Managed OpenCode listening on ${managedOpencode.url}`);
   }
 }
 
 const server = await startServer(config);
+const workerActivityHeartbeat = startWorkerActivityHeartbeat(config, logger);
 
 // The runtime config file above only covers workspaces[0]. Push every
 // workspace's runtime-DB MCPs into the engine so they aren't invisible
@@ -104,6 +127,10 @@ if (args.verbose) {
 }
 
 const shutdown = () => {
+  workerActivityHeartbeat?.stop();
+  if (managedOpencodeIdentity) {
+    clearTrustedOpencodeProcess(config, managedOpencodeIdentity);
+  }
   void managedOpencode?.close();
   (server as { stop?: (closeActiveConnections?: boolean) => void }).stop?.(true);
 };

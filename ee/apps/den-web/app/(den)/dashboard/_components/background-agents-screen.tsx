@@ -18,7 +18,6 @@ import {
 import { DenInput } from "../../_components/ui/input";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
 import {
-  OPENWORK_APP_CONNECT_BASE_URL,
   buildOpenworkAppConnectUrl,
   buildOpenworkDeepLink,
   getErrorMessage,
@@ -301,6 +300,7 @@ export function BackgroundAgentsScreen() {
     workersError,
     renameWorker,
     renameBusyWorkerId,
+    runtimeConfig,
   } = useDenFlow();
 
   async function loadConnectionDetails(workerId: string, workerName: string) {
@@ -333,7 +333,7 @@ export function BackgroundAgentsScreen() {
         ownerToken: tokens.ownerToken,
         clientToken: tokens.clientToken,
         openworkAppConnectUrl: buildOpenworkAppConnectUrl(
-          OPENWORK_APP_CONNECT_BASE_URL,
+          runtimeConfig.openworkAppConnectUrl,
           tokens.openworkUrl,
           tokens.clientToken,
           workerId,

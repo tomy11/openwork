@@ -4,8 +4,70 @@ import { isMcpOperationAllowed, type OpenApiOperation } from "./policy.js"
 
 const METHODS = new Set(["get", "post", "put", "patch", "delete"])
 
+// AWS Bedrock's Converse API rejects any `toolConfig.tools.*.member.toolSpec.name`
+// longer than 64 characters. MCP clients namespace our tools as
+// `<serverName>_<name>` (e.g. `openwork-cloud_` adds 15 chars), so the raw
+// operationId budget is even tighter. We keep the registered tool name well
+// under 64 so the prefixed name still validates on Bedrock.
+export const BEDROCK_MAX_TOOL_NAME_LENGTH = 64
+export const MAX_CLIENT_PREFIX = "openwork-cloud_".length // 15
+export const MAX_TOOL_NAME_LENGTH = BEDROCK_MAX_TOOL_NAME_LENGTH - MAX_CLIENT_PREFIX // 49
+
+// Generated operationIds are verbose and structured: `<verb>V1<Resource>By<Param>Id<Sub>...`.
+// The `V1` version marker and the `By<Param>Id` path-param restatements carry no
+// meaning for a model choosing a tool; it reasons about verb + resource nouns.
+// Stripping them yields short, unique, human-readable names (e.g.
+// `deleteV1ConnectorInstancesByConnectorInstanceIdAccessByGrantId` ->
+// `deleteConnectorInstancesAccess`) that an LLM recognizes far more reliably
+// than a truncated+hashed name.
+function structuralShorten(name: string): string {
+  return name
+    .replace(/^(get|post|put|patch|delete)V1/, "$1") // version marker is irrelevant to tool selection
+    .replace(/By[A-Z][a-zA-Z]*?Id/g, "") // drop "ByConfigObjectId" path-param markers
+}
+
+// Deterministic, stable short hash (FNV-1a, base36) used only as a last-resort
+// fallback when two structurally-shortened names collide. Stable across runs so
+// tool identities don't churn between deploys.
+function shortHash(value: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+// Produce the registered MCP tool name. Structurally shortens every name for a
+// clean, consistent catalog, then disambiguates against `taken` with a short
+// deterministic hash suffix only if two operationIds collapse to the same name.
+//
+// Note: this does NOT silently truncate over-length names. If structural
+// shortening cannot fit the budget, buildMcpCatalog's guard throws so the
+// regression is fixed in structuralShorten() rather than shipped as a
+// hard-to-read hashed name. See the guard in buildMcpCatalog.
+export function shortenToolName(operationId: string, taken?: ReadonlySet<string>): string {
+  const base = structuralShorten(operationId)
+  if (!taken?.has(base)) {
+    return base
+  }
+  // Deterministic disambiguation: append a stable hash of the full operationId.
+  const suffix = `_${shortHash(operationId)}`
+  let name = `${base.slice(0, Math.max(1, MAX_TOOL_NAME_LENGTH - suffix.length))}${suffix}`
+  let salt = 1
+  while (taken.has(name)) {
+    const salted = `_${shortHash(`${operationId}#${salt}`)}`
+    name = `${base.slice(0, Math.max(1, MAX_TOOL_NAME_LENGTH - salted.length))}${salted}`
+    salt += 1
+  }
+  return name
+}
+
 type OpenApiDocument = {
   paths?: Record<string, Record<string, OpenApiOperation>>
+  components?: {
+    parameters?: Record<string, unknown>
+  }
 }
 
 type OpenApiParameter = {
@@ -37,10 +99,46 @@ export type McpToolOperation = {
 }
 
 function isOpenApiParameter(value: unknown): value is OpenApiParameter {
-  return typeof value === "object" && value !== null
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function getParameters(operation: OpenApiOperation, location: "path" | "query") {
+function componentParameterName(value: unknown) {
+  if (!isOpenApiParameter(value) || !("$ref" in value)) {
+    return null
+  }
+
+  const ref = value.$ref
+  const prefix = "#/components/parameters/"
+  if (typeof ref !== "string" || !ref.startsWith(prefix)) {
+    return null
+  }
+
+  const name = ref.slice(prefix.length)
+  return name.length > 0 ? name : null
+}
+
+function resolveParameterReference(document: OpenApiDocument, parameter: unknown) {
+  const name = componentParameterName(parameter)
+  if (!name) {
+    return parameter
+  }
+
+  const resolved = document.components?.parameters?.[name]
+  return isOpenApiParameter(resolved) ? resolved : parameter
+}
+
+function resolveOperationParameterRefs(document: OpenApiDocument, operation: OpenApiOperation): OpenApiOperation {
+  if (!operation.parameters) {
+    return operation
+  }
+
+  return {
+    ...operation,
+    parameters: operation.parameters.map((parameter) => resolveParameterReference(document, parameter)),
+  }
+}
+
+export function getParameters(operation: OpenApiOperation, location: "path" | "query") {
   return (operation.parameters ?? [])
     .filter(isOpenApiParameter)
     .filter((parameter) => parameter.in === location && typeof parameter.name === "string" && parameter.name.length > 0)
@@ -82,7 +180,7 @@ function objectForParameters(parameters: OpenApiParameter[], requiredByDefault: 
   return z.object(shape).strict()
 }
 
-function pathParameterNamesFromTemplate(path: string) {
+export function pathParameterNamesFromTemplate(path: string) {
   return [...path.matchAll(/\{([^}]+)\}/g)].map((match) => match[1]).filter(Boolean)
 }
 
@@ -99,10 +197,22 @@ function buildQuerySchema(operation: OpenApiOperation) {
   return parameters.length > 0 ? objectForParameters(parameters, false) : undefined
 }
 
-function hasJsonRequestBody(operation: OpenApiOperation) {
+export function hasJsonRequestBody(operation: OpenApiOperation) {
   const requestBody = getRequestBody(operation)
   const content = requestBody?.content
   return typeof content === "object" && content !== null && "application/json" in content
+}
+
+export function getJsonRequestBodySchema(operation: OpenApiOperation): unknown {
+  const content = getRequestBody(operation)?.content
+  if (typeof content !== "object" || content === null || !("application/json" in content)) {
+    return undefined
+  }
+  const mediaType = content["application/json"]
+  if (typeof mediaType !== "object" || mediaType === null || !("schema" in mediaType)) {
+    return undefined
+  }
+  return mediaType.schema
 }
 
 function getRequestBody(operation: OpenApiOperation): OpenApiRequestBody | null {
@@ -192,17 +302,32 @@ export function buildMcpCatalog(document: OpenApiDocument): McpToolOperation[] {
         continue
       }
 
-      if (!isMcpOperationAllowed({ method, path, operation })) {
+      const resolvedOperation = resolveOperationParameterRefs(document, operation)
+
+      if (!isMcpOperationAllowed({ method, path, operation: resolvedOperation })) {
         continue
       }
 
-      const name = operation.operationId
-      if (!name) {
+      const operationId = resolvedOperation.operationId
+      if (!operationId) {
         continue
       }
 
+      const name = shortenToolName(operationId, names)
       if (names.has(name)) {
-        throw new Error(`Duplicate MCP tool operationId: ${name}`)
+        throw new Error(`Duplicate MCP tool name after shortening: ${name} (operationId: ${operationId})`)
+      }
+
+      // Guard against future regressions: a tool name that overflows the client
+      // prefix budget (e.g. `openwork-cloud_` + name > 64) is rejected by AWS
+      // Bedrock's Converse API and breaks every Bedrock model. Surface it here,
+      // at catalog-build time (covered by tests/CI), instead of in production.
+      const prefixedLength = MAX_CLIENT_PREFIX + name.length
+      if (name.length > MAX_TOOL_NAME_LENGTH) {
+        throw new Error(
+          `MCP tool name too long for Bedrock: "${name}" (${prefixedLength} chars prefixed, max 64; operationId: ${operationId}). ` +
+            `Adjust structuralShorten() in catalog.ts.`,
+        )
       }
       names.add(name)
 
@@ -210,8 +335,8 @@ export function buildMcpCatalog(document: OpenApiDocument): McpToolOperation[] {
         name,
         method: method.toUpperCase(),
         path,
-        operation,
-        inputSchema: buildInputSchema(path, operation),
+        operation: resolvedOperation,
+        inputSchema: buildInputSchema(path, resolvedOperation),
       })
     }
   }

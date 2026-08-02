@@ -6,7 +6,11 @@ import { addMcp, listMcp, setMcpEnabled } from "./mcp.js";
 import { buildOpenworkRuntimeConfig } from "./openwork-runtime-config.js";
 import { readOpenworkWorkspaceConfig } from "./openwork-workspace-config-store.js";
 import { addPlugin, listPlugins, removePlugin } from "./plugins.js";
-import { readRuntimeOpencodeConfig } from "./runtime-opencode-config-store.js";
+import {
+  onRuntimeOpencodeConfigWrite,
+  readRuntimeOpencodeConfig,
+  writeRuntimeOpencodeConfig,
+} from "./runtime-opencode-config-store.js";
 import { startServer } from "./server.js";
 import type { ServerConfig } from "./types.js";
 
@@ -40,13 +44,21 @@ function serverConfig(root: string, dbPath: string): ServerConfig {
 async function withWorkspace(fn: (input: { root: string; config: ServerConfig }) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "openwork-runtime-config-"));
   const previousDb = process.env.OPENWORK_RUNTIME_DB;
+  const previousOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
   const dbPath = join(root, "runtime.sqlite");
   process.env.OPENWORK_RUNTIME_DB = dbPath;
+  // MCP listings merge the global OpenCode config layer, so point it at an
+  // empty directory inside the fixture. Without this the assertions observe
+  // whatever MCP servers the developer happens to have in ~/.config/opencode.
+  process.env.OPENCODE_CONFIG_DIR = join(root, "global-opencode");
+  await mkdir(process.env.OPENCODE_CONFIG_DIR, { recursive: true });
   try {
     await fn({ root, config: serverConfig(root, dbPath) });
   } finally {
     if (previousDb === undefined) delete process.env.OPENWORK_RUNTIME_DB;
     else process.env.OPENWORK_RUNTIME_DB = previousDb;
+    if (previousOpencodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
+    else process.env.OPENCODE_CONFIG_DIR = previousOpencodeConfigDir;
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -56,6 +68,43 @@ async function expectMissing(path: string): Promise<void> {
 }
 
 describe("runtime OpenCode config store", () => {
+  test("reports no-op writes without notifying listeners", async () => {
+    await withWorkspace(async ({ config }) => {
+      let writes = 0;
+      const unsubscribe = onRuntimeOpencodeConfigWrite((writtenConfig, workspaceId) => {
+        if (writtenConfig === config && workspaceId === WORKSPACE_ID) {
+          writes += 1;
+        }
+      });
+
+      try {
+        const first = await writeRuntimeOpencodeConfig(config, WORKSPACE_ID, (current) => ({
+          ...current,
+          mcp: { posthog: { type: "remote", url: "https://mcp.posthog.com/mcp", enabled: true } },
+        }));
+        expect(first.changed).toBe(true);
+        expect(writes).toBe(1);
+
+        const second = await writeRuntimeOpencodeConfig(config, WORKSPACE_ID, (current) => ({
+          ...current,
+          mcp: { posthog: { type: "remote", url: "https://mcp.posthog.com/mcp", enabled: true } },
+        }));
+        expect(second.changed).toBe(false);
+        expect(second.config).toEqual(first.config);
+        expect(writes).toBe(1);
+
+        const third = await writeRuntimeOpencodeConfig(config, WORKSPACE_ID, (current) => ({
+          ...current,
+          mcp: { posthog: { type: "remote", url: "https://mcp.posthog.com/mcp", enabled: false } },
+        }));
+        expect(third.changed).toBe(true);
+        expect(writes).toBe(2);
+      } finally {
+        unsubscribe();
+      }
+    });
+  });
+
   test("stores MCP changes in the OpenWork runtime DB without rewriting workspace files", async () => {
     await withWorkspace(async ({ root, config }) => {
       const opencodePath = join(root, "opencode.jsonc");
@@ -195,7 +244,10 @@ describe("runtime OpenCode config store", () => {
         expect(runtime.permission?.external_directory?.["/legacy/*"]).toBe("allow");
         expect(runtime.provider?.legacy).toEqual({ npm: "legacy-provider" });
 
-        const openwork = JSON.parse(await readFile(openworkPath, "utf8")) as Record<string, unknown>;
+        // The legacy file is migrated into the runtime DB and never rewritten.
+        // The cleaned config (legacy runtime keys stripped, metadata kept)
+        // now lives in the DB-backed openwork config.
+        const openwork = await readOpenworkWorkspaceConfig(config, WORKSPACE_ID);
         expect(openwork.version).toBe(1);
         expect(openwork.workspace).toEqual({ name: "Test" });
         expect(openwork.plugin).toBeUndefined();

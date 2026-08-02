@@ -3,9 +3,11 @@ import { basename, dirname, resolve } from "node:path";
 import { recordAudit } from "../audit.js";
 import { ApiError } from "../errors.js";
 import { inheritWorkspaceOpencodeConnection, resolveWorkspaceOpencodeConnection } from "../opencode-connection.js";
+import { externalFetch } from "../server-fetch.js";
 import type { ServerConfig, WorkspaceInfo } from "../types.js";
 import { ensureDir, exists, shortId } from "../utils.js";
-import { ensureWorkspaceFiles } from "../workspace-init.js";
+import { defaultWorkspaceOpenworkConfig, ensureWorkspaceFiles } from "../workspace-init.js";
+import { seedOpenworkWorkspaceConfigIfEmpty } from "../openwork-workspace-config-store.js";
 import { workspaceIdForPath, workspaceIdForRemote } from "../workspaces.js";
 import { addRoute, type Route } from "./registry.js";
 
@@ -132,7 +134,7 @@ async function fetchOpenworkWorkspaceList(hostUrl: string, token: string, hostTo
   if (hostToken) headers.set("X-OpenWork-Host-Token", hostToken);
 
   try {
-    const response = await fetch(url, { headers, signal: controller.signal });
+    const response = await externalFetch(url, { headers, signal: controller.signal });
     if (!response.ok) {
       throw new ApiError(
         502,
@@ -277,8 +279,17 @@ export function registerWorkspaceRoutes(options: RegisterWorkspaceRoutesOptions)
     await ensureDir(workspacePath);
     await ensureWorkspaceFiles(workspacePath, preset);
 
+    const workspaceId = workspaceIdForPath(workspacePath);
+    // Seed the per-workspace openwork config in the runtime DB (replaces the
+    // legacy `.opencode/openwork.json` file). No-op if a row already exists.
+    await seedOpenworkWorkspaceConfigIfEmpty(
+      config,
+      workspaceId,
+      defaultWorkspaceOpenworkConfig(workspacePath, preset),
+    );
+
     const workspace: WorkspaceInfo = {
-      id: workspaceIdForPath(workspacePath),
+      id: workspaceId,
       name,
       path: workspacePath,
       preset,
@@ -446,6 +457,7 @@ export function registerWorkspaceRoutes(options: RegisterWorkspaceRoutesOptions)
     const body = queryPersist === undefined ? await readOptionalJsonBody(ctx.request) : {};
     const persist = queryPersist ?? (body.persist === true);
     if (persist) ensureWritable(config);
+    const wasActive = config.workspaces[0]?.id === workspace.id;
     config.workspaces = [
       workspace,
       ...config.workspaces.filter((entry) => entry.id !== workspace.id),
@@ -461,7 +473,8 @@ export function registerWorkspaceRoutes(options: RegisterWorkspaceRoutesOptions)
       summary: "Switched active workspace",
       timestamp: Date.now(),
     });
-    if (workspace.workspaceType === "local" && resolveWorkspaceOpencodeConnection(config, workspace).baseUrl?.trim()) {
+    // Re-activating the already-active workspace must not dispose its engine instance; switch reloads stay (#870).
+    if (!wasActive && workspace.workspaceType === "local" && resolveWorkspaceOpencodeConnection(config, workspace).baseUrl?.trim()) {
       await reloadOpencodeEngine(config, workspace);
     }
     return jsonResponse({ activeId: workspace.id, workspace: serializeWorkspace(workspace), persisted });

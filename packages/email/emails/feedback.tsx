@@ -14,8 +14,6 @@ FeedbackPreview.PreviewProps = {
   appVersion: "0.13.5",
   openworkServerVersion: "0.13.5",
   opencodeVersion: "1.4.9",
-  orchestratorVersion: "0.13.5",
-  opencodeRouterVersion: "unknown",
   osName: "macOS",
   osVersion: "15.4",
   platform: "MacIntel",

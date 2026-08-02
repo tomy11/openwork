@@ -1,4 +1,4 @@
-import type { WorkspacePreset } from "../../../app/types";
+import type { ComposerAttachment, WorkspacePreset } from "../../../app/types";
 
 export type CreateWorkspaceScreen = "chooser" | "local" | "remote";
 
@@ -10,6 +10,14 @@ export type RemoteWorkspaceInput = {
   directory?: string | null;
   displayName?: string | null;
   closeModal?: boolean;
+};
+
+export type CreateWorkspaceOptions = {
+  projectLabel?: string | null;
+  /** Saved as the first session's composer draft after the workspace is created. */
+  firstTaskPrompt?: string | null;
+  /** Seeded into the first session's composer with the draft, then sent by auto-send. */
+  firstTaskAttachments?: ComposerAttachment[] | null;
 };
 
 export type CreateWorkspaceProgress = {
@@ -29,14 +37,15 @@ export type CreateWorkspaceProgress = {
 export type CreateWorkspaceModalProps = {
   open: boolean;
   onClose: () => void;
-  onConfirm: (preset: WorkspacePreset, folder: string | null) => void;
+  onConfirm: (preset: WorkspacePreset, folder: string | null, options?: CreateWorkspaceOptions) => void;
   onConfirmRemote?: (input: RemoteWorkspaceInput) => Promise<boolean> | boolean | void;
-  onConfirmWorker?: (preset: WorkspacePreset, folder: string | null) => void;
+  onConfirmWorker?: (preset: WorkspacePreset, folder: string | null, options?: CreateWorkspaceOptions) => void;
   onPickFolder: () => Promise<string | null>;
   onImportConfig?: () => void;
   importingConfig?: boolean;
   submitting?: boolean;
   localError?: string | null;
+  showProjectLabel?: boolean;
   remoteSubmitting?: boolean;
   remoteError?: string | null;
   showClose?: boolean;

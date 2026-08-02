@@ -93,6 +93,8 @@ import {
   pluginDetailResponseSchema,
   pluginListQuerySchema,
   pluginListResponseSchema,
+  pluginMcpRequirementConfigureResponseSchema,
+  pluginMcpRequirementConfigureSchema,
   pluginMembershipMutationResponseSchema,
   pluginMembershipListResponseSchema,
   pluginMembershipWriteSchema,
@@ -100,10 +102,12 @@ import {
   pluginParamsSchema,
   pluginUpdateSchema,
   resourceAccessGrantWriteSchema,
+  teamParamsSchema,
+  teamPluginAccessListResponseSchema,
 } from "./schemas.js"
 
 type EndpointMethod = "DELETE" | "GET" | "PATCH" | "POST"
-type EndpointAudience = "admin" | "public_webhook"
+type EndpointAudience = "admin" | "member" | "public_webhook"
 type EndpointTag = "Config Objects" | "Plugins" | "Marketplaces" | "Connectors" | "GitHub" | "Webhooks"
 
 type EndpointContract = {
@@ -160,14 +164,19 @@ export const pluginArchRoutePaths = {
   pluginRestore: `${orgBasePath}/plugins/:pluginId/restore`,
   pluginConfigObjects: `${orgBasePath}/plugins/:pluginId/config-objects`,
   pluginConfigObject: `${orgBasePath}/plugins/:pluginId/config-objects/:configObjectId`,
+  pluginMcpConnections: `${orgBasePath}/plugins/:pluginId/mcp-connections`,
   pluginResolved: `${orgBasePath}/plugins/:pluginId/resolved`,
   pluginReleases: `${orgBasePath}/plugins/:pluginId/releases`,
   pluginAccess: `${orgBasePath}/plugins/:pluginId/access`,
   pluginAccessGrant: `${orgBasePath}/plugins/:pluginId/access/:grantId`,
+  teamPluginAccess: `${orgBasePath}/teams/:teamId/plugin-access`,
+  pluginGithubMcpImportPreview: `${orgBasePath}/plugins/import-mcps-from-github-url/preview`,
+  pluginGithubMcpImport: `${orgBasePath}/plugins/import-mcps-from-github-url`,
   marketplaces: `${orgBasePath}/marketplaces`,
   marketplace: `${orgBasePath}/marketplaces/:marketplaceId`,
   marketplaceResolved: `${orgBasePath}/marketplaces/:marketplaceId/resolved`,
   marketplaceArchive: `${orgBasePath}/marketplaces/:marketplaceId/archive`,
+  marketplaceDelete: `${orgBasePath}/marketplaces/:marketplaceId/delete`,
   marketplaceRestore: `${orgBasePath}/marketplaces/:marketplaceId/restore`,
   marketplacePlugins: `${orgBasePath}/marketplaces/:marketplaceId/plugins`,
   marketplacePlugin: `${orgBasePath}/marketplaces/:marketplaceId/plugins/:pluginId`,
@@ -227,7 +236,7 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
     tag: "Config Objects",
   },
   createConfigObject: {
-    audience: "admin",
+    audience: "member",
     description: "Create a cloud or imported config object and optionally attach it to plugins.",
     method: "POST",
     path: pluginArchRoutePaths.configObjects,
@@ -237,7 +246,7 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
   },
   createConfigObjectVersion: {
     audience: "admin",
-    description: "Create a new immutable version for an existing config object.",
+    description: "Update an existing config object, including a Cloud skill, by creating a new immutable version without creating a duplicate.",
     method: "POST",
     path: pluginArchRoutePaths.configObjectVersions,
     request: { body: configObjectCreateVersionSchema, params: configObjectParamsSchema },
@@ -371,8 +380,8 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
     tag: "Plugins",
   },
   createPlugin: {
-    audience: "admin",
-    description: "Create a private-by-default plugin.",
+    audience: "member",
+    description: "Create a private-by-default plugin, optionally bundled with components, org-wide sharing, and marketplace publishing.",
     method: "POST",
     path: pluginArchRoutePaths.plugins,
     request: { body: pluginCreateSchema },
@@ -442,6 +451,15 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
     response: { description: "Resolved plugin membership view.", schema: pluginMembershipListResponseSchema, status: 200 },
     tag: "Plugins",
   },
+  configurePluginMcpRequirement: {
+    audience: "admin",
+    description: "Configure one declared remote MCP server from a plugin by deriving its URL and audience server-side.",
+    method: "POST",
+    path: pluginArchRoutePaths.pluginMcpConnections,
+    request: { body: pluginMcpRequirementConfigureSchema, params: pluginParamsSchema },
+    response: { description: "Plugin MCP requirement connection configured successfully.", schema: pluginMcpRequirementConfigureResponseSchema, status: 200 },
+    tag: "Plugins",
+  },
   listPluginAccess: {
     audience: "admin",
     description: "List direct, team, and org-wide grants for a plugin.",
@@ -449,6 +467,15 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
     path: pluginArchRoutePaths.pluginAccess,
     request: { params: pluginParamsSchema },
     response: { description: "Plugin access grants.", schema: accessGrantListResponseSchema, status: 200 },
+    tag: "Plugins",
+  },
+  listTeamPluginAccess: {
+    audience: "member",
+    description: "List the plugins a team can use through direct, marketplace, and organization-wide access.",
+    method: "GET",
+    path: pluginArchRoutePaths.teamPluginAccess,
+    request: { params: teamParamsSchema },
+    response: { description: "Effective plugin access for the team.", schema: teamPluginAccessListResponseSchema, status: 200 },
     tag: "Plugins",
   },
   grantPluginAccess: {
@@ -512,6 +539,15 @@ export const pluginArchEndpointContracts: Record<string, EndpointContract> = {
     path: pluginArchRoutePaths.marketplaceArchive,
     request: { params: marketplaceParamsSchema },
     response: { description: "Archived marketplace detail.", schema: marketplaceMutationResponseSchema, status: 200 },
+    tag: "Marketplaces",
+  },
+  deleteMarketplace: {
+    audience: "admin",
+    description: "Permanently delete a custom marketplace and its access and plugin relationships.",
+    method: "POST",
+    path: pluginArchRoutePaths.marketplaceDelete,
+    request: { params: marketplaceParamsSchema },
+    response: { description: "Snapshot of the deleted marketplace.", schema: marketplaceMutationResponseSchema, status: 200 },
     tag: "Marketplaces",
   },
   restoreMarketplace: {

@@ -182,12 +182,12 @@ export const SETTINGS_TAB_VALUES = [
   "ai",
   "preferences",
   "permissions",
-  "shell",
   "cloud-account",
+  "connect",
   "cloud-marketplaces",
-  "cloud-workers",
   "cloud-providers",
   "skills",
+  "memory",
   "extensions",
   "environment",
   "advanced",
@@ -277,36 +277,18 @@ export type WorkspaceOpenworkConfig = {
   } | null;
 };
 
+export type CapabilityOrigin = "local" | "openwork-connect";
+
 export type SkillCard = {
   name: string;
   path: string;
   description?: string;
   trigger?: string;
-};
-
-export type HubSkillRepo = {
-  owner: string;
-  repo: string;
-  ref: string;
-};
-
-export type HubSkillCard = {
-  name: string;
-  description?: string;
-  trigger?: string;
-  source: HubSkillRepo & {
-    path: string;
-  };
-};
-
-/** OpenWork Cloud (Den) org skill surfaced in the Skills catalog. */
-export type DenOrgSkillCard = {
-  id: string;
-  title: string;
-  description: string | null;
-  skillText: string;
-  shared: "org" | "public" | null;
-  updatedAt: string | null;
+  origin?: CapabilityOrigin;
+  scope?: "project" | "global";
+  marketplaceName?: string;
+  pluginName?: string;
+  connectCapabilityName?: string;
 };
 
 export type PluginInstallStep = {
@@ -344,9 +326,14 @@ export type McpServerConfig = {
 };
 
 export type McpServerEntry = {
+  id?: string;
   name: string;
   config: McpServerConfig;
   source?: McpServerSource;
+  origin?: CapabilityOrigin;
+  marketplaceName?: string;
+  pluginName?: string;
+  connectCapabilityName?: string;
 };
 
 export type McpStatus =
@@ -425,7 +412,6 @@ export type ModelOption = {
   behaviorOptions?: ModelBehaviorOption[];
   disabled?: boolean;
   isFree: boolean;
-  isConnected: boolean;
   isRecommended?: boolean;
   /** "cloud" for org-managed providers (lpr_*), undefined for local. */
   source?: "cloud";

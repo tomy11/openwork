@@ -2,39 +2,24 @@ import { sql } from "@openwork-ee/den-db/drizzle"
 import { AdminAllowlistTable } from "@openwork-ee/den-db/schema"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { db } from "./db.js"
+import { env } from "./env.js"
 
-const ADMIN_ALLOWLIST_SEEDS = [
-  {
-    email: "ben@openworklabs.com",
-    note: "Seeded internal admin",
-  },
-  {
-    email: "jan@openworklabs.com",
-    note: "Seeded internal admin",
-  },
-  {
-    email: "omar@openworklabs.com",
-    note: "Seeded internal admin",
-  },
-  {
-    email: "berk@openworklabs.com",
-    note: "Seeded internal admin",
-  },
-] as const
+const BOOTSTRAP_ADMIN_NOTE = "Seeded bootstrap admin"
 
 let ensureAdminAllowlistSeededPromise: Promise<void> | null = null
 
 async function seedAdminAllowlist() {
-  for (const entry of ADMIN_ALLOWLIST_SEEDS) {
+  for (const email of env.bootstrapAdminEmails) {
     await db
       .insert(AdminAllowlistTable)
       .values({
         id: createDenTypeId("adminAllowlist"),
-        ...entry,
+        email,
+        note: BOOTSTRAP_ADMIN_NOTE,
       })
       .onDuplicateKeyUpdate({
         set: {
-          note: entry.note,
+          note: BOOTSTRAP_ADMIN_NOTE,
           updated_at: sql`CURRENT_TIMESTAMP(3)`,
         },
       })

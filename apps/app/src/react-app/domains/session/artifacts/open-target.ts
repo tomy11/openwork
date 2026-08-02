@@ -1,7 +1,7 @@
 import type { UIMessage } from "ai";
 
 type OpenTargetKind = "url" | "file";
-export type OpenTargetPreview = "browser" | "markdown" | "sheet" | "slides" | "image" | "pdf" | "html" | "text" | "external";
+export type OpenTargetPreview = "browser" | "markdown" | "sheet" | "slides" | "document" | "image" | "pdf" | "html" | "text" | "external";
 
 export interface TextData {
   kind: "text";
@@ -34,7 +34,7 @@ const WORKSPACE_ID_PREFIX_PATTERN = /^workspace\/(?:ws_[^/]+|\d+|[0-9a-f-]{6,})\
 const FILE_PATTERN = /(?:^|[\s"'`([{])((?:\.{1,2}[/\\]|~[/\\]|[/\\])?[\w.\-]+(?:[/\\][\w.\-]+)+\.[a-z][a-z0-9]{0,9}|[\w.\-]+\.[a-z][a-z0-9]{0,9})/gi;
 const URL_PATTERN = /https?:\/\/[^\s)\]}>"'`]+/gi;
 const SOCKET_PATTERN = /(?:ws|wss):\/\/[^\s)\]}>"'`]+/gi;
-const SIDEBAR_ARTIFACT_FILE_PREVIEWS = new Set<OpenTargetPreview>(["markdown", "sheet", "slides", "image", "pdf", "html"]);
+const SIDEBAR_ARTIFACT_FILE_PREVIEWS = new Set<OpenTargetPreview>(["markdown", "sheet", "slides", "document", "image", "pdf", "html"]);
 const MARKDOWN_LINK_PATTERN = /\[([^\]\n]+)\]\(([^)\s]+)\)/g;
 const ASSISTANT_ARTIFACT_MENTION_PATTERN = /\b(?:artifact|created|deck|deliverable|exported|file|generated|opened|presentation|saved|slides?|updated|wrote)\b/i;
 const DISCOVERY_TOOL_NAMES = new Set(["glob", "grep", "search", "find"]);
@@ -85,6 +85,7 @@ function classifyOpenTarget(value: string, kind: OpenTargetKind): OpenTargetPrev
   if ([".md", ".markdown", ".mdx"].includes(ext)) return "markdown";
   if ([".csv", ".tsv", ".xlsx", ".xls", ".ods"].includes(ext)) return "sheet";
   if ([".ppt", ".pptx", ".pptm", ".pot", ".potx", ".odp", ".key", ".sxi"].includes(ext)) return "slides";
+  if (ext === ".docx") return "document";
   if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(ext)) return "image";
   if (ext === ".pdf") return "pdf";
   if ([".html", ".htm"].includes(ext)) return "html";
@@ -102,6 +103,23 @@ function textWithoutRedundantMarkdownLinkLabels(text: string) {
     const cleanHref = href.trim();
     return cleanLabel === basename(cleanHref) ? `[](${cleanHref})` : match;
   });
+}
+
+/**
+ * Chat attachments are uploaded into the workspace inbox and referenced by
+ * `file://` URLs on message file parts. Decoding the URL here lets those
+ * attachments resolve as openable artifacts (regex path scanning cannot,
+ * because attachment filenames often contain spaces).
+ */
+export function filePathFromFileUrl(url: string): string | null {
+  if (!url.startsWith("file://")) return null;
+  try {
+    const pathname = decodeURIComponent(new URL(url).pathname);
+    if (!pathname) return null;
+    return /^\/[A-Za-z]:\//.test(pathname) ? pathname.slice(1) : pathname;
+  } catch {
+    return null;
+  }
 }
 
 function targetFromFile(path: string, confidence: number, reason: string): OpenTarget | null {
@@ -287,6 +305,15 @@ export function deriveOpenTargets(messages: UIMessage[], options: DeriveOpenTarg
         scanText(targets, part.text, message.role === "assistant" ? 65 : 40, "message", {
           includeFiles: options.includeFileMentions === true || (message.role === "assistant" && shouldScanAssistantFileMentions(part.text)),
         });
+        continue;
+      }
+
+      if (part.type === "file") {
+        const path = filePathFromFileUrl(part.url);
+        if (path) {
+          const target = targetFromFile(path, 95, "chat attachment");
+          addTarget(targets, target && part.filename ? { ...target, name: part.filename } : target);
+        }
         continue;
       }
 

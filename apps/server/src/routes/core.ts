@@ -1,6 +1,16 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
+import {
+  type ConnectSnapshotOptions,
+  getConnectSnapshot,
+  googleWorkspaceStatusConnectExtra,
+  writeConnectState,
+} from "../connect-state.js";
+import type { CloudMcpLiveStatusObserver } from "../cloud-mcp-health.js";
+import { readOpenWorkConnectSkillCatalog, renderOpenWorkConnectSkillInstruction } from "../connect-skill-catalog.js";
 import { EnvStoreReadError, InvalidEnvKeyError, isValidEnvKey, type EnvService } from "../env-file.js";
+import { syncManagedProviderAuth } from "../managed-provider-auth.js";
 import { ApiError } from "../errors.js";
 import {
   createGoogleWorkspaceConnectFlowManager,
@@ -29,6 +39,7 @@ type JsonResponse = (data: unknown, status?: number) => Response;
 type ReadJsonBody = (request: Request) => Promise<Record<string, unknown>>;
 type ParseOptionalBoolean = (value: string | null, name: string) => boolean | undefined;
 type FetchRuntimeControl = (path: string, init?: { method?: string; body?: unknown }) => Promise<unknown>;
+type WorkspaceOpencodeClient = ReturnType<typeof createOpencodeClient>;
 
 interface RegisterCoreRoutesOptions {
   routes: Route[];
@@ -45,14 +56,50 @@ interface RegisterCoreRoutesOptions {
   buildCapabilities: (config: ServerConfig) => Capabilities;
   fetchRuntimeControl: FetchRuntimeControl;
   resolveWorkspace: (config: ServerConfig, id: string) => Promise<WorkspaceInfo>;
+  resolveOpencodeDirectory: (workspace: WorkspaceInfo) => string | null;
+  createWorkspaceOpencodeClient: (config: ServerConfig, workspace: WorkspaceInfo) => WorkspaceOpencodeClient;
+  refreshRegistrationFromLiveStatus?: CloudMcpLiveStatusObserver;
   serializeWorkspace: (workspace: ServerConfig["workspaces"][number]) => unknown;
   resolveToyUiEnabled: () => boolean;
   resolveDevLogPath: () => string | null;
   createOpenAiRealtimeVoiceSession: (env: EnvService, input: unknown) => Promise<unknown>;
+  managedProviderAuthLogger?: {
+    warn: (message: string, attributes?: Record<string, unknown>) => void;
+    error: (message: string, attributes?: Record<string, unknown>) => void;
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalTrimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function providerModelFromValues(provider: unknown, model: unknown): ConnectSnapshotOptions["providerModel"] {
+  const providerValue = optionalTrimmedString(provider);
+  const modelValue = optionalTrimmedString(model);
+  if (!providerValue && !modelValue) return undefined;
+  if (!providerValue || !modelValue) return undefined;
+  return { provider: providerValue, model: modelValue };
+}
+
+function connectSnapshotOptionsFromQuery(url: URL): ConnectSnapshotOptions {
+  return {
+    workspaceId: optionalTrimmedString(url.searchParams.get("workspaceId")) ?? optionalTrimmedString(url.searchParams.get("workspace")),
+    directory: optionalTrimmedString(url.searchParams.get("directory")) ?? optionalTrimmedString(url.searchParams.get("worktree")),
+    providerModel: providerModelFromValues(url.searchParams.get("provider"), url.searchParams.get("model")),
+  };
+}
+
+function connectSnapshotOptionsFromBody(body: Record<string, unknown>): ConnectSnapshotOptions {
+  const context = isRecord(body.context) ? body.context : {};
+  return {
+    workspaceId: optionalTrimmedString(context.workspaceId) ?? optionalTrimmedString(context.workspaceID) ?? optionalTrimmedString(body.workspaceId),
+    directory: optionalTrimmedString(context.worktree) ?? optionalTrimmedString(context.directory) ?? optionalTrimmedString(body.directory),
+    providerModel: providerModelFromValues(context.provider, context.model) ?? providerModelFromValues(body.provider, body.model),
+  };
 }
 
 export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
@@ -71,13 +118,24 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
     buildCapabilities,
     fetchRuntimeControl,
     resolveWorkspace,
+    resolveOpencodeDirectory,
+    createWorkspaceOpencodeClient,
+    refreshRegistrationFromLiveStatus,
     serializeWorkspace,
     resolveToyUiEnabled,
     resolveDevLogPath,
     createOpenAiRealtimeVoiceSession,
+    managedProviderAuthLogger,
   } = options;
   const googleWorkspaceConnectFlows = createGoogleWorkspaceConnectFlowManager(config);
   const envPendingChangesByRuntime = new Map<string, boolean>();
+
+  const connectSnapshotBaseOptions = {
+    resolveOpencodeDirectory,
+    createWorkspaceOpencodeClient,
+    refreshRegistrationFromLiveStatus,
+    serverMetadata: { serverVersion, expectedOpencodeVersion: opencodeVersion },
+  };
 
   const healthResponse = () => jsonResponse({
     ok: true,
@@ -263,12 +321,42 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
     return jsonResponse(buildCapabilities(config));
   });
 
-  addRoute(routes, "GET", "/experimental/extensions/actions", "client", async (ctx) => {
-    const extensionId = ctx.url.searchParams.get("extensionId") ?? "";
+  addRoute(routes, "GET", "/experimental/connect/state", "client", async (ctx) => {
     return jsonResponse({
       ok: true,
       schemaVersion: 1,
-      actions: listExperimentalExtensionActions(extensionId),
+      ...(await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromQuery(ctx.url) })),
+    });
+  });
+
+  addRoute(routes, "GET", "/experimental/connect/skills", "client", async (_ctx) => {
+    // Connect skills are server/account-scoped (openwork-cloud on the host), not per-workspace.
+    const skills = await readOpenWorkConnectSkillCatalog(config);
+    return jsonResponse({
+      ok: true,
+      schemaVersion: 1,
+      skills,
+      instruction: renderOpenWorkConnectSkillInstruction(skills),
+    });
+  });
+
+  addRoute(routes, "PUT", "/experimental/connect/state", "host", async (ctx) => {
+    ensureWritable(config);
+    const body = await readJsonBody(ctx.request);
+    if (typeof body.connectEnabled !== "boolean" || Object.keys(body).some((key) => key !== "connectEnabled")) {
+      throw new ApiError(400, "invalid_payload", "connectEnabled must be a boolean");
+    }
+    await writeConnectState(config, { connectEnabled: body.connectEnabled });
+    return jsonResponse({ ok: true, schemaVersion: 1, ...(await getConnectSnapshot(config, connectSnapshotBaseOptions)) });
+  });
+
+  addRoute(routes, "GET", "/experimental/extensions/actions", "client", async (ctx) => {
+    const extensionId = ctx.url.searchParams.get("extensionId") ?? "";
+    const connectSnapshot = await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromQuery(ctx.url) });
+    return jsonResponse({
+      ok: true,
+      schemaVersion: 1,
+      actions: listExperimentalExtensionActions(extensionId, connectSnapshot),
     });
   });
 
@@ -277,11 +365,12 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
       throw new ApiError(403, "forbidden", "Viewer tokens cannot call extension actions");
     }
     const body = await readJsonBody(ctx.request);
-    return jsonResponse(await callExperimentalExtensionAction(config, env, body));
+    return jsonResponse(await callExperimentalExtensionAction(config, env, body, await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromBody(body) })));
   });
 
-  addRoute(routes, "GET", "/experimental/google-workspace/status", "client", async () => {
-    return jsonResponse(await googleWorkspaceStatus(config));
+  addRoute(routes, "GET", "/experimental/google-workspace/status", "client", async (ctx) => {
+    const connectSnapshot = await getConnectSnapshot(config, { ...connectSnapshotBaseOptions, ...connectSnapshotOptionsFromQuery(ctx.url) });
+    return jsonResponse(await googleWorkspaceStatus(config, googleWorkspaceStatusConnectExtra(connectSnapshot)));
   });
 
   addRoute(routes, "POST", "/experimental/google-workspace/connect/start", "client", async (ctx) => {
@@ -466,6 +555,9 @@ export function registerCoreRoutes(options: RegisterCoreRoutesOptions): void {
       }
       throw error;
     }
+    // A stored credential is useless until the engine holds it: deliver it now
+    // rather than waiting for the next engine start.
+    await syncManagedProviderAuth({ config, env, logger: managedProviderAuthLogger }).catch(() => undefined);
     return jsonResponse({ ok: true, count: entries.length });
   });
 

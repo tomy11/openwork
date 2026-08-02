@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
 import type { OpenworkSessionGroupState } from "@/app/lib/openwork-server";
 import type { ResolvedWorkspaceEndpoint } from "@/app/lib/workspace-endpoint";
@@ -12,6 +12,7 @@ import {
   type WorkspaceGroupState,
 } from "@/react-app/domains/session/sidebar/session-management-store";
 import type { RouteWorkspace } from "./route-workspaces";
+import { SessionGroupEventPoller } from "./session-group-event-poller";
 
 const MIGRATION_PREFIX = "openwork.sessionGroups.migrated.v2";
 
@@ -48,6 +49,24 @@ function migrationKey(endpoint: ResolvedWorkspaceEndpoint): string {
   return `${MIGRATION_PREFIX}:${endpoint.baseUrl}:${endpoint.workspaceId}`;
 }
 
+function workspaceEndpointSyncKey(
+  workspaces: RouteWorkspace[],
+  endpointForWorkspace: UseSessionGroupSyncInput["endpointForWorkspace"],
+): string {
+  return workspaces
+    .map((workspace) => {
+      const endpoint = endpointForWorkspace(workspace);
+      return JSON.stringify([
+        workspace.id.trim(),
+        endpoint?.baseUrl.trim() ?? "",
+        endpoint?.workspaceId.trim() ?? "",
+        endpoint?.token.trim() ?? "",
+      ]);
+    })
+    .sort()
+    .join("|");
+}
+
 function readMigrationComplete(endpoint: ResolvedWorkspaceEndpoint): boolean {
   try {
     return window.localStorage.getItem(migrationKey(endpoint)) === "1";
@@ -68,8 +87,12 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
   const { workspaces, endpointForWorkspace } = input;
   const workspacesRef = useRef(workspaces);
   const endpointForWorkspaceRef = useRef(endpointForWorkspace);
-  const eventCursorByWorkspaceRef = useRef<Record<string, number | null>>({});
+  const eventPollerRef = useRef(new SessionGroupEventPoller());
   const pollInFlightRef = useRef(false);
+  const groupSyncKey = useMemo(
+    () => workspaceEndpointSyncKey(workspaces, endpointForWorkspace),
+    [endpointForWorkspace, workspaces],
+  );
 
   useEffect(() => {
     workspacesRef.current = workspaces;
@@ -105,11 +128,19 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
         writeMigrationComplete(endpoint);
         return response.state;
       },
-      removeGroup: async (workspaceId: string, groupId: string) => {
+      renameGroup: async (workspaceId: string, groupId: string, label: string) => {
         const workspace = workspacesRef.current.find((item) => item.id === workspaceId);
         const endpoint = endpointForWorkspaceRef.current(workspace);
         if (!endpoint) return null;
-        const response = await endpoint.client.removeSessionGroup(endpoint.workspaceId, groupId);
+        const response = await endpoint.client.renameSessionGroup(endpoint.workspaceId, groupId, label);
+        writeMigrationComplete(endpoint);
+        return response.state;
+      },
+      removeGroup: async (workspaceId, groupId, destinationGroupId) => {
+        const workspace = workspacesRef.current.find((item) => item.id === workspaceId);
+        const endpoint = endpointForWorkspaceRef.current(workspace);
+        if (!endpoint) return null;
+        const response = await endpoint.client.removeSessionGroup(endpoint.workspaceId, groupId, destinationGroupId);
         writeMigrationComplete(endpoint);
         return response.state;
       },
@@ -119,9 +150,15 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
 
   useEffect(() => {
     let cancelled = false;
+    const eventWorkspaceKeys: string[] = [];
+    for (const workspace of workspacesRef.current) {
+      const endpoint = endpointForWorkspaceRef.current(workspace);
+      if (endpoint) eventWorkspaceKeys.push(`${endpoint.baseUrl}:${endpoint.workspaceId}`);
+    }
+    eventPollerRef.current.setWorkspaces(eventWorkspaceKeys);
 
     const syncWorkspace = async (workspace: RouteWorkspace, migrateLocal: boolean) => {
-      const endpoint = endpointForWorkspace(workspace);
+      const endpoint = endpointForWorkspaceRef.current(workspace);
       if (!endpoint) return;
       const version = beginSessionGroupServerSync(workspace.id);
 
@@ -148,7 +185,7 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
       applySessionGroupServerState(workspace.id, nextState, version);
     };
 
-    for (const workspace of workspaces) {
+    for (const workspace of workspacesRef.current) {
       void syncWorkspace(workspace, true).catch((error) => {
         console.warn("[session-groups] initial sync failed", error);
       });
@@ -162,20 +199,13 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
           const endpoint = endpointForWorkspaceRef.current(workspace);
           if (!endpoint) continue;
           const key = `${endpoint.baseUrl}:${endpoint.workspaceId}`;
-          const currentCursor = eventCursorByWorkspaceRef.current[key];
           try {
-            const response = await endpoint.client.listSessionGroupEvents(
-              endpoint.workspaceId,
-              typeof currentCursor === "number" ? { since: currentCursor } : undefined,
+            await eventPollerRef.current.poll(
+              key,
+              (options) => endpoint.client.listSessionGroupEvents(endpoint.workspaceId, options),
+              () => syncWorkspace(workspace, false),
             );
             if (cancelled) return;
-            eventCursorByWorkspaceRef.current[key] =
-              typeof response.cursor === "number"
-                ? response.cursor
-                : Math.max(currentCursor ?? 0, ...((response.items ?? []).map((item) => Number(item.seq) || 0)));
-            if (currentCursor === undefined || currentCursor === null) continue;
-            if ((response.items ?? []).length === 0) continue;
-            await syncWorkspace(workspace, false);
           } catch {
             // Best effort: normal workspace/session loading still surfaces connection issues.
           }
@@ -191,5 +221,5 @@ export function useSessionGroupSync(input: UseSessionGroupSyncInput): void {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [endpointForWorkspace, workspaces]);
+  }, [groupSyncKey]);
 }

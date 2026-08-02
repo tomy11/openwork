@@ -5,6 +5,9 @@ import {
   appBuildInfo as appBuildInfoCmd,
   engineInfo as engineInfoCmd,
   engineStart as engineStartCmd,
+  getDesktopBootstrapConfig,
+  debugDesktopBootstrapConfig,
+  nukeOpenworkAndOpencodeConfigPreview,
   nukeOpenworkAndOpencodeConfigAndExit,
   openDesktopUrl,
   openworkServerInfo as openworkServerInfoCmd,
@@ -12,21 +15,24 @@ import {
   pickFile,
   revealDesktopItemInDir,
   resetOpenworkState,
-  sandboxDebugProbe as sandboxDebugProbeCmd,
   updaterEnvironment as updaterEnvironmentCmd,
   workspaceBootstrap as workspaceBootstrapCmd,
   type AppBuildInfo,
+  type DesktopBootstrapConfig,
   type EngineInfo,
+  type NukeManifestPreview,
   type OpenworkServerInfo,
-  type SandboxDebugProbeResult,
 } from "../../../../app/lib/desktop";
+import { createDenClient, readDenSettings } from "../../../../app/lib/den";
 import {
   ELECTRON_ALPHA_RELEASE_PAGE_URL,
   type ElectronAlphaArtifact,
 } from "../../../../app/lib/electron-alpha";
+import { downloadTextAsFile } from "../../../../app/lib/download";
 
 import {
   writeOpenworkServerSettings,
+  type OpenworkRuntimeConfigStatus,
 } from "../../../../app/lib/openwork-server";
 import {
   clearStartupPreference,
@@ -40,10 +46,14 @@ import type { DebugViewProps } from "../pages/debug-view";
 import type { ReleaseChannel } from "../../../../app/types";
 import type { OpenworkServerStore, OpenworkServerStoreSnapshot } from "../../connections/openwork-server-store";
 
+type DebugViewModelProps = Omit<DebugViewProps, "agentContextDiagnostics">;
+
 const STARTUP_PREFERENCE_KEY = "openwork.startupPreference";
 const ENGINE_SOURCE_KEY = "openwork.engineSource";
 const ENGINE_CUSTOM_BIN_KEY = "openwork.engineCustomBinPath";
 const OPENCODE_ENABLE_EXA_KEY = "openwork.opencodeEnableExa";
+const NUKE_CONFIRMATION_WORD = "NUKE";
+const NUKE_SIGN_OUT_TIMEOUT_MS = 5000;
 
 type ResetModalMode = "onboarding" | "all";
 
@@ -111,21 +121,18 @@ function clearOpenworkLocalStorageForReset(mode: ResetModalMode): void {
   }
 }
 
-function downloadTextAsFile(filename: string, content: string, mimeType: string) {
-  if (typeof window === "undefined") return;
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  try {
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    anchor.style.display = "none";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+async function revokeDenSessionBeforeNuke(): Promise<void> {
+  const settings = readDenSettings();
+  const token = settings.authToken?.trim() ?? "";
+  if (!token) return;
+  const client = createDenClient({ baseUrl: settings.baseUrl, token });
+  const signOut = client.signOut().catch(() => undefined);
+  await Promise.race([
+    signOut,
+    new Promise<void>((resolve) => {
+      globalThis.setTimeout(resolve, NUKE_SIGN_OUT_TIMEOUT_MS);
+    }),
+  ]);
 }
 
 function readEngineSource(): "path" | "sidecar" | "custom" {
@@ -263,10 +270,11 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
 
   const [engineInfoState, setEngineInfoState] = useState<EngineInfo | null>(null);
   const [appBuild, setAppBuild] = useState<AppBuildInfo | null>(null);
+  const [bootstrapPrepared, setBootstrapPrepared] = useState<DesktopBootstrapConfig["prepared"]>(null);
+  const [bootstrapConfigDebug, setBootstrapConfigDebug] = useState<unknown>(null);
+  const [runtimeConfigStatus, setRuntimeConfigStatus] = useState<OpenworkRuntimeConfigStatus | null>(null);
+  const [runtimeConfigStatusError, setRuntimeConfigStatusError] = useState<string | null>(null);
   const [runtimeDebugStatus, setRuntimeDebugStatus] = useState<string | null>(null);
-  const [sandboxProbeBusy, setSandboxProbeBusy] = useState(false);
-  const [sandboxProbeResult, setSandboxProbeResult] = useState<SandboxDebugProbeResult | null>(null);
-  const [sandboxProbeStatus, setSandboxProbeStatus] = useState<string | null>(null);
   const [opencodeRestarting, setOpencodeRestarting] = useState(false);
   const [openworkServerRestarting, setOpenworkServerRestarting] = useState(false);
   const [opencodeServiceStatus, setOpencodeServiceStatus] = useState<{
@@ -283,6 +291,13 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
   const [resetModalBusy, setResetModalBusy] = useState(false);
   const [nukeConfigBusy, setNukeConfigBusy] = useState(false);
   const [nukeConfigStatus, setNukeConfigStatus] = useState<string | null>(null);
+  const [nukePreviewBusy, setNukePreviewBusy] = useState(false);
+  const [nukeDialogOpen, setNukeDialogOpen] = useState(false);
+  const [nukeConfirmationText, setNukeConfirmationText] = useState("");
+  // Opt-in: the bootstrap / organization server config is only wiped when the
+  // user explicitly asks for it. The IPC contract still speaks "preserve".
+  const [nukeDeleteBootstrap, setNukeDeleteBootstrap] = useState(false);
+  const [nukeManifestPreview, setNukeManifestPreview] = useState<NukeManifestPreview | null>(null);
   const [engineSource, setEngineSourceState] = useState<"path" | "sidecar" | "custom">(readEngineSource);
   const [engineCustomBinPath, setEngineCustomBinPath] = useState<string>(() =>
     readStoredString(ENGINE_CUSTOM_BIN_KEY, ""),
@@ -331,6 +346,69 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
     return () => window.clearInterval(interval);
   }, [developerMode, refreshEngineInfo]);
 
+  // Surface the agent-first install's non-secret prepared summary (org + first
+  // skill) in the runtime debug report so install verification has one place to
+  // read it without a dedicated diagnostics screen.
+  useEffect(() => {
+    if (!developerMode || !isDesktopRuntime()) return;
+    let cancelled = false;
+    void getDesktopBootstrapConfig()
+      .then((config) => {
+        if (!cancelled) setBootstrapPrepared(config.prepared ?? null);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [developerMode]);
+
+  useEffect(() => {
+    if (!developerMode) return;
+    const client = openworkServerSnapshot.openworkServerClient;
+    const workspaceId = runtimeWorkspaceId?.trim();
+    if (!client || !workspaceId) {
+      setRuntimeConfigStatus(null);
+      setRuntimeConfigStatusError(null);
+      return;
+    }
+    let cancelled = false;
+    void client.getRuntimeConfigStatus(workspaceId)
+      .then((status) => {
+        if (!cancelled) {
+          setRuntimeConfigStatus(status);
+          setRuntimeConfigStatusError(null);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setRuntimeConfigStatus(null);
+          setRuntimeConfigStatusError(error instanceof Error ? error.message : safeStringify(error));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [developerMode, openworkServerSnapshot.openworkServerClient, runtimeWorkspaceId]);
+
+  useEffect(() => {
+    if (!developerMode || !isDesktopRuntime()) return;
+    let cancelled = false;
+    void debugDesktopBootstrapConfig()
+      .then((config) => {
+        if (!cancelled) setBootstrapConfigDebug(config);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setBootstrapConfigDebug({
+            error: error instanceof Error ? error.message : safeStringify(error),
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [developerMode]);
+
   const pushDeveloperLog = useCallback((message: string) => {
     const timestamp = new Date().toISOString();
     setDeveloperLog((current) => {
@@ -369,9 +447,11 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       },
       runtimeWorkspaceId,
       selectedWorkspaceRoot,
+      bootstrap: bootstrapPrepared ? { prepared: bootstrapPrepared } : null,
     };
   }, [
     appBuild,
+    bootstrapPrepared,
     engineInfoState,
     openworkServerSnapshot.openworkServerCapabilities,
     openworkServerSnapshot.openworkServerDiagnostics,
@@ -386,6 +466,10 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
   const runtimeDebugReportJson = useMemo(
     () => safeStringify(runtimeDebugReport),
     [runtimeDebugReport],
+  );
+  const bootstrapConfigDebugJson = useMemo(
+    () => safeStringify(bootstrapConfigDebug),
+    [bootstrapConfigDebug],
   );
 
   const engineCard = useMemo(() => describeEngine(engineInfoState), [engineInfoState]);
@@ -582,26 +666,6 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       setElectronAlphaUpdaterBusy(false);
     }
   }, [electronAlphaUpdaterChannel]);
-
-  const onRunSandboxDebugProbe = useCallback(async () => {
-    if (!isDesktopRuntime()) return;
-    setSandboxProbeBusy(true);
-    setSandboxProbeStatus(null);
-    try {
-      const result = (await sandboxDebugProbeCmd()) as SandboxDebugProbeResult | null;
-      setSandboxProbeResult(result);
-      setSandboxProbeStatus(
-        result!.ready
-          ? t("settings.sandbox_probe_success")
-          : (result!.error ?? t("settings.sandbox_error")),
-      );
-      pushDeveloperLog(`sandbox probe ready=${String(result!.ready)}`);
-    } catch (error) {
-      setSandboxProbeStatus(error instanceof Error ? error.message : safeStringify(error));
-    } finally {
-      setSandboxProbeBusy(false);
-    }
-  }, [pushDeveloperLog]);
 
   const [startupStatus, setStartupStatus] = useState<string | null>(null);
 
@@ -878,32 +942,66 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
     [pushDeveloperLog, setRouteError],
   );
 
-  const onNukeOpenworkAndOpencodeConfig = useCallback(async () => {
+  const onOpenNukeDialog = useCallback(async () => {
     if (!isDesktopRuntime()) return;
-    const confirmed =
-      typeof window === "undefined"
-        ? true
-        : window.confirm(
-            "Delete ALL local OpenWork + OpenCode config and quit? This cannot be undone.",
-          );
-    if (!confirmed) return;
-    setNukeConfigBusy(true);
+    setNukePreviewBusy(true);
     setNukeConfigStatus(null);
     try {
-      await nukeOpenworkAndOpencodeConfigAndExit();
+      const preview = await nukeOpenworkAndOpencodeConfigPreview({ preserveBootstrap: true });
+      setNukeManifestPreview(preview);
+      setNukeConfirmationText("");
+      setNukeDeleteBootstrap(false);
+      setNukeDialogOpen(true);
     } catch (error) {
       setNukeConfigStatus(error instanceof Error ? error.message : safeStringify(error));
     } finally {
-      setNukeConfigBusy(false);
+      setNukePreviewBusy(false);
     }
   }, []);
+
+  const onSetNukeDeleteBootstrap = useCallback(async (deleteBootstrap: boolean) => {
+    if (nukeConfigBusy || nukePreviewBusy) return;
+    setNukeDeleteBootstrap(deleteBootstrap);
+    setNukePreviewBusy(true);
+    setNukeConfigStatus(null);
+    try {
+      const preview = await nukeOpenworkAndOpencodeConfigPreview({ preserveBootstrap: !deleteBootstrap });
+      setNukeManifestPreview(preview);
+    } catch (error) {
+      setNukeDeleteBootstrap(!deleteBootstrap);
+      setNukeConfigStatus(error instanceof Error ? error.message : safeStringify(error));
+    } finally {
+      setNukePreviewBusy(false);
+    }
+  }, [nukeConfigBusy, nukePreviewBusy]);
+
+  const onCloseNukeDialog = useCallback(() => {
+    if (nukeConfigBusy) return;
+    setNukeDialogOpen(false);
+  }, [nukeConfigBusy]);
+
+  const onConfirmNukeOpenworkAndOpencodeConfig = useCallback(async () => {
+    if (!isDesktopRuntime() || nukeConfirmationText.trim().toUpperCase() !== NUKE_CONFIRMATION_WORD) return;
+    setNukeConfigBusy(true);
+    setNukeConfigStatus(null);
+    try {
+      await revokeDenSessionBeforeNuke();
+      await nukeOpenworkAndOpencodeConfigAndExit({ preserveBootstrap: !nukeDeleteBootstrap });
+    } catch (error) {
+      setNukeConfigStatus(error instanceof Error ? error.message : safeStringify(error));
+      setNukeConfigBusy(false);
+      return;
+    } finally {
+      setNukeDialogOpen(false);
+    }
+  }, [nukeConfirmationText, nukeDeleteBootstrap]);
 
   const [workspaceDebugEventsStatus, setWorkspaceDebugEventsStatus] = useState<string | null>(null);
   const onClearWorkspaceDebugEvents = useCallback(async () => {
     setWorkspaceDebugEventsStatus("Workspace debug events are not retained in the React route yet.");
   }, []);
 
-  const debugProps: DebugViewProps = useMemo(
+  const debugProps: DebugViewModelProps = useMemo(
     () => ({
       developerMode,
       busy: false,
@@ -915,6 +1013,9 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
           : t("status.disconnected_label"),
       runtimeSummary,
       runtimeDebugReportJson,
+      bootstrapConfigDebugJson,
+      runtimeConfigStatus,
+      runtimeConfigStatusError,
       runtimeDebugStatus,
       onCopyRuntimeDebugReport,
       onExportRuntimeDebugReport,
@@ -946,10 +1047,6 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       electronAlphaUpdaterChannel,
       onSetElectronAlphaUpdaterChannel,
       onCheckElectronAlphaUpdates,
-      sandboxProbeBusy,
-      sandboxProbeResult,
-      sandboxProbeStatus,
-      onRunSandboxDebugProbe,
       onStopHost,
       onResetStartupPreference,
       engineSource,
@@ -994,13 +1091,23 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       opencodeDevModeEnabled: appBuild?.openworkDevMode === true,
       nukeConfigBusy,
       nukeConfigStatus,
-      onNukeOpenworkAndOpencodeConfig,
+      nukePreviewBusy,
+      nukeDialogOpen,
+      nukeConfirmationText,
+      nukeDeleteBootstrap,
+      nukeManifestPreview,
+      onOpenNukeDialog,
+      onCloseNukeDialog,
+      onSetNukeConfirmationText: setNukeConfirmationText,
+      onSetNukeDeleteBootstrap,
+      onConfirmNukeOpenworkAndOpencodeConfig,
     }),
     [
       appBuild?.openworkDevMode,
       developerLog,
       developerLogStatus,
       developerMode,
+      bootstrapConfigDebugJson,
       electronMigrationBusy,
       electronMigrationArtifactLabel,
       electronMigrationSha256,
@@ -1015,17 +1122,25 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       engineSource,
       nukeConfigBusy,
       nukeConfigStatus,
+      nukeConfirmationText,
+      nukeDialogOpen,
+      nukeManifestPreview,
+      nukeDeleteBootstrap,
+      nukePreviewBusy,
       onClearDeveloperLog,
       onClearEngineCustomBinPath,
       onClearWorkspaceDebugEvents,
+      onCloseNukeDialog,
+      onSetNukeDeleteBootstrap,
       onCopyDeveloperLog,
       onCopyRuntimeDebugReport,
       onExportDeveloperLog,
       onExportRuntimeDebugReport,
       onInstallElectronPreviewFromTauri,
       onCheckElectronAlphaUpdates,
-      onNukeOpenworkAndOpencodeConfig,
+      onConfirmNukeOpenworkAndOpencodeConfig,
       onOpenElectronPreviewRelease,
+      onOpenNukeDialog,
       onOpenResetModal,
       onPrepareElectronMigrationSnapshot,
       onPickEngineBinary,
@@ -1034,7 +1149,6 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       onResetStartupPreference,
       onRestartOpencode,
       onRestartOpenworkServer,
-      onRunSandboxDebugProbe,
       onSetElectronAlphaUpdaterChannel,
       onSetElectronMigrationSha512,
       onSetElectronMigrationUrl,
@@ -1062,13 +1176,12 @@ export function useDebugViewModel(options: UseDebugViewModelOptions) {
       openworkServerSnapshot.openworkServerDiagnostics,
       openworkServerSnapshot.openworkServerStatus,
       resetModalBusy,
+      runtimeConfigStatus,
+      runtimeConfigStatusError,
       runtimeDebugReportJson,
       runtimeDebugStatus,
       runtimeSummary,
       runtimeWorkspaceId,
-      sandboxProbeBusy,
-      sandboxProbeResult,
-      sandboxProbeStatus,
       serviceRestartError,
     ],
   );

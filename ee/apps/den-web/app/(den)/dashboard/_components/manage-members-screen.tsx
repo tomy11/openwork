@@ -1,10 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { type ElementType, useEffect, useMemo, useState } from "react";
 import {
   CheckCircle2,
   Circle,
-  Link,
+  Link as LinkIcon,
   Lock,
   MoreHorizontal,
   Pencil,
@@ -18,11 +19,15 @@ import {
 } from "lucide-react";
 import {
   DEN_ROLE_PERMISSION_OPTIONS,
+  canRefreshInvitationRole,
   formatRoleLabel,
   getJoinOrgRoute,
   getOrgAccessFlags,
+  isAssignableOrgRole,
   getMembersRoute,
+  getTeamRoute,
   splitRoleString,
+  type DenOrgMember,
 } from "../../_lib/den-org";
 import { type OrgLimitError, type OrgPaymentRequiredError, getOrgLimitError, getOrgPaymentRequiredError } from "../../_lib/den-flow";
 import { buildDenFeedbackUrl } from "../../_lib/feedback";
@@ -33,7 +38,9 @@ import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-templ
 import { DenButton } from "../../_components/ui/button";
 import { DenCard } from "../../_components/ui/card";
 import { DenInput } from "../../_components/ui/input";
+import { DenNotice } from "../../_components/ui/notice";
 import { DenSelect } from "../../_components/ui/select";
+import { createOrganizationInstallLink } from "../../_lib/install-link-data";
 import { OrgMemberIdentity } from "./org-member-identity";
 
 type MembersTab = "members" | "teams" | "roles";
@@ -122,6 +129,7 @@ function SummaryCard({
 export function ManageMembersScreen() {
   const {
     activeOrg,
+    orgSlug,
     orgContext,
     orgBusy,
     orgError,
@@ -131,12 +139,14 @@ export function ManageMembersScreen() {
     cancelInvitation,
     updateMemberRole,
     removeMember,
+    transferOwnership,
     createTeam,
     updateTeam,
     deleteTeam,
     createRole,
     updateRole,
     deleteRole,
+    runReauthableAction,
   } = useOrgDashboard();
   const [activeTab, setActiveTab] = useState<MembersTab>("members");
   const [pageError, setPageError] = useState<string | null>(null);
@@ -146,6 +156,8 @@ export function ManageMembersScreen() {
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
   const [openMemberMenuId, setOpenMemberMenuId] = useState<string | null>(null);
   const [memberRoleDraft, setMemberRoleDraft] = useState("member");
+  const [editingMemberTeamsId, setEditingMemberTeamsId] = useState<string | null>(null);
+  const [memberTeamsDraft, setMemberTeamsDraft] = useState<Set<string>>(new Set());
   const [showTeamForm, setShowTeamForm] = useState(false);
   const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
   const [teamNameDraft, setTeamNameDraft] = useState("");
@@ -158,9 +170,13 @@ export function ManageMembersScreen() {
   >({});
   const [limitDialogError, setLimitDialogError] = useState<OrgLimitError | null>(null);
   const [seatBillingDialogError, setSeatBillingDialogError] = useState<OrgPaymentRequiredError | null>(null);
+  const [installLinkBusy, setInstallLinkBusy] = useState(false);
+  const [installLinkCopied, setInstallLinkCopied] = useState(false);
+  const [installLinkShareUrl, setInstallLinkShareUrl] = useState<string | null>(null);
+  const [installLinkShareCopied, setInstallLinkShareCopied] = useState(false);
 
   const assignableRoles = useMemo(
-    () => (orgContext?.roles ?? []).filter((role) => !role.protected),
+    () => (orgContext?.roles ?? []).filter(isAssignableOrgRole),
     [orgContext?.roles],
   );
 
@@ -173,7 +189,7 @@ export function ManageMembersScreen() {
       ),
     [orgContext?.currentMember.isOwner, orgContext?.currentMember.role, orgContext?.roles],
   );
-  const canStartSeatCheckout = orgContext?.currentMember.isOwner === true;
+  const canStartSeatCheckout = access.canStartSeatCheckout;
 
   const tabCounts: Record<MembersTab, number> = {
     members: orgContext?.members.length ?? 0,
@@ -215,13 +231,13 @@ export function ManageMembersScreen() {
 
   function resetInviteForm() {
     setInviteEmail("");
-    setInviteRole(assignableRoles[0]?.role ?? "member");
+    setInviteRole(access.canManageRoles ? assignableRoles[0]?.role ?? "member" : "member");
     setShowInviteForm(false);
   }
 
   function resetMemberEditor() {
     setEditingMemberId(null);
-    setMemberRoleDraft(assignableRoles[0]?.role ?? "member");
+    setMemberRoleDraft(access.canManageRoles ? assignableRoles[0]?.role ?? "member" : "member");
   }
 
   function resetTeamEditor() {
@@ -238,7 +254,93 @@ export function ManageMembersScreen() {
     setShowRoleForm(false);
   }
 
+  function selectInstallLinkShareInput() {
+    const input = document.getElementById("install-link-share-url");
+    if (input instanceof HTMLInputElement) {
+      input.focus();
+      input.select();
+    }
+  }
+
+  async function handleInstallLinkShareCopy() {
+    if (!installLinkShareUrl) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(installLinkShareUrl);
+      setInstallLinkShareCopied(true);
+      window.setTimeout(() => setInstallLinkShareCopied(false), 1800);
+    } catch {
+      selectInstallLinkShareInput();
+    }
+  }
+
+  async function handleCopyInstallLink() {
+    if (!activeOrg) {
+      return;
+    }
+
+    let mintedInstallPageUrl: string | null = null;
+    setPageError(null);
+    setInstallLinkCopied(false);
+    setInstallLinkShareUrl(null);
+    setInstallLinkShareCopied(false);
+    setInstallLinkBusy(true);
+    try {
+      await runReauthableAction("copy-install-link", async () => {
+        mintedInstallPageUrl = await createOrganizationInstallLink(activeOrg.id);
+      });
+
+      if (!mintedInstallPageUrl) {
+        throw new Error("The install link response was incomplete.");
+      }
+
+      // The clipboard write is best-effort presentation, kept outside the
+      // queued action: after a step-up verification the retry runs without
+      // transient user activation, and some browsers deniy programmatic
+      // clipboard access entirely. The mint already succeeded either way, so
+      // failure falls back to showing the link for a manual copy instead of
+      // surfacing a raw browser error.
+      try {
+        await navigator.clipboard.writeText(mintedInstallPageUrl);
+        setInstallLinkCopied(true);
+        window.setTimeout(() => setInstallLinkCopied(false), 1800);
+      } catch {
+        setInstallLinkShareUrl(mintedInstallPageUrl);
+      }
+    } catch (error) {
+      setPageError(error instanceof Error ? error.message : "Could not copy install link.");
+    } finally {
+      setInstallLinkBusy(false);
+    }
+  }
+
+  async function handleTransferOwnership(member: DenOrgMember) {
+    const targetName = member.user.name || member.user.email;
+    const confirmed = window.confirm(
+      `Transfer workspace ownership to ${targetName}? ${targetName} becomes the sole owner, and your account becomes a super-admin.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setPageError(null);
+    try {
+      await transferOwnership(member.id);
+      setOpenMemberMenuId(null);
+    } catch (error) {
+      setPageError(error instanceof Error ? error.message : "Could not transfer ownership.");
+    }
+  }
+
   useEffect(() => {
+    if (!access.canManageRoles) {
+      setInviteRole("member");
+      setMemberRoleDraft("member");
+      return;
+    }
+
     if (!assignableRoles[0]) {
       return;
     }
@@ -253,7 +355,7 @@ export function ManageMembersScreen() {
         ? current
         : assignableRoles[0].role,
     );
-  }, [assignableRoles]);
+  }, [access.canManageRoles, assignableRoles]);
 
   if (orgBusy && !orgContext) {
     return (
@@ -279,12 +381,12 @@ export function ManageMembersScreen() {
     showInviteForm && access.canInviteMembers ? (
       <DenCard className="mb-6">
         <form
-          className="grid gap-4 lg:grid-cols-[minmax(0,1.4fr)_220px_auto] lg:items-end"
+          className={`grid gap-4 lg:items-end ${access.canManageRoles ? "lg:grid-cols-[minmax(0,1.4fr)_220px_auto]" : "lg:grid-cols-[minmax(0,1fr)_220px_auto]"}`}
           onSubmit={async (event) => {
             event.preventDefault();
             setPageError(null);
             try {
-              await inviteMember({ email: inviteEmail, role: inviteRole });
+              await inviteMember({ email: inviteEmail, role: access.canManageRoles ? inviteRole : "member" });
               resetInviteForm();
             } catch (error) {
               const paymentRequiredError = getOrgPaymentRequiredError(error);
@@ -317,16 +419,23 @@ export function ManageMembersScreen() {
               required
             />
           </label>
-          <label className="grid gap-3">
-            <span className="text-[14px] font-medium text-gray-700">Role</span>
-            <DenSelect value={inviteRole} onChange={(event) => setInviteRole(event.target.value)}>
-              {assignableRoles.map((role) => (
-                <option key={role.id} value={role.role}>
-                  {formatRoleLabel(role.role)}
-                </option>
-              ))}
-            </DenSelect>
-          </label>
+          {access.canManageRoles ? (
+            <label className="grid gap-3">
+              <span className="text-[14px] font-medium text-gray-700">Role</span>
+              <DenSelect value={inviteRole} onChange={(event) => setInviteRole(event.target.value)}>
+                {assignableRoles.map((role) => (
+                  <option key={role.id} value={role.role}>
+                    {formatRoleLabel(role.role)}
+                  </option>
+                ))}
+              </DenSelect>
+            </label>
+          ) : (
+            <div className="grid gap-3">
+              <span className="text-[14px] font-medium text-gray-700">Role</span>
+              <DenInput value="Member" readOnly disabled />
+            </div>
+          )}
           <div className="flex gap-2 lg:justify-end">
             <ActionButton size="md" onClick={resetInviteForm}>Cancel</ActionButton>
             <DenButton type="submit" loading={mutationBusy === "invite-member"}>
@@ -338,7 +447,7 @@ export function ManageMembersScreen() {
     ) : null;
 
   const editMemberForm =
-    editingMemberId && access.canManageMembers ? (
+    editingMemberId && access.canManageRoles ? (
       <DenCard className="mb-6">
         <form
           className="grid gap-4 lg:grid-cols-[240px_auto] lg:items-end"
@@ -628,7 +737,7 @@ export function ManageMembersScreen() {
         eyebrow="Seat billing"
         title="Subscribe to add more users"
         message="The first 5 users in your organization are free, additional users are charged at $10 per user per month"
-        detail={canStartSeatCheckout ? null : "Only workspace owners can start billing checkout."}
+        detail={canStartSeatCheckout ? null : "Only workspace admins can start billing checkout."}
         closeLabel="Cancel"
         actionLabel="Subscribe"
         actionLoading={mutationBusy === "seat-checkout"}
@@ -645,9 +754,7 @@ export function ManageMembersScreen() {
       />
 
       {pageError ? (
-        <div className="mb-6 rounded-[28px] border border-red-200 bg-red-50 px-6 py-4 text-[14px] text-red-700">
-          {pageError}
-        </div>
+        <DenNotice message={pageError} className="mb-6" />
       ) : null}
 
       <UnderlineTabs
@@ -670,18 +777,71 @@ export function ManageMembersScreen() {
         <div>
           <div className="mb-6 flex items-center justify-between gap-4">
             <p className="text-[15px] text-gray-400">
-              {access.canManageMembers
+              {access.canManageRoles
                 ? "Invite people, update their role, or remove them from the organization."
                 : access.canRemoveMembers
                   ? "Invite people or remove non-owner members from the organization."
                 : "View who is in the organization and what role they currently hold."}
             </p>
             {toolbarAction ? (
-              <DenButton icon={Plus} onClick={toolbarAction.onClick}>
-                {toolbarAction.label}
-              </DenButton>
+              <div className="flex flex-wrap justify-end gap-2">
+                {orgContext.capabilities.installLinks ? (
+                  <DenButton
+                    data-testid="copy-install-link"
+                    variant="secondary"
+                    icon={LinkIcon}
+                    onClick={() => void handleCopyInstallLink()}
+                    loading={installLinkBusy || mutationBusy === "copy-install-link"}
+                  >
+                    {installLinkCopied ? "Copied" : "Copy install link"}
+                  </DenButton>
+                ) : null}
+                <DenButton icon={Plus} onClick={toolbarAction.onClick}>
+                  {toolbarAction.label}
+                </DenButton>
+              </div>
             ) : null}
           </div>
+
+          {installLinkShareUrl ? (
+            <div className="mb-6 rounded-[24px] border border-gray-200 bg-white px-5 py-4">
+              <p className="text-[13px] text-gray-500">
+                Copy blocked by the browser — copy the link manually:
+              </p>
+              <div className="mt-3 flex flex-col gap-3 lg:flex-row lg:items-center">
+                <DenInput
+                  id="install-link-share-url"
+                  data-testid="install-link-share-url"
+                  value={installLinkShareUrl}
+                  readOnly
+                  aria-label="Install link"
+                  className="font-mono text-[12px]"
+                  onFocus={(event) => event.currentTarget.select()}
+                  onClick={(event) => event.currentTarget.select()}
+                />
+                <div className="flex shrink-0 gap-2">
+                  <DenButton
+                    data-testid="install-link-share-copy"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => void handleInstallLinkShareCopy()}
+                  >
+                    {installLinkShareCopied ? "Copied" : "Copy"}
+                  </DenButton>
+                  <DenButton
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      setInstallLinkShareUrl(null);
+                      setInstallLinkShareCopied(false);
+                    }}
+                  >
+                    Done
+                  </DenButton>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           <div className="overflow-visible rounded-2xl border border-gray-100 bg-white">
             <div className="grid grid-cols-[minmax(0,1fr)_180px_140px_160px] gap-4 border-b border-gray-100 px-6 py-3 text-[11px] font-medium uppercase tracking-wide text-gray-400">
@@ -695,15 +855,18 @@ export function ManageMembersScreen() {
               const isInvited = !member.joinedAt;
               const inviteId = member.inviteId;
               const inviteToken = inviteId ? invitationsById.get(inviteId)?.inviteToken : null;
+              const memberAccess = getOrgAccessFlags(member.role, member.isOwner, orgContext.roles);
+              const canResendInvitation = isInvited && canRefreshInvitationRole(member.role, access);
+              const canTransferOwnershipToMember = access.canTransferOwnership && !isInvited && memberAccess.isSuperAdmin;
               const canOpenActions = member.isOwner
                 ? false
                 : isInvited
-                  ? access.canInviteMembers || access.canCancelInvitations
-                  : access.canManageMembers || access.canRemoveMembers;
+                  ? canResendInvitation || access.canCancelInvitations
+                  : access.canManageRoles || access.canManageTeams || access.canRemoveMembers || canTransferOwnershipToMember;
 
               return (
+                <div key={member.id}>
                 <div
-                  key={member.id}
                   className="grid grid-cols-[minmax(0,1fr)_180px_140px_160px] items-center gap-4 border-b border-gray-100 px-6 py-3.5 transition hover:bg-gray-50/60 last:border-b-0"
                 >
                   <OrgMemberIdentity member={member} />
@@ -743,11 +906,11 @@ export function ManageMembersScreen() {
                                 }}
                                 className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-gray-600 transition hover:bg-gray-50"
                               >
-                                <Link className="h-3.5 w-3.5" />
+                                <LinkIcon className="h-3.5 w-3.5" />
                                 Copy invite link
                               </button>
                             ) : null}
-                            {isInvited && access.canInviteMembers ? (
+                            {canResendInvitation ? (
                               <button
                                 type="button"
                                 onClick={async () => {
@@ -785,7 +948,7 @@ export function ManageMembersScreen() {
                                 Cancel invite
                               </button>
                             ) : null}
-                            {!isInvited && access.canManageMembers ? (
+                            {!isInvited && access.canManageRoles ? (
                               <button
                                 type="button"
                                 onClick={() => {
@@ -798,6 +961,36 @@ export function ManageMembersScreen() {
                               >
                                 <Settings className="h-3.5 w-3.5" />
                                 Edit role
+                              </button>
+                            ) : null}
+                            {canTransferOwnershipToMember ? (
+                              <button
+                                type="button"
+                                onClick={() => void handleTransferOwnership(member)}
+                                disabled={mutationBusy === "transfer-ownership"}
+                                className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                <Shield className="h-3.5 w-3.5" />
+                                Transfer ownership
+                              </button>
+                            ) : null}
+                            {!isInvited && access.canManageTeams ? (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const currentTeamIds = new Set(
+                                    (orgContext?.teams ?? [])
+                                      .filter((team) => team.memberIds.includes(member.id))
+                                      .map((team) => team.id),
+                                  );
+                                  setEditingMemberTeamsId(member.id);
+                                  setMemberTeamsDraft(currentTeamIds);
+                                  setOpenMemberMenuId(null);
+                                }}
+                                className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-gray-600 transition hover:bg-gray-50"
+                              >
+                                <Users className="h-3.5 w-3.5" />
+                                Manage teams
                               </button>
                             ) : null}
                             {!isInvited && access.canRemoveMembers ? (
@@ -829,6 +1022,82 @@ export function ManageMembersScreen() {
                       <span className="text-[13px] text-gray-400">Read only</span>
                     )}
                   </div>
+                </div>
+                {editingMemberTeamsId === member.id ? (
+                  <div className="col-span-full border-b border-gray-100 bg-gray-50/50 px-6 py-4">
+                    <div className="flex flex-wrap items-start gap-4">
+                      <div className="flex-1">
+                        <p className="mb-2 text-[12px] font-medium uppercase tracking-wide text-gray-400">
+                          Teams for {member.user.name}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {(orgContext?.teams ?? []).map((team) => {
+                            const selected = memberTeamsDraft.has(team.id);
+                            return (
+                              <button
+                                key={team.id}
+                                type="button"
+                                onClick={() => {
+                                  setMemberTeamsDraft((current) => {
+                                    const next = new Set(current);
+                                    if (next.has(team.id)) {
+                                      next.delete(team.id);
+                                    } else {
+                                      next.add(team.id);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                                className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[13px] font-medium transition ${selected ? "border-blue-300 bg-blue-50 text-blue-700" : "border-gray-200 bg-white text-gray-500 hover:border-gray-300"}`}
+                              >
+                                {selected ? (
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                ) : (
+                                  <Circle className="h-3.5 w-3.5" />
+                                )}
+                                {team.name}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 pt-5">
+                        <button
+                          type="button"
+                          onClick={() => setEditingMemberTeamsId(null)}
+                          className="inline-flex h-8 items-center rounded-full border border-gray-200 bg-white px-3.5 text-[13px] font-medium text-gray-600 transition hover:bg-gray-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={mutationBusy === "update-team"}
+                          onClick={async () => {
+                            setPageError(null);
+                            try {
+                              // For each team, update its member list to add or remove this member.
+                              for (const team of orgContext?.teams ?? []) {
+                                const wasInTeam = team.memberIds.includes(member.id);
+                                const shouldBeInTeam = memberTeamsDraft.has(team.id);
+                                if (wasInTeam === shouldBeInTeam) continue;
+                                const nextMemberIds = shouldBeInTeam
+                                  ? [...team.memberIds, member.id]
+                                  : team.memberIds.filter((id) => id !== member.id);
+                                await updateTeam(team.id, { memberIds: nextMemberIds });
+                              }
+                              setEditingMemberTeamsId(null);
+                            } catch (error) {
+                              setPageError(error instanceof Error ? error.message : "Could not update teams.");
+                            }
+                          }}
+                          className="inline-flex h-8 items-center rounded-full bg-gray-900 px-3.5 text-[13px] font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          Save teams
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
                 </div>
               );
             })}
@@ -865,9 +1134,19 @@ export function ManageMembersScreen() {
                   className="grid grid-cols-[minmax(0,1fr)_160px_200px] items-center gap-4 border-b border-gray-100 px-6 py-3.5 transition hover:bg-gray-50/60 last:border-b-0"
                 >
                   <div>
-                    <span className="text-[13px] font-medium text-gray-900">
-                      {team.name}
-                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Link
+                        href={getTeamRoute(orgSlug, team.id)}
+                        className="text-[13px] font-medium text-gray-900 hover:underline"
+                      >
+                        {team.name}
+                      </Link>
+                      {team.managedByScim ? (
+                        <span className="rounded-full bg-cyan-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cyan-700">
+                          Managed by SCIM
+                        </span>
+                      ) : null}
+                    </div>
                     <p className="mt-0.5 text-[12px] text-gray-400">
                       {teamMemberNames.get(team.id)?.slice(0, 3).join(", ") ||
                         "No members assigned yet"}
@@ -878,7 +1157,9 @@ export function ManageMembersScreen() {
                   </div>
                   <span className="text-[13px] text-gray-400">{`${team.memberIds.length} ${team.memberIds.length === 1 ? "member" : "members"}`}</span>
                   <div className="flex items-center justify-end gap-3">
-                    {access.canManageTeams ? (
+                    {team.managedByScim ? (
+                      <span className="text-[12px] font-medium text-cyan-700">Managed by identity provider</span>
+                    ) : access.canManageTeams ? (
                       <>
                         <ActionButton
                           icon={Pencil}
@@ -932,8 +1213,8 @@ export function ManageMembersScreen() {
           <div className="mb-6 flex items-center justify-between gap-4">
             <p className="text-[15px] text-gray-400">
               {access.canManageRoles
-                ? "Default roles stay available, and owners can add, edit, or remove custom roles here."
-                : "Role definitions are visible here, but only owners can change them."}
+                ? "Default roles stay available, and owners or super-admins can add, edit, or remove custom roles here."
+                : "Role definitions are visible here, but only owners and super-admins can change them."}
             </p>
             {toolbarAction ? (
               <DenButton icon={Plus} onClick={toolbarAction.onClick}>

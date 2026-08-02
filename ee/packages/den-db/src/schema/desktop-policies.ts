@@ -1,6 +1,6 @@
 import { relations, sql } from "drizzle-orm"
-import { boolean, index, json, mysqlTable, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
-import type { DesktopPolicyValue } from "@openwork/types/den/desktop-policies"
+import { boolean, index, int, json, mysqlTable, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
+import type { DesktopPolicyDocument } from "@openwork/types/den/desktop-policies"
 import { denTypeIdColumn } from "../columns"
 import { MemberTable, OrganizationTable } from "./org"
 import { TeamTable } from "./teams"
@@ -13,7 +13,8 @@ export const DesktopPolicyTable = mysqlTable(
     policyName: varchar("policy_name", { length: 255 }).notNull(),
     isDefault: boolean("is_default"),
     isEnabled: boolean("is_enabled").notNull().default(true),
-    policy: json("policy").$type<DesktopPolicyValue>().notNull().default(sql`(json_object())`),
+    priority: int("priority").notNull().default(0),
+    policy: json("policy").$type<DesktopPolicyDocument>().notNull().default(sql`(json_object())`),
     createdByOrgMemberId: denTypeIdColumn("member", "created_by_org_member_id").notNull(),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
@@ -22,9 +23,9 @@ export const DesktopPolicyTable = mysqlTable(
     deletedAt: timestamp("deleted_at", { fsp: 3 }),
   },
   (table) => [
-    index("desktop_policy_organization_id").on(table.organizationId),
     index("desktop_policy_created_by_member_id").on(table.createdByOrgMemberId),
     index("desktop_policy_is_enabled").on(table.isEnabled),
+    index("desktop_policy_priority").on(table.priority),
     index("desktop_policy_deleted_at").on(table.deletedAt),
     uniqueIndex("desktop_policy_org_default").on(table.organizationId, table.isDefault),
   ],
@@ -38,11 +39,11 @@ export const DesktopPolicyMemberTable = mysqlTable(
     desktopPolicyId: denTypeIdColumn("desktopPolicy", "desktop_policy_id").notNull(),
     orgMemberId: denTypeIdColumn("member", "org_member_id"),
     teamId: denTypeIdColumn("team", "team_id"),
+    role: varchar("role", { length: 64 }),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
   },
   (table) => [
     index("desktop_policy_member_organization_id").on(table.organizationId),
-    index("desktop_policy_member_policy_id").on(table.desktopPolicyId),
     index("desktop_policy_member_org_member_id").on(table.orgMemberId),
     index("desktop_policy_member_team_id").on(table.teamId),
     uniqueIndex("desktop_policy_member_policy_org_member").on(table.desktopPolicyId, table.orgMemberId),

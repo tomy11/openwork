@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { IBM_Plex_Mono, Inter } from "next/font/google";
+import { headers } from "next/headers";
 import Script from "next/script";
 import "./globals.css";
 
@@ -16,36 +17,57 @@ const ibmPlexMono = IBM_Plex_Mono({
   weight: ["400", "500"]
 });
 
-export const metadata: Metadata = {
-  metadataBase: new URL("https://app.openworklabs.com"),
-  title: "OpenWork Cloud",
-  description:
-    "Share your OpenWork setup with your team, manage billing, and use OpenWork Cloud from app.openworklabs.com.",
-  openGraph: {
-    title: "OpenWork Cloud",
-    description:
-      "Share your OpenWork setup with your team and keep selected workflows available in OpenWork Cloud.",
-    images: ["/opengraph-image"]
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "OpenWork Cloud",
-    description:
-      "Share your OpenWork setup with your team and manage OpenWork Cloud from app.openworklabs.com.",
-    images: ["/opengraph-image"]
-  },
-  icons: {
-    icon: "/openwork-mark.svg"
+function metadataBaseFromOrigin(origin: string) {
+  try {
+    return new URL(origin);
+  } catch {
+    return new URL("http://localhost:3005");
   }
-};
+}
 
-const defaultPosthogKey = "phc_4YnPTlDVYPjgwKvLuNxhbHjV5kadgvd7XLzVHWnCXAI";
+function firstHeaderValue(value: string | null) {
+  return value?.split(",")[0]?.trim() || "";
+}
+
+function forwardedProtocol(value: string | null) {
+  const protocol = firstHeaderValue(value).toLowerCase();
+  return protocol === "http" || protocol === "https" ? protocol : "https";
+}
+
+export async function generateMetadata(): Promise<Metadata> {
+  const configuredOrigin = process.env.DEN_WEB_PUBLIC_ORIGIN?.trim();
+  const requestHeaders = await headers();
+  const host = firstHeaderValue(requestHeaders.get("x-forwarded-host")) || firstHeaderValue(requestHeaders.get("host"));
+  const protocol = forwardedProtocol(requestHeaders.get("x-forwarded-proto"));
+  const metadataOrigin = configuredOrigin || (host ? `${protocol}://${host}` : "http://localhost:3005");
+
+  return {
+    metadataBase: metadataBaseFromOrigin(metadataOrigin),
+    title: "OpenWork Cloud",
+    description:
+      "Share your OpenWork setup with your team, manage billing, and use OpenWork Cloud from app.openworklabs.com.",
+    openGraph: {
+      title: "OpenWork Cloud",
+      description:
+        "Share your OpenWork setup with your team and keep selected workflows available in OpenWork Cloud.",
+      images: ["/opengraph-image"]
+    },
+    twitter: {
+      card: "summary_large_image",
+      title: "OpenWork Cloud",
+      description:
+        "Share your OpenWork setup with your team and manage OpenWork Cloud from app.openworklabs.com.",
+      images: ["/opengraph-image"]
+    },
+    icons: {
+      icon: "/openwork-mark.svg"
+    }
+  };
+}
+
 const defaultPosthogProxyPath = "/ow";
-const posthogKey =
-  process.env.NEXT_PUBLIC_POSTHOG_KEY?.trim() ||
-  process.env.NEXT_PUBLIC_POSTHOG_API_KEY?.trim() ||
-  defaultPosthogKey;
-const posthogHost = (process.env.NEXT_PUBLIC_POSTHOG_HOST ?? defaultPosthogProxyPath).trim();
+const posthogKey = process.env.DEN_WEB_POSTHOG_KEY?.trim() || "";
+const posthogHost = (process.env.DEN_WEB_POSTHOG_HOST ?? defaultPosthogProxyPath).trim();
 
 const posthogBootstrap = posthogKey
   ? `!function(t,e){var o,n,p,r;e.__SV||(window.posthog&&window.posthog.__loaded)||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture identify alias reset register unregister setPersonProperties".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])})}(document,window.posthog||[]);

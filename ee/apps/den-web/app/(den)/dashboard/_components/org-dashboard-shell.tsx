@@ -2,59 +2,77 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   BarChart3,
-  Bot,
-  Cable,
-  CreditCard,
-  Cpu,
+  ChevronDown,
+  ChevronRight,
   FileText,
+  Globe,
   Home,
-  KeyRound,
-  Laptop,
   LogOut,
   Menu,
   MessageSquare,
+  Plug,
   Puzzle,
-  Shield,
   SlidersHorizontal,
   Sparkles,
-  Store,
   type LucideIcon,
   Users,
   X,
 } from "lucide-react";
 import { useDenFlow } from "../../_providers/den-flow-provider";
+import { DEFAULT_AUTH_NAME } from "../../_lib/den-flow";
 import {
   formatRoleLabel,
   getAnalyticsRoute,
   getBackgroundAgentsRoute,
   getApiKeysRoute,
+  getBrandAppearanceRoute,
   getBillingRoute,
   getCustomLlmProvidersRoute,
+  getDiagnosticsRoute,
   getDesktopPoliciesRoute,
   getOrgAccessFlags,
   getIntegrationsRoute,
   getInferenceRoute,
+  getMcpConnectionsRoute,
+  getManagedBrandIconUrl,
   getMembersRoute,
+  getYourConnectionsRoute,
   getOrgDashboardRoute,
   getOrgSettingsRoute,
   getMarketplacesRoute,
   getPluginsRoute,
   getSsoRoute,
   getScimRoute,
+  getWebRoute,
 } from "../../_lib/den-org";
+import { useOrgListWindow } from "../../_lib/use-org-list-window";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { buildDenFeedbackUrl } from "../../_lib/feedback";
+import { OrgSelectionScreen } from "./org-selection-screen";
+import { UserProfileDialog } from "./user-profile-dialog";
 
-const OPENWORK_DOCS_URL = "https://openworklabs.com/docs";
+const OPENWORK_DOCS_URL = "/docs";
+
+type DashboardNavChild = {
+  href: string;
+  label: string;
+  badge?: string;
+};
 
 type DashboardNavItem = {
   href: string;
   label: string;
   icon: LucideIcon;
   badge?: string;
+  /**
+   * Grouped entries (Extensions, Models, Settings) keep the sidebar at seven
+   * top-level rows: the group links to its first child and its children
+   * render indented while the current page is inside the group.
+   */
+  children?: DashboardNavChild[];
 };
 
 function OrgMark({ name }: { name: string }) {
@@ -107,6 +125,105 @@ function OpenWorkMark({ className = "h-9 w-auto" }: { className?: string }) {
   );
 }
 
+export function SidebarBrandMark({
+  metadata,
+  organizationName,
+}: {
+  metadata: string | null | undefined;
+  organizationName: string;
+}) {
+  const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+
+  if (metadata === undefined) {
+    return (
+      <div
+        className="h-10 w-10 rounded-xl"
+        aria-label="Loading organization icon"
+        data-sidebar-brand-icon="loading"
+      />
+    );
+  }
+
+  const iconUrl = getManagedBrandIconUrl(metadata);
+  if (!iconUrl || failedUrl === iconUrl) {
+    return (
+      <div data-sidebar-brand-icon="fallback">
+        <OpenWorkMark />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="h-10 w-10 overflow-hidden rounded-xl"
+      data-sidebar-brand-icon={loadedUrl === iconUrl ? "ready" : "loading"}
+    >
+      <img
+        src={iconUrl}
+        alt={`${organizationName} icon`}
+        className={`h-full w-full object-contain transition-opacity ${loadedUrl === iconUrl ? "opacity-100" : "opacity-0"}`}
+        onLoad={() => setLoadedUrl(iconUrl)}
+        onError={() => setFailedUrl(iconUrl)}
+      />
+    </div>
+  );
+}
+
+const DEFAULT_WORKSPACE_FAVICON_HREF = "/openwork-mark.svg";
+
+export function WorkspaceFavicon({
+  metadata,
+}: {
+  metadata: string | null | undefined;
+}) {
+  const orgContextLoading = metadata === undefined;
+  const iconUrl = getManagedBrandIconUrl(metadata ?? null);
+
+  useEffect(() => {
+    if (orgContextLoading) {
+      // Keep the server-rendered favicon until the org context is known.
+      return;
+    }
+
+    let favicon = document.head.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!favicon) {
+      favicon = document.createElement("link");
+      favicon.rel = "icon";
+      document.head.appendChild(favicon);
+    }
+
+    if (!iconUrl) {
+      favicon.href = DEFAULT_WORKSPACE_FAVICON_HREF;
+      favicon.removeAttribute("type");
+      return;
+    }
+
+    const previousHref = favicon.getAttribute("href");
+    const previousType = favicon.getAttribute("type");
+    favicon.href = iconUrl;
+    favicon.type = iconUrl.toLowerCase().endsWith(".jpg")
+      || iconUrl.toLowerCase().endsWith(".jpeg")
+      ? "image/jpeg"
+      : "image/png";
+
+    return () => {
+      if (previousHref === null) {
+        favicon.setAttribute("href", DEFAULT_WORKSPACE_FAVICON_HREF);
+      } else {
+        favicon.setAttribute("href", previousHref);
+      }
+      if (previousType === null) {
+        favicon.removeAttribute("type");
+      } else {
+        favicon.setAttribute("type", previousType);
+      }
+    };
+  }, [orgContextLoading, iconUrl]);
+
+  return null;
+}
+
 function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
   if (!orgSlug) {
     return "Home";
@@ -136,25 +253,40 @@ function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
     return "Background Tasks";
   }
   if (pathname.startsWith(getCustomLlmProvidersRoute(orgSlug))) {
-    return "LLM Providers";
+    return "Bring your Own Keys";
   }
   if (pathname.startsWith(getDesktopPoliciesRoute(orgSlug))) {
     return "Desktop Policies";
   }
+  if (pathname.startsWith(getDiagnosticsRoute(orgSlug))) {
+    return "Diagnostics";
+  }
   if (pathname.startsWith(getInferenceRoute(orgSlug))) {
     return "OpenWork Models";
+  }
+  if (pathname.startsWith(getWebRoute(orgSlug))) {
+    return "Web";
   }
   if (pathname.startsWith(getPluginsRoute(orgSlug))) {
     return "Plugins";
   }
   if (pathname.startsWith(getMarketplacesRoute(orgSlug))) {
-    return "Marketplaces";
+    return "Marketplace";
   }
   if (pathname.startsWith(getIntegrationsRoute(orgSlug))) {
-    return "Integrations";
+    return "Sources";
+  }
+  if (pathname.startsWith(getMcpConnectionsRoute(orgSlug))) {
+    return "Connectors";
+  }
+  if (pathname.startsWith(getYourConnectionsRoute(orgSlug))) {
+    return "Your Connections";
   }
   if (pathname.startsWith(getBillingRoute(orgSlug))) {
     return "Billing";
+  }
+  if (pathname.startsWith(getBrandAppearanceRoute(orgSlug))) {
+    return "Brand appearance";
   }
   if (pathname.startsWith(getOrgSettingsRoute(orgSlug))) {
     return "Org Settings";
@@ -165,16 +297,43 @@ function getDashboardPageTitle(pathname: string, orgSlug: string | null) {
 
 export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const { user, signOut } = useDenFlow();
+  const { user, signOut, updateUserProfile, runtimeConfig, runtimeConfigLoaded } = useDenFlow();
   const {
     activeOrg,
     orgDirectory,
     orgContext,
+    orgSelectionRequired,
     orgBusy,
     orgError,
+    mutationBusy,
     switchOrganization,
   } = useOrgDashboard();
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [profilePromptDismissed, setProfilePromptDismissed] = useState(false);
+  const isSingleOrgMode = runtimeConfigLoaded && runtimeConfig.orgMode === "single_org";
+  const {
+    query: switcherQuery,
+    setQuery: setSwitcherQuery,
+    visible: visibleOrgDirectory,
+    filteredCount: switcherFilteredCount,
+    hiddenCount: switcherHiddenCount,
+    hasMore: switcherHasMore,
+    showMore: showMoreOrgDirectory,
+    showSearch: showSwitcherSearch,
+  } = useOrgListWindow(orgDirectory, 20);
+
+  if (orgSelectionRequired) {
+    return (
+      <OrgSelectionScreen
+        orgs={orgDirectory}
+        onSelect={switchOrganization}
+        onSignOut={() => void signOut()}
+        busy={mutationBusy === "switch-organization"}
+        error={orgError}
+      />
+    );
+  }
 
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
@@ -183,104 +342,84 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
   );
 
   const pageTitle = getDashboardPageTitle(pathname, activeOrg?.slug ?? null);
+  const shouldShowProfilePrompt = Boolean(
+    user &&
+      !profilePromptDismissed &&
+      user.name?.trim() === DEFAULT_AUTH_NAME,
+  );
+  const showFeedbackLink = runtimeConfigLoaded && runtimeConfig.orgMode === "multi_org";
   const feedbackHref = buildDenFeedbackUrl({
     pathname,
     orgSlug: activeOrg?.slug,
   });
+  const mcpConnectionsEnabled = orgContext?.capabilities.mcpConnections === true;
+  // Web access is backed by the existing hosted cloud capability. The org
+  // payload only reports `cloud` after the server rollout helper has verified
+  // the multi-org deployment gate, so the sidebar stays hidden by default until
+  // both config and org context load.
+  const showWeb = runtimeConfigLoaded && orgContext?.capabilities.cloud === true;
 
-  const adminNavItems: DashboardNavItem[] = access.isAdmin
+  // Top-level rows: Dashboard, optional Your Connections, Extensions, Models,
+  // Members, Analytics, Settings. Everything tool-shaped groups under
+  // Extensions starts with the Marketplace, followed by its source and
+  // management surfaces; model config groups under
+  // Models; set-once governance groups under Settings.
+  const extensionsGroup: DashboardNavItem | null = access.isAdmin && activeOrg
+    ? {
+        href: getMarketplacesRoute(activeOrg.slug),
+        label: "Extensions",
+        icon: Puzzle,
+        children: [
+          { href: getMarketplacesRoute(activeOrg.slug), label: "Marketplace" },
+          { href: getIntegrationsRoute(activeOrg.slug), label: "Sources", badge: "Alpha" },
+          { href: getPluginsRoute(activeOrg.slug), label: "Plugins" },
+          { href: getMcpConnectionsRoute(activeOrg.slug), label: "Connectors", badge: "Beta" },
+        ],
+      }
+    : null;
+  // OpenWork Models are a hosted OpenWork Cloud offering; self-hosted
+  // (single-org) deployments only manage their own LLM providers. Default
+  // hidden until the runtime config confirms a hosted (multi-org) deployment.
+  const showOpenWorkModels = runtimeConfigLoaded && runtimeConfig.orgMode === "multi_org";
+  const modelsGroup: DashboardNavItem | null = access.isAdmin && activeOrg
+    ? {
+        href: showOpenWorkModels
+          ? getInferenceRoute(activeOrg.slug)
+          : getCustomLlmProvidersRoute(activeOrg.slug),
+        label: "Models",
+        icon: Sparkles,
+        children: [
+          ...(showOpenWorkModels
+            ? [{ href: getInferenceRoute(activeOrg.slug), label: "OpenWork Models" }]
+            : []),
+          { href: getCustomLlmProvidersRoute(activeOrg.slug), label: "Bring your Own Keys" },
+        ],
+      }
+    : null;
+  const settingsChildren: DashboardNavChild[] = activeOrg
     ? [
-        {
-          href: activeOrg ? getAnalyticsRoute(activeOrg.slug) : "#",
-          label: "Analytics",
-          icon: BarChart3,
-          badge: "New",
-        },
-        // NOTE: Shared Workspace soft-disabled — uncomment to re-enable
-        // {
-        //   href: activeOrg ? getBackgroundAgentsRoute(activeOrg.slug) : "#",
-        //   label: "Shared Workspace",
-        //   icon: Bot,
-        //   badge: "Alpha",
-        // },
-        {
-          href: activeOrg ? getInferenceRoute(activeOrg.slug) : "#",
-          label: "OpenWork Models",
-          icon: Sparkles,
-          badge: "Beta",
-        },
-        {
-          href: activeOrg ? getCustomLlmProvidersRoute(activeOrg.slug) : "#",
-          label: "LLM Providers",
-          icon: Cpu,
-        },
-        {
-          href: activeOrg ? getDesktopPoliciesRoute(activeOrg.slug) : "#",
-          label: "Desktop Policies",
-          icon: Laptop,
-        },
-        {
-          href: activeOrg ? getIntegrationsRoute(activeOrg.slug) : "#",
-          label: "Integrations",
-          icon: Cable,
-          badge: "New",
-        },
-        {
-          href: activeOrg ? getMarketplacesRoute(activeOrg.slug) : "#",
-          label: "Marketplaces",
-          icon: Store,
-          badge: "New",
-        },
-        {
-          href: activeOrg ? getPluginsRoute(activeOrg.slug) : "#",
-          label: "Plugins",
-          icon: Puzzle,
-          badge: "New",
-        },
-        {
-          href: activeOrg ? getMembersRoute(activeOrg.slug) : "#",
-          label: "Members",
-          icon: Users,
-        },
+        ...(access.canViewSettings
+          ? [
+              { href: getOrgSettingsRoute(activeOrg.slug), label: "General" },
+              { href: getDiagnosticsRoute(activeOrg.slug), label: "Diagnostics" },
+              { href: getBrandAppearanceRoute(activeOrg.slug), label: "Brand appearance" },
+              { href: getDesktopPoliciesRoute(activeOrg.slug), label: "Desktop Policies" },
+              { href: getBillingRoute(activeOrg.slug), label: "Billing" },
+              { href: getApiKeysRoute(activeOrg.slug), label: "API Keys" },
+              { href: getSsoRoute(activeOrg.slug), label: "SSO" },
+              { href: getScimRoute(activeOrg.slug), label: "SCIM" },
+            ]
+          : []),
       ]
     : [];
-  const securityNavItems: DashboardNavItem[] = [
-    ...(access.canManageApiKeys
-      ? [{
-          href: activeOrg ? getApiKeysRoute(activeOrg.slug) : "#",
-          label: "API Keys",
-          icon: KeyRound,
-        }]
-      : []),
-    ...(access.canManageScim
-      ? [{
-          href: activeOrg ? getScimRoute(activeOrg.slug) : "#",
-          label: "SCIM",
-          icon: Shield,
-        }]
-      : []),
-    ...(access.canManageSso
-      ? [{
-          href: activeOrg ? getSsoRoute(activeOrg.slug) : "#",
-          label: "SSO",
-          icon: Shield,
-        }]
-      : []),
-  ];
-  const ownerAdminNavItems: DashboardNavItem[] = access.isAdmin
-    ? [
-        {
-          href: getBillingRoute(activeOrg?.slug),
-          label: "Billing",
-          icon: CreditCard,
-        },
-        {
-          href: activeOrg ? getOrgSettingsRoute(activeOrg.slug) : "#",
-          label: "Org Settings",
-          icon: SlidersHorizontal,
-        },
-      ]
-    : [];
+  const settingsGroup: DashboardNavItem | null = settingsChildren.length > 0
+    ? {
+        href: settingsChildren[0].href,
+        label: "Settings",
+        icon: SlidersHorizontal,
+        children: settingsChildren,
+      }
+    : null;
 
   const navItems: DashboardNavItem[] = [
     {
@@ -288,12 +427,58 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
       label: "Dashboard",
       icon: Home,
     },
-    ...adminNavItems,
-    ...securityNavItems,
-    ...ownerAdminNavItems,
+    ...(mcpConnectionsEnabled
+      ? [{
+          // Member-visible (not admin-gated): where each person connects their
+          // own account for per-member connections shared with them.
+          href: activeOrg ? getYourConnectionsRoute(activeOrg.slug) : "#",
+          label: "Your Connections",
+          icon: Plug,
+          badge: "Beta",
+        }]
+      : []),
+    ...(showWeb
+      ? [{
+          href: activeOrg ? getWebRoute(activeOrg.slug) : "#",
+          label: "Web",
+          icon: Globe,
+          badge: "Alpha",
+        }]
+      : []),
+    ...(extensionsGroup ? [extensionsGroup] : []),
+    ...(modelsGroup ? [modelsGroup] : []),
+    ...(access.isAdmin && activeOrg
+      ? [
+          { href: getMembersRoute(activeOrg.slug), label: "Members", icon: Users },
+          { href: getAnalyticsRoute(activeOrg.slug), label: "Analytics", icon: BarChart3 },
+        ]
+      : []),
+    ...(settingsGroup ? [settingsGroup] : []),
   ];
 
-  const orgSwitcher = (
+  const orgSwitcher = isSingleOrgMode ? (
+    <div className="flex w-full items-center justify-between gap-3 rounded-xl px-2 py-2">
+      <div className="flex min-w-0 items-center gap-3">
+        <OrgMark name={activeOrg?.name ?? runtimeConfig.singleOrgName} />
+        <div className="min-w-0">
+          <p className="truncate text-[14px] font-medium text-gray-900">
+            {activeOrg?.name ?? runtimeConfig.singleOrgName}
+          </p>
+          <p className="truncate text-[12px] text-gray-500">
+            {activeOrg ? formatRoleLabel(activeOrg.role) : "Preparing workspace"}
+          </p>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => void signOut()}
+        className="shrink-0 rounded-lg p-1.5 text-gray-400 transition hover:bg-gray-100 hover:text-gray-900"
+        aria-label="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
+    </div>
+  ) : (
     <div className="relative">
       <button
         type="button"
@@ -334,9 +519,21 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
               Switch workspace
             </p>
           </div>
-          
-          <div className="grid gap-0.5 px-1.5">
-            {orgDirectory.map((org) => (
+
+          {showSwitcherSearch ? (
+            <div className="px-2 pb-1">
+              <input
+                type="search"
+                value={switcherQuery}
+                onChange={(event) => setSwitcherQuery(event.target.value)}
+                placeholder="Search workspaces"
+                className="w-full rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[12px] text-gray-900 outline-none transition focus:border-gray-400"
+              />
+            </div>
+          ) : null}
+
+          <div className="grid max-h-64 gap-0.5 overflow-y-auto px-1.5">
+            {visibleOrgDirectory.map((org) => (
               <button
                 key={org.id}
                 type="button"
@@ -367,6 +564,22 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
             ))}
           </div>
 
+          {switcherFilteredCount === 0 && switcherQuery ? (
+            <p className="px-3 py-1 text-[12px] text-gray-500">No organizations match your search.</p>
+          ) : null}
+
+          {switcherHasMore ? (
+            <div className="px-1.5">
+              <button
+                type="button"
+                onClick={showMoreOrgDirectory}
+                className="flex w-full items-center justify-center rounded-lg px-2 py-1.5 text-[12px] font-medium text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-900"
+              >
+                Show more ({switcherHiddenCount})
+              </button>
+            </div>
+          ) : null}
+
           <div className="px-1.5 mt-0.5">
             <Link
               href="/organization"
@@ -394,13 +607,14 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
     </div>
   );
 
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-
   const sidebarContent = (
     <div className="flex flex-1 flex-col">
       <div className="border-b border-gray-100 px-4 pb-4 pt-5">
         <div className="flex items-center justify-between gap-3">
-          <OpenWorkMark />
+          <SidebarBrandMark
+            metadata={orgContext?.organization.metadata}
+            organizationName={activeOrg?.name ?? runtimeConfig.singleOrgName}
+          />
           <button
             type="button"
             className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 md:hidden"
@@ -420,33 +634,69 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
           {navItems.map((item) => {
             const isDashboardRoot =
               activeOrg && item.href === getOrgDashboardRoute(activeOrg.slug);
+            const childActive = (child: DashboardNavChild) =>
+              pathname === child.href || pathname.startsWith(`${child.href}/`);
+            const groupActive = (item.children ?? []).some(childActive);
             const selected =
               item.href !== "#" &&
-              (isDashboardRoot
-                ? pathname === item.href
-                : pathname === item.href || pathname.startsWith(`${item.href}/`));
+              (item.children
+                ? groupActive
+                : isDashboardRoot
+                  ? pathname === item.href
+                  : pathname === item.href || pathname.startsWith(`${item.href}/`));
 
             return (
-              <Link
-                key={item.label}
-                href={item.href}
-                onClick={() => setSidebarOpen(false)}
-                className={`flex items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-[13px] tracking-[-0.1px] transition-colors ${
-                  selected
-                    ? "bg-gray-100 text-gray-900"
-                    : "text-gray-500 hover:bg-gray-50 hover:text-gray-700"
-                }`}
-              >
-                <span className="flex items-center gap-3">
-                  <item.icon className="h-4 w-4" strokeWidth={1.8} />
-                  {item.label}
-                </span>
-                {item.badge ? (
-                  <span className="rounded-full bg-white px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-gray-500">
-                    {item.badge}
+              <div key={item.label}>
+                <Link
+                  href={item.href}
+                  onClick={() => setSidebarOpen(false)}
+                  className={`flex items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-[13px] tracking-[-0.1px] transition-colors ${
+                    selected
+                      ? "bg-gray-100 text-gray-900"
+                      : "text-gray-500 hover:bg-gray-50 hover:text-gray-700"
+                  }`}
+                >
+                  <span className="flex items-center gap-3">
+                    <item.icon className="h-4 w-4" strokeWidth={1.8} />
+                    {item.label}
                   </span>
+                  <span className="flex items-center gap-1.5">
+                    {item.badge ? (
+                      <span className="rounded-full bg-white px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-gray-500">
+                        {item.badge}
+                      </span>
+                    ) : null}
+                    {item.children ? (
+                      groupActive
+                        ? <ChevronDown className="h-3.5 w-3.5 text-gray-400" strokeWidth={2} />
+                        : <ChevronRight className="h-3.5 w-3.5 text-gray-300" strokeWidth={2} />
+                    ) : null}
+                  </span>
+                </Link>
+                {item.children && groupActive ? (
+                  <div className="ml-[22px] mt-1 space-y-0.5 border-l border-gray-100 pl-3">
+                    {item.children.map((child) => (
+                      <Link
+                        key={child.label}
+                        href={child.href}
+                        onClick={() => setSidebarOpen(false)}
+                        className={`flex items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-[13px] tracking-[-0.1px] transition-colors ${
+                          childActive(child)
+                            ? "font-medium text-gray-900"
+                            : "text-gray-500 hover:text-gray-700"
+                        }`}
+                      >
+                        {child.label}
+                        {child.badge ? (
+                          <span className="rounded-full bg-white px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-gray-500">
+                            {child.badge}
+                          </span>
+                        ) : null}
+                      </Link>
+                    ))}
+                  </div>
                 ) : null}
-              </Link>
+              </div>
             );
           })}
         </div>
@@ -466,7 +716,8 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <div className="flex min-h-screen flex-col bg-[#fafafa] md:flex-row">
+    <div className="flex min-h-screen flex-col bg-[#fafafa] md:h-screen md:flex-row">
+      <WorkspaceFavicon metadata={orgContext?.organization.metadata} />
       {/* Desktop sidebar — always visible at md+ */}
       <aside className="hidden shrink-0 border-r border-gray-100 bg-white md:flex md:min-h-screen md:w-[260px] md:flex-col">
         {sidebarContent}
@@ -499,15 +750,17 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
           </div>
 
           <div className="flex items-center gap-1">
-            <a
-              href={feedbackHref}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] text-gray-500 transition-colors hover:bg-gray-50 hover:text-gray-700"
-            >
-              <MessageSquare className="h-4 w-4" />
-              <span className="hidden sm:inline">Feedback</span>
-            </a>
+            {showFeedbackLink ? (
+              <a
+                href={feedbackHref}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] text-gray-500 transition-colors hover:bg-gray-50 hover:text-gray-700"
+              >
+                <MessageSquare className="h-4 w-4" />
+                <span className="hidden sm:inline">Feedback</span>
+              </a>
+            ) : null}
             <a
               href={OPENWORK_DOCS_URL}
               target="_blank"
@@ -522,6 +775,19 @@ export function OrgDashboardShell({ children }: { children: React.ReactNode }) {
 
         <main className="flex-1 overflow-y-auto bg-[#fafafa]">{children}</main>
       </div>
+
+      {shouldShowProfilePrompt && user ? (
+        <UserProfileDialog
+          key={user.id}
+          user={user}
+          descriptor="Change how your name appears in the organization"
+          onCancel={() => setProfilePromptDismissed(true)}
+          onSave={async (input) => {
+            await updateUserProfile(input);
+            setProfilePromptDismissed(true);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

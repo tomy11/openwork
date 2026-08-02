@@ -13,7 +13,17 @@ import {
 import { THINKING_PREF_KEY } from "../../app/constants";
 import { coerceReleaseChannel } from "../../app/lib/release-channels";
 import type { ModelRef, ReleaseChannel, SettingsTab, View } from "../../app/types";
-import { readStoredDefaultModel } from "./model-config";
+import {
+  DEFAULT_DESKTOP_NOTIFICATION_PREFERENCE,
+  isDesktopNotificationPreference,
+  type DesktopNotificationPreference,
+} from "./desktop-notification-preferences";
+import { LOCAL_PREFERENCES_KEY } from "./local-preferences-storage";
+import {
+  readStoredDefaultModel,
+  storedDefaultModelChangedEvent,
+  writeStoredDefaultModel,
+} from "./model-config";
 
 export type LocalUIState = {
   view: View;
@@ -38,6 +48,12 @@ export type LocalPreferences = {
   releaseChannel: ReleaseChannel;
   featureFlags: {
     microsandboxCreateSandbox: boolean;
+    /**
+     * Memory Bank preview. Client-only, per-device, never synced. Gates desktop
+     * UI surfacing (the management panel + copy-prompt affordance); the routes
+     * stay callable (owner-scoped + authz'd). Off by default — opt-in preview.
+     */
+    memory: boolean;
   };
   /**
    * Set to true after the user completes the welcome/onboarding flow
@@ -50,6 +66,11 @@ export type LocalPreferences = {
    * opt-out in Settings -> Preferences. Never includes message content.
    */
   analyticsEnabled: boolean;
+  /**
+   * Native OS notifications from the desktop app. Off by default so upgrading
+   * users are not surprised by system popups.
+   */
+  desktopNotifications: DesktopNotificationPreference;
 };
 
 type LocalContextValue = {
@@ -63,7 +84,6 @@ type LocalContextValue = {
 const LocalContext = createContext<LocalContextValue | undefined>(undefined);
 
 const UI_STORAGE_KEY = "openwork.ui";
-const PREFS_STORAGE_KEY = "openwork.preferences";
 export const DEFAULT_SHOW_THINKING = true;
 
 const INITIAL_UI: LocalUIState = { view: "settings", tab: "general" };
@@ -73,9 +93,10 @@ const INITIAL_PREFS: LocalPreferences = {
   defaultModel: null,
   selectedAgent: null,
   releaseChannel: "stable",
-  featureFlags: { microsandboxCreateSandbox: true },
+  featureFlags: { microsandboxCreateSandbox: true, memory: false },
   hasCompletedOnboarding: false,
   analyticsEnabled: true,
+  desktopNotifications: DEFAULT_DESKTOP_NOTIFICATION_PREFERENCE,
 };
 
 function readPersisted<T>(key: string, fallback: T): T {
@@ -111,7 +132,10 @@ export function LocalProvider({ children }: LocalProviderProps) {
     readPersisted(UI_STORAGE_KEY, INITIAL_UI),
   );
   const [prefs, setPrefsRaw] = useState<LocalPreferences>(() => {
-    const persisted = readPersisted(PREFS_STORAGE_KEY, INITIAL_PREFS);
+    const persisted = readPersisted(LOCAL_PREFERENCES_KEY, INITIAL_PREFS);
+    persisted.desktopNotifications = isDesktopNotificationPreference(persisted.desktopNotifications)
+      ? persisted.desktopNotifications
+      : DEFAULT_DESKTOP_NOTIFICATION_PREFERENCE;
     if (persisted.defaultModel) {
       return persisted;
     }
@@ -128,8 +152,32 @@ export function LocalProvider({ children }: LocalProviderProps) {
   }, [ui]);
 
   useEffect(() => {
-    writePersisted(PREFS_STORAGE_KEY, prefs);
+    writePersisted(LOCAL_PREFERENCES_KEY, prefs);
+    if (prefs.defaultModel) writeStoredDefaultModel(prefs.defaultModel);
   }, [prefs]);
+
+  useEffect(() => {
+    const updateDefaultModel = () => {
+      const model = readStoredDefaultModel();
+      setPrefsRaw((previous) => {
+        if (
+          previous.defaultModel?.providerID === model.providerID &&
+          previous.defaultModel.modelID === model.modelID
+        ) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          defaultModel: model,
+          modelVariant: null,
+        };
+      });
+    };
+
+    window.addEventListener(storedDefaultModelChangedEvent, updateDefaultModel);
+    return () => window.removeEventListener(storedDefaultModelChangedEvent, updateDefaultModel);
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

@@ -1,7 +1,14 @@
 import { and, eq, isNull } from "@openwork-ee/den-db/drizzle"
 import {
+  ConfigObjectAccessGrantTable,
+  ConnectorInstanceAccessGrantTable,
+  DesktopPolicyMemberTable,
+  ExternalMcpConnectionAccessGrantTable,
+  InvitationTable,
+  LlmProviderAccessTable,
+  MarketplaceAccessGrantTable,
   MemberTable,
-  SkillHubMemberTable,
+  PluginAccessGrantTable,
   TeamMemberTable,
   TeamTable,
 } from "@openwork-ee/den-db/schema"
@@ -10,6 +17,7 @@ import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { db } from "../../db.js"
+import { isScimManagedTeam } from "../../scim-groups.js"
 import {
   jsonValidator,
   orgRoleRoute,
@@ -53,7 +61,8 @@ const teamResponseSchema = z.object({
     name: z.string(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
-    memberIds: z.array(denTypeIdSchema("member")),
+      memberIds: z.array(denTypeIdSchema("member")),
+      managedByScim: z.boolean(),
   }),
 }).meta({ ref: "TeamResponse" })
 
@@ -165,6 +174,7 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
           createdAt: now,
           updatedAt: now,
           memberIds,
+          managedByScim: false,
         },
       }, 201)
     },
@@ -214,6 +224,9 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
       if (!team) {
         return c.json({ error: "team_not_found" }, 404)
       }
+      if (await isScimManagedTeam({ organizationId: payload.organization.id, teamId: team.id })) {
+        return c.json({ error: "scim_managed_team", message: "Manage this team through the SCIM identity provider." }, 409)
+      }
 
       let memberIds: MemberId[] | undefined
       if (input.memberIds) {
@@ -244,6 +257,12 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
       }
 
       const updatedAt = new Date()
+      const responseMemberIds = memberIds ?? (await db
+        .select({ id: TeamMemberTable.orgMembershipId })
+        .from(TeamMemberTable)
+        .where(eq(TeamMemberTable.teamId, team.id)))
+        .map((row) => row.id)
+
       await db.transaction(async (tx) => {
         await tx.update(TeamTable).set({ name: nextName, updatedAt }).where(eq(TeamTable.id, team.id))
 
@@ -267,7 +286,8 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
           ...team,
           name: nextName,
           updatedAt,
-          memberIds: memberIds ?? [],
+          memberIds: responseMemberIds,
+          managedByScim: false,
         },
       })
     },
@@ -278,7 +298,7 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
     describeRoute({
       tags: ["Teams"],
       summary: "Delete team",
-      description: "Deletes a team and removes its related hub-access and team-membership records.",
+      description: "Deletes a team and removes its related team-membership records.",
       responses: {
         204: emptyResponse("Team deleted successfully."),
         400: jsonResponse("The team deletion path parameters were invalid.", invalidRequestSchema),
@@ -315,9 +335,43 @@ export function registerOrgTeamRoutes<T extends { Variables: OrgRouteVariables }
       if (!team) {
         return c.json({ error: "team_not_found" }, 404)
       }
+      if (await isScimManagedTeam({ organizationId: payload.organization.id, teamId: team.id })) {
+        return c.json({ error: "scim_managed_team", message: "Disable SCIM team mapping before deleting this team." }, 409)
+      }
 
       await db.transaction(async (tx) => {
-        await tx.delete(SkillHubMemberTable).where(eq(SkillHubMemberTable.teamId, team.id))
+        const removedAt = new Date()
+
+        await tx
+          .update(InvitationTable)
+          .set({ teamId: null })
+          .where(and(
+            eq(InvitationTable.organizationId, payload.organization.id),
+            eq(InvitationTable.teamId, team.id),
+            eq(InvitationTable.status, "pending"),
+          ))
+
+        await tx.delete(DesktopPolicyMemberTable).where(eq(DesktopPolicyMemberTable.teamId, team.id))
+        await tx.delete(ExternalMcpConnectionAccessGrantTable).where(eq(ExternalMcpConnectionAccessGrantTable.teamId, team.id))
+        await tx.delete(LlmProviderAccessTable).where(eq(LlmProviderAccessTable.teamId, team.id))
+
+        await tx
+          .update(MarketplaceAccessGrantTable)
+          .set({ removedAt })
+          .where(and(eq(MarketplaceAccessGrantTable.teamId, team.id), isNull(MarketplaceAccessGrantTable.removedAt)))
+        await tx
+          .update(ConfigObjectAccessGrantTable)
+          .set({ removedAt })
+          .where(and(eq(ConfigObjectAccessGrantTable.teamId, team.id), isNull(ConfigObjectAccessGrantTable.removedAt)))
+        await tx
+          .update(PluginAccessGrantTable)
+          .set({ removedAt })
+          .where(and(eq(PluginAccessGrantTable.teamId, team.id), isNull(PluginAccessGrantTable.removedAt)))
+        await tx
+          .update(ConnectorInstanceAccessGrantTable)
+          .set({ removedAt })
+          .where(and(eq(ConnectorInstanceAccessGrantTable.teamId, team.id), isNull(ConnectorInstanceAccessGrantTable.removedAt)))
+
         await tx.delete(TeamMemberTable).where(eq(TeamMemberTable.teamId, team.id))
         await tx.delete(TeamTable).where(eq(TeamTable.id, team.id))
       })

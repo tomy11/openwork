@@ -1,10 +1,11 @@
 /** @jsxImportSource react */
 import { useEffect, useRef } from "react";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { cn } from "@/lib/utils";
+import { markdownLivePreview } from "./markdown-live-preview";
 
 type ArtifactTextEditorProps = {
   className?: string;
@@ -34,34 +35,51 @@ export function ArtifactTextEditor(props: ArtifactTextEditorProps) {
       state: EditorState.create({
         doc: props.value,
         extensions: [
-          lineNumbers(),
+          props.language === "markdown" ? [] : lineNumbers(),
           history(),
           keymap.of([...defaultKeymap, ...historyKeymap]),
-          props.language === "markdown" ? markdown() : [],
+          // GFM base so tables, strikethrough and task lists parse; the
+          // CommonMark default never produces Table nodes to render.
+          props.language === "markdown" ? [markdown({ base: markdownLanguage }), markdownLivePreview()] : [],
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onChangeRef.current(update.state.doc.toString());
             }
           }),
-          EditorView.theme({
-            "&": { height: "100%", background: "transparent" },
-            ".cm-scroller": { fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" },
-            ".cm-content": { minHeight: "100%", padding: "12px 0", fontSize: "12px", lineHeight: "20px" },
-            ".cm-gutters": { background: "transparent", borderRight: "1px solid hsl(var(--border))" },
-            ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px", color: "hsl(var(--muted-foreground))" },
-            ".cm-activeLine": { backgroundColor: "hsl(var(--muted) / 0.35)" },
-            ".cm-activeLineGutter": { backgroundColor: "hsl(var(--muted) / 0.35)" },
-          }),
+          props.language === "markdown"
+            ? EditorView.theme({
+                "&": { height: "100%", background: "transparent" },
+                ".cm-scroller": { fontFamily: "inherit" },
+                ".cm-content": { minHeight: "100%", padding: "16px", maxWidth: "768px", margin: "0 auto", fontSize: "14px", lineHeight: "1.7" },
+                ".cm-activeLine": { backgroundColor: "transparent" },
+              })
+            : EditorView.theme({
+                "&": { height: "100%", background: "transparent" },
+                ".cm-scroller": { fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" },
+                ".cm-content": { minHeight: "100%", padding: "12px 0", fontSize: "12px", lineHeight: "20px" },
+                ".cm-gutters": { background: "transparent", borderRight: "1px solid hsl(var(--border))" },
+                ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px", color: "hsl(var(--muted-foreground))" },
+                ".cm-activeLine": { backgroundColor: "hsl(var(--muted) / 0.35)" },
+                ".cm-activeLineGutter": { backgroundColor: "hsl(var(--muted) / 0.35)" },
+              }),
         ],
       }),
     });
 
     viewRef.current = view;
 
+    // Dev-only handle so e2e flows can drive the editor selection.
+    if (import.meta.env.DEV) {
+      (window as unknown as { __artifactEditorView?: EditorView }).__artifactEditorView = view;
+    }
+
     return () => {
       view.destroy();
       viewRef.current = null;
+      if (import.meta.env.DEV) {
+        delete (window as unknown as { __artifactEditorView?: EditorView }).__artifactEditorView;
+      }
     };
   }, [props.language]);
 

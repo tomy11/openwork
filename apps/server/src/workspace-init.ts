@@ -1,11 +1,11 @@
-import { basename, join } from "node:path";
-import { readFile, writeFile } from "node:fs/promises";
+import { basename } from "node:path";
+import { readFile } from "node:fs/promises";
 
 import { ensureDir, exists } from "./utils.js";
 import { ApiError } from "./errors.js";
-import { openworkConfigPath, opencodeConfigPath } from "./workspace-files.js";
+import { opencodeConfigPath } from "./workspace-files.js";
 import { readJsoncFile } from "./jsonc.js";
-import type { ReloadReason } from "./types.js";
+import type { ReloadReason, WorkspaceInfo } from "./types.js";
 
 type WorkspaceOpenworkConfig = {
   version: number;
@@ -32,23 +32,24 @@ function normalizePreset(preset: string | null | undefined): string {
   return trimmed;
 }
 
-async function ensureWorkspaceOpenworkConfig(workspaceRoot: string, preset: string): Promise<boolean> {
-  const path = openworkConfigPath(workspaceRoot);
-  if (await exists(path)) return false;
-  const now = Date.now();
-  const config: WorkspaceOpenworkConfig = {
+/**
+ * Build the default per-workspace openwork config metadata. The openwork
+ * config is now stored in the runtime DB (see
+ * `seedOpenworkWorkspaceConfigIfEmpty`), not in `.opencode/openwork.json`, so
+ * this no longer writes a file. Exposed so the workspace-creation route can
+ * seed the DB row with the same defaults.
+ */
+export function defaultWorkspaceOpenworkConfig(workspaceRoot: string, preset: string): WorkspaceOpenworkConfig {
+  return {
     version: 1,
     workspace: {
       name: basename(workspaceRoot) || "Workspace",
-      createdAt: now,
+      createdAt: Date.now(),
       preset,
     },
     authorizedRoots: [workspaceRoot],
     reload: null,
   };
-  await ensureDir(join(workspaceRoot, ".opencode"));
-  await writeFile(path, JSON.stringify(config, null, 2) + "\n", "utf8");
-  return true;
 }
 
 async function ensureOpencodeConfig(workspaceRoot: string): Promise<boolean> {
@@ -67,11 +68,32 @@ export async function ensureWorkspaceFiles(workspaceRoot: string, presetInput: s
   await ensureDir(workspaceRoot);
   const reloadReasons = new Set<ReloadReason>();
   if (await ensureOpencodeConfig(workspaceRoot)) reloadReasons.add("config");
-  const openworkConfigChanged = await ensureWorkspaceOpenworkConfig(workspaceRoot, preset);
+  // openwork config is seeded into the runtime DB by the caller, not written
+  // as a file here.
+  void preset;
   return {
-    changed: openworkConfigChanged || reloadReasons.size > 0,
+    changed: reloadReasons.size > 0,
     reloadReasons: Array.from(reloadReasons),
   };
+}
+
+/**
+ * Provision workspace files for every workspace that has local files to set up.
+ *
+ * Skips remote workspaces (which live on a host and may even carry a non-empty
+ * remote `directory`) and any workspace without a resolved local path. Either
+ * would otherwise reach ensureWorkspaceFiles() — which throws
+ * `invalid_workspace_path` on a blank path — and abort server startup. Local
+ * workspaces are always created with a validated path, so they are unaffected.
+ * Shared by the embedded-server and CLI boot paths.
+ */
+export async function ensureLocalWorkspaceFiles(
+  workspaces: ReadonlyArray<Pick<WorkspaceInfo, "path" | "preset" | "workspaceType">>,
+): Promise<void> {
+  for (const workspace of workspaces) {
+    if (workspace.workspaceType === "remote" || !workspace.path.trim()) continue;
+    await ensureWorkspaceFiles(workspace.path, workspace.preset);
+  }
 }
 
 export async function readRawOpencodeConfig(path: string): Promise<{ exists: boolean; content: string | null }> {

@@ -13,7 +13,7 @@ import {
 } from "@openwork-ee/den-db/schema"
 import type { MemberTeamSummary, OrganizationContext } from "../../../orgs.js"
 import { db } from "../../../db.js"
-import { hasFreshPrivilegedSession, memberHasRole } from "../shared.js"
+import { getFreshPrivilegedSessionRequiredResponse, hasFreshPrivilegedSession, memberHasRole } from "../shared.js"
 
 export type PluginArchResourceKind = "config_object" | "connector_instance" | "marketplace" | "plugin"
 export type PluginArchRole = "viewer" | "editor" | "manager"
@@ -98,7 +98,10 @@ export function isPluginArchOrgAdmin(context: PluginArchActorContext) {
   return context.organizationContext.currentMember.isOwner || memberHasRole(context.organizationContext.currentMember.role, "admin")
 }
 
-export function hasPluginArchCapability(context: PluginArchActorContext, _capability: PluginArchCapability) {
+export function hasPluginArchCapability(context: PluginArchActorContext, capability: PluginArchCapability) {
+  if (capability === "plugin.create" || capability === "config_object.create") {
+    return true
+  }
   return isPluginArchOrgAdmin(context)
 }
 
@@ -107,7 +110,8 @@ function ensureFreshPluginArchAdmin(context: PluginArchActorContext) {
     return
   }
 
-  throw new PluginArchAuthorizationError(403, "reauth", "Sign in again before performing this privileged action.", "fresh_auth_required")
+  const response = getFreshPrivilegedSessionRequiredResponse()
+  throw new PluginArchAuthorizationError(403, response.error, response.message, response.reason)
 }
 
 function roleSatisfies(role: PluginArchRole | null, required: PluginArchRole) {

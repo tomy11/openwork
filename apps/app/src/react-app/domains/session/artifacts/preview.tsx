@@ -37,7 +37,7 @@ interface MarkdownPreviewProps extends React.ComponentProps<"div"> {
 
 export function MarkdownPreview({ content, className, ...props }: MarkdownPreviewProps) {
   return (
-    <div className={cn("h-full overflow-auto p-4", className)} {...props}>
+    <div data-openwork-markdown-preview="" className={cn("h-full overflow-auto p-4", className)} {...props}>
       <MarkdownBlock text={content} />
     </div>
   );
@@ -63,6 +63,19 @@ export function HTMLPreview({ className, ...props }: HTMLPreviewProps) {
   }
 
   return <iframe src={props.url} title={props.title} className={cn("h-full w-full border-0", className)} sandbox="allow-scripts allow-same-origin" />;
+}
+
+interface PdfPreviewProps {
+  url: string;
+  title: string;
+  className?: string;
+}
+
+export function PdfPreview({ url, title, className }: PdfPreviewProps) {
+  // Chromium's built-in PDF viewer (enabled via webPreferences.plugins) renders
+  // reliably through <embed>; <object>/sandboxed <iframe> show a blank frame.
+  // The blob URL comes from a trusted workspace file.
+  return <embed src={url} type="application/pdf" title={title} className={cn("h-full w-full border-0", className)} />;
 }
 
 interface ImagePreviewProps extends React.ComponentProps<"div"> {

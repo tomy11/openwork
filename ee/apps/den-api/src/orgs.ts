@@ -1,11 +1,14 @@
-import { and, asc, count, eq, inArray, isNull } from "@openwork-ee/den-db/drizzle"
+import { and, asc, count, eq, gt, inArray, isNotNull, isNull, sql } from "@openwork-ee/den-db/drizzle"
 import {
   AuthSessionTable,
   AuthUserTable,
+  ConnectedAccountTable,
   InvitationTable,
+  LlmProviderAccessTable,
   MemberTable,
   OrganizationRoleTable,
   OrganizationTable,
+  SsoConnectionTable,
   TeamMemberTable,
   TeamTable,
 } from "@openwork-ee/den-db/schema"
@@ -13,16 +16,23 @@ import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { revokeOrganizationApiKeysForMember } from "./api-keys.js"
 import { revokeMembershipSessionCredentials } from "./credential-revocation.js"
 import { db } from "./db.js"
+import { env } from "./env.js"
 import {
   getRoleValueAfterOwnershipTransfer,
-  roleIncludesPrivileged,
   roleIncludesOwner as guardRoleIncludesOwner,
+  roleIncludesSuperAdmin,
   validateOrganizationMemberRemoval,
   validateOrganizationMemberRoleChange,
   type MemberLifecycleValidation,
 } from "./organization-member-guards.js"
 import { runPostOrganizationMemberChangeHooks } from "./organization-member-hooks.js"
-import { DEFAULT_ORGANIZATION_LIMITS, normalizeOrganizationMetadata, serializeOrganizationMetadata } from "./organization-limits.js"
+import { getScimManagedTeamIds } from "./scim-groups.js"
+import {
+  DEFAULT_ORGANIZATION_LIMITS,
+  normalizeOrganizationMetadata,
+  serializeOrganizationMetadata,
+  type ManagedBrandAssetMetadata,
+} from "./organization-limits.js"
 import {
   denDefaultDynamicOrganizationRoles,
   denOrganizationStaticRoles,
@@ -30,6 +40,8 @@ import {
   type OrganizationPermissionRecord,
 } from "./organization-access.js"
 import { ensureDefaultDesktopPolicyForOrganization } from "./desktop-policies.js"
+import { isProtectedOrganizationRoleName } from "./organization-role-hierarchy.js"
+import { isSingleOrgOwnerEmailEligible, resolveSingleOrgMembershipRole } from "./single-org-policy.js"
 
 type UserId = typeof AuthUserTable.$inferSelect.id
 type SessionId = typeof AuthSessionTable.$inferSelect.id
@@ -38,6 +50,16 @@ type MemberRow = typeof MemberTable.$inferSelect
 type MemberId = MemberRow["id"]
 type InvitationRow = typeof InvitationTable.$inferSelect
 export type AllowedEmailDomains = string[] | null
+type OrganizationMetadataInput = Record<string, unknown> | string | null | undefined
+
+export type AcceptInvitationForUserResult = {
+  status: "accepted"
+  invitation: InvitationRow
+  member: MemberRow
+} | {
+  status: "membership_removed"
+  invitation: InvitationRow
+}
 
 type MemberLifecycleValidationFailure = Extract<MemberLifecycleValidation, { ok: false }>
 
@@ -52,6 +74,14 @@ type MemberMutationResult = {
   member: MemberRow
 } | MemberMutationFailure
 
+type MemberRoleUpdateResult = {
+  ok: true
+  member: MemberRow
+  previousRole: string
+  nextRole: string
+  changed: boolean
+} | MemberMutationFailure
+
 type OwnershipTransferFailure = {
   ok: false
   error: "owner_not_found" | "target_member_not_found" | "owner_transfer_invalid"
@@ -64,13 +94,17 @@ type OwnershipTransferResult = {
   newOwner: MemberRow
   previousOwnerRole: string
   newOwnerRole: string
+  previousOwnerCount: number
 } | OwnershipTransferFailure
 
-type OwnershipRecoveryResult = {
+type OwnershipTransferCommitResult = {
   ok: true
-  previousOwnerCount: number
+  previousOwner: MemberRow
   newOwner: MemberRow
+  previousOwnerRole: string
   newOwnerRole: string
+  previousOwnerCount: number
+  demotedOwners: MemberRow[]
 } | OwnershipTransferFailure
 
 export type InvitationStatus = "pending" | "accepted" | "canceled" | "expired"
@@ -89,6 +123,11 @@ export type InvitationPreview = {
     name: string
     slug: string
     allowedEmailDomains: AllowedEmailDomains
+    branding: {
+      appName: string
+      logoUrl: string | null
+      iconUrl: string | null
+    }
   }
 }
 
@@ -164,6 +203,7 @@ export type OrganizationContext = {
     createdAt: Date
     updatedAt: Date
     memberIds: MemberId[]
+    managedByScim: boolean
   }>
 }
 
@@ -292,6 +332,50 @@ function normalizeStoredAllowedEmailDomains(value: unknown): AllowedEmailDomains
   return normalizeAllowedEmailDomains(values).domains
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function parseMetadataRecord(input: OrganizationMetadataInput): Record<string, unknown> {
+  if (!input) {
+    return {}
+  }
+
+  if (typeof input === "string") {
+    try {
+      const parsed: unknown = JSON.parse(input)
+      return isRecord(parsed) ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+
+  return isRecord(input) ? input : {}
+}
+
+function serializeMetadataRecord(metadata: Record<string, unknown>) {
+  return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null
+}
+
+export function serializeMemberFacingOrganizationMetadata(input: OrganizationMetadataInput) {
+  const metadata = parseMetadataRecord(input)
+  const capabilities = isRecord(metadata.capabilities) ? metadata.capabilities : null
+  if (!capabilities || !("cloud" in capabilities)) {
+    return serializeOrganizationMetadata(input)
+  }
+
+  const nextCapabilities = { ...capabilities }
+  delete nextCapabilities.cloud
+  const nextMetadata = { ...metadata }
+  if (Object.keys(nextCapabilities).length > 0) {
+    nextMetadata.capabilities = nextCapabilities
+  } else {
+    delete nextMetadata.capabilities
+  }
+
+  return serializeMetadataRecord(nextMetadata)
+}
+
 export function parsePermissionRecord(value: string | null) {
   if (!value) {
     return {}
@@ -408,10 +492,10 @@ async function ensureDefaultDynamicRoles(orgId: OrgId) {
   }
 }
 
-function normalizeAssignableRole(input: string, availableRoles: Set<string>) {
+function normalizeAssignableRole(input: string, availableRoles: Set<string>, fallbackRole = "member") {
   const roles = splitRoles(input).filter((role) => availableRoles.has(role))
   if (roles.length === 0) {
-    return "member"
+    return fallbackRole
   }
   return roles.join(",")
 }
@@ -431,6 +515,7 @@ async function insertMemberIfMissing(input: {
   organizationId: OrgId
   userId: UserId
   role: string
+  email?: string | null
 }) {
   const existing = await db
     .select()
@@ -438,17 +523,38 @@ async function insertMemberIfMissing(input: {
     .where(and(eq(MemberTable.organizationId, input.organizationId), eq(MemberTable.userId, input.userId), isNull(MemberTable.removedAt)))
     .limit(1)
 
-  if (existing.length > 0) {
-    return existing[0]
+  const existingMember = existing[0] ?? null
+  if (existingMember) {
+    return existingMember
   }
 
-  await db.insert(MemberTable).values({
-    id: createDenTypeId("member"),
+  const invitedMember = await acceptPendingInvitationForBootstrapMembership({
     organizationId: input.organizationId,
     userId: input.userId,
-    role: input.role,
-    joinedAt: new Date(),
+    email: input.email ?? null,
+    defaultRole: input.role,
   })
+  if (invitedMember) {
+    return invitedMember
+  }
+
+  const removedMember = await findSoftRemovedMemberForUser({
+    organizationId: input.organizationId,
+    userId: input.userId,
+  })
+  if (removedMember) {
+    return null
+  }
+
+  try {
+    await db.insert(MemberTable).values({
+      id: createDenTypeId("member"),
+      organizationId: input.organizationId,
+      userId: input.userId,
+      role: input.role,
+      joinedAt: new Date(),
+    })
+  } catch {}
 
   const created = await db
     .select()
@@ -463,80 +569,298 @@ async function insertMemberIfMissing(input: {
   return created[0]
 }
 
-async function acceptInvitation(invitation: InvitationRow, userId: UserId) {
-  const availableRoles = await listAssignableRoles(invitation.organizationId)
-  const role = normalizeAssignableRole(invitation.role, availableRoles)
-  const joinedAt = new Date()
-
-  const existingMemberRows = await db
+async function findSoftRemovedMemberForUser(input: {
+  organizationId: OrgId
+  userId: UserId
+}) {
+  const rows = await db
     .select()
     .from(MemberTable)
-    .where(and(eq(MemberTable.organizationId, invitation.organizationId), eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
+    .where(and(eq(MemberTable.organizationId, input.organizationId), eq(MemberTable.userId, input.userId), isNotNull(MemberTable.removedAt)))
     .limit(1)
 
-  const invitedMemberRows = await db
+  return rows[0] ?? null
+}
+
+export async function ensureBootstrapMembershipForOrganization(input: {
+  organizationId: OrgId
+  userId: UserId
+  role: string
+  email?: string | null
+}) {
+  return insertMemberIfMissing(input)
+}
+
+export async function acceptPendingInvitationForBootstrapMembership(input: {
+  organizationId: OrgId
+  userId: UserId
+  email: string | null
+  defaultRole: string
+}) {
+  const email = input.email?.trim().toLowerCase()
+  if (!email) {
+    return null
+  }
+
+  const invitationRows = await db
     .select()
-    .from(MemberTable)
-    .where(and(eq(MemberTable.inviteId, invitation.id), eq(MemberTable.organizationId, invitation.organizationId), isNull(MemberTable.removedAt)))
+    .from(InvitationTable)
+    .where(and(
+      eq(InvitationTable.organizationId, input.organizationId),
+      eq(InvitationTable.status, "pending"),
+      gt(InvitationTable.expiresAt, new Date()),
+      sql`lower(${InvitationTable.email}) = ${email}`,
+    ))
     .limit(1)
 
-  const invitedMember = invitedMemberRows[0] ?? null
-  const existingMember = existingMemberRows[0] ?? null
-  let member = existingMember
-
-  if (!member && invitedMember) {
-    await db
-      .update(MemberTable)
-      .set({ userId, role, joinedAt })
-      .where(eq(MemberTable.id, invitedMember.id))
-    member = { ...invitedMember, userId, role, joinedAt }
+  const invitation = invitationRows.find((row) => (
+    row.organizationId === input.organizationId
+    && row.status === "pending"
+    && row.expiresAt > new Date()
+    && row.email.trim().toLowerCase() === email
+  )) ?? null
+  if (!invitation) {
+    return null
   }
 
-  if (!member) {
-    member = await insertMemberIfMissing({
-      organizationId: invitation.organizationId,
-      userId,
-      role,
-    })
+  // Bootstrap paths already grant same-org membership before email verification.
+  // organization-join-verification.ts keeps that gate on the explicit accept endpoint.
+  const accepted = await acceptInvitation(invitation, input.userId, { fallbackRole: input.defaultRole })
+  return accepted?.member ?? null
+}
+
+export async function reconcilePendingInvitationsForUser(userId: UserId) {
+  const userRows = await db
+    .select({ email: AuthUserTable.email })
+    .from(AuthUserTable)
+    .where(eq(AuthUserTable.id, userId))
+    .limit(1)
+  const email = userRows[0]?.email.trim().toLowerCase()
+  if (!email) {
+    return 0
   }
 
-  if (invitation.teamId) {
-    const teams = await db
-      .select({ id: TeamTable.id })
-      .from(TeamTable)
-      .where(eq(TeamTable.id, invitation.teamId))
+  const now = new Date()
+  const invitations = await db
+    .select()
+    .from(InvitationTable)
+    .where(and(
+      eq(InvitationTable.status, "pending"),
+      gt(InvitationTable.expiresAt, now),
+      sql`lower(${InvitationTable.email}) = ${email}`,
+    ))
+    .limit(20)
+
+  let acceptedCount = 0
+  for (const invitation of invitations) {
+    if (invitation.status !== "pending" || invitation.expiresAt <= now || invitation.email.trim().toLowerCase() !== email) {
+      continue
+    }
+
+    const existingMemberRows = await db
+      .select({ id: MemberTable.id })
+      .from(MemberTable)
+      .where(and(eq(MemberTable.organizationId, invitation.organizationId), eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
       .limit(1)
+    if (!existingMemberRows[0]) {
+      // No cross-org auto-join here; organization-join-verification.ts keeps
+      // that email-verification boundary on the explicit accept endpoint.
+      continue
+    }
 
-    if (teams[0]) {
-      const existingTeamMember = await db
-        .select({ id: TeamMemberTable.id })
-        .from(TeamMemberTable)
-        .where(and(eq(TeamMemberTable.teamId, invitation.teamId), eq(TeamMemberTable.orgMembershipId, member.id)))
-        .limit(1)
-
-      if (!existingTeamMember[0]) {
-        await db.insert(TeamMemberTable).values({
-          id: createDenTypeId("teamMember"),
-          teamId: invitation.teamId,
-          orgMembershipId: member.id,
-        })
-      }
+    const accepted = await acceptInvitation(invitation, userId)
+    if (accepted) {
+      acceptedCount += 1
     }
   }
 
-  await db
-    .update(InvitationTable)
-    .set({ status: "accepted" })
-    .where(eq(InvitationTable.id, invitation.id))
+  return acceptedCount
+}
 
-  return member
+async function acceptInvitation(invitation: InvitationRow, userId: UserId, options?: { fallbackRole?: string }) {
+  const availableRoles = await listAssignableRoles(invitation.organizationId)
+  return db.transaction(async (tx) => {
+    const lockedInvitations = await tx
+      .select()
+      .from(InvitationTable)
+      .where(and(
+        eq(InvitationTable.id, invitation.id),
+        eq(InvitationTable.organizationId, invitation.organizationId),
+      ))
+      .for("update")
+    const currentInvitation = lockedInvitations[0] ?? null
+    if (!currentInvitation) {
+      return null
+    }
+
+    const existingMemberRows = await tx
+      .select()
+      .from(MemberTable)
+      .where(and(eq(MemberTable.organizationId, currentInvitation.organizationId), eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
+      .limit(1)
+      .for("update")
+    const existingMember = existingMemberRows[0] ?? null
+    const invitationStatus = getInvitationStatus(currentInvitation)
+    if (invitationStatus !== "pending") {
+      return invitationStatus === "accepted" && existingMember
+        ? { invitation: currentInvitation, member: existingMember, newlyAccepted: false }
+        : null
+    }
+
+    const role = normalizeAssignableRole(currentInvitation.role, availableRoles, options?.fallbackRole)
+    const joinedAt = new Date()
+    const invitedMemberRows = await tx
+      .select()
+      .from(MemberTable)
+      .where(and(eq(MemberTable.inviteId, currentInvitation.id), eq(MemberTable.organizationId, currentInvitation.organizationId), isNull(MemberTable.removedAt)))
+      .limit(1)
+      .for("update")
+    const invitedMember = invitedMemberRows[0] ?? null
+    const removedMemberRows = existingMember
+      ? []
+      : await tx
+          .select()
+          .from(MemberTable)
+          .where(and(eq(MemberTable.organizationId, currentInvitation.organizationId), eq(MemberTable.userId, userId), isNotNull(MemberTable.removedAt)))
+          .limit(1)
+          .for("update")
+    const removedMember = removedMemberRows[0] ?? null
+    let member = existingMember
+
+    if (existingMember && invitedMember) {
+      const existingJoinedAt = existingMember.joinedAt ?? joinedAt
+      const existingRole = roleIncludesOwner(existingMember.role) ? existingMember.role : role
+      await tx
+        .update(MemberTable)
+        .set({ role: existingRole, joinedAt: existingJoinedAt })
+        .where(eq(MemberTable.id, existingMember.id))
+      if (invitedMember.id !== existingMember.id) {
+        await tx.delete(MemberTable).where(eq(MemberTable.id, invitedMember.id))
+      }
+      member = { ...existingMember, role: existingRole, joinedAt: existingJoinedAt }
+    }
+
+    if (!member && removedMember && invitedMember) {
+      // A new explicit invitation is a new access lifecycle. Keep the removed
+      // row for audit history, but activate the invitation placeholder so any
+      // teams or direct grants assigned while the invite was pending remain
+      // attached to the member who joins.
+      await tx
+        .update(MemberTable)
+        .set({ userId: null })
+        .where(eq(MemberTable.id, removedMember.id))
+      await tx
+        .update(MemberTable)
+        .set({ userId, role, joinedAt })
+        .where(eq(MemberTable.id, invitedMember.id))
+      member = {
+        ...invitedMember,
+        userId,
+        role,
+        joinedAt,
+      }
+    }
+
+    if (!member && removedMember) {
+      const memberId = createDenTypeId("member")
+      // Legacy invitations may not have a pending member placeholder. They
+      // still represent a fresh access lifecycle, so detach the audit row and
+      // create a new membership instead of reviving stale membership grants.
+      await tx
+        .update(MemberTable)
+        .set({ userId: null })
+        .where(eq(MemberTable.id, removedMember.id))
+      await tx.insert(MemberTable).values({
+        id: memberId,
+        organizationId: currentInvitation.organizationId,
+        userId,
+        role,
+        joinedAt,
+        inviteId: currentInvitation.id,
+        invitedByOrgMember: currentInvitation.orgMemberId,
+      })
+      const createdMembers = await tx
+        .select()
+        .from(MemberTable)
+        .where(eq(MemberTable.id, memberId))
+        .limit(1)
+      member = createdMembers[0]
+      if (!member) {
+        throw new Error("failed_to_create_member")
+      }
+    }
+
+    if (!member && invitedMember) {
+      await tx
+        .update(MemberTable)
+        .set({ userId, role, joinedAt })
+        .where(eq(MemberTable.id, invitedMember.id))
+      member = { ...invitedMember, userId, role, joinedAt }
+    }
+
+    if (!member) {
+      const memberId = createDenTypeId("member")
+      await tx.insert(MemberTable).values({
+        id: memberId,
+        organizationId: currentInvitation.organizationId,
+        userId,
+        role,
+        joinedAt,
+        inviteId: currentInvitation.id,
+        invitedByOrgMember: currentInvitation.orgMemberId,
+      })
+      const createdMembers = await tx
+        .select()
+        .from(MemberTable)
+        .where(eq(MemberTable.id, memberId))
+        .limit(1)
+      member = createdMembers[0]
+      if (!member) {
+        throw new Error("failed_to_create_member")
+      }
+    }
+
+    if (currentInvitation.teamId) {
+      const teams = await tx
+        .select({ id: TeamTable.id })
+        .from(TeamTable)
+        .where(and(
+          eq(TeamTable.id, currentInvitation.teamId),
+          eq(TeamTable.organizationId, currentInvitation.organizationId),
+        ))
+        .limit(1)
+
+      if (teams[0]) {
+        const existingTeamMember = await tx
+          .select({ id: TeamMemberTable.id })
+          .from(TeamMemberTable)
+          .where(and(eq(TeamMemberTable.teamId, currentInvitation.teamId), eq(TeamMemberTable.orgMembershipId, member.id)))
+          .limit(1)
+
+        if (!existingTeamMember[0]) {
+          await tx.insert(TeamMemberTable).values({
+            id: createDenTypeId("teamMember"),
+            teamId: currentInvitation.teamId,
+            orgMembershipId: member.id,
+          })
+        }
+      }
+    }
+
+    await tx
+      .update(InvitationTable)
+      .set({ status: "accepted" })
+      .where(and(eq(InvitationTable.id, currentInvitation.id), eq(InvitationTable.status, "pending")))
+
+    return { invitation: currentInvitation, member, newlyAccepted: true }
+  })
 }
 
 export async function acceptInvitationForUser(input: {
   userId: UserId
   email: string
   invitationId: string | null
-}) {
+}): Promise<AcceptInvitationForUserResult | null> {
   if (!input.invitationId) {
     return null
   }
@@ -551,7 +875,35 @@ export async function acceptInvitationForUser(input: {
     return null
   }
 
-  if (getInvitationStatus(invitation) !== "pending") {
+  const invitationStatus = getInvitationStatus(invitation)
+  if (invitationStatus !== "pending") {
+    if (invitationStatus === "accepted") {
+      const memberRows = await db
+        .select()
+        .from(MemberTable)
+        .where(and(eq(MemberTable.organizationId, invitation.organizationId), eq(MemberTable.userId, input.userId), isNull(MemberTable.removedAt)))
+        .limit(1)
+      const member = memberRows[0]
+      if (member) {
+        return {
+          status: "accepted",
+          invitation,
+          member,
+        }
+      }
+
+      const removedMember = await findSoftRemovedMemberForUser({
+        organizationId: invitation.organizationId,
+        userId: input.userId,
+      })
+      if (removedMember) {
+        return {
+          status: "membership_removed",
+          invitation,
+        }
+      }
+    }
+
     return null
   }
 
@@ -566,11 +918,34 @@ export async function acceptInvitationForUser(input: {
     throw new OrganizationEmailDomainRestrictionError(input.email, allowedEmailDomains ?? [])
   }
 
-  const member = await acceptInvitation(invitation, input.userId)
-  await runPostOrganizationMemberChangeHooks({ organizationId: invitation.organizationId, memberId: member.id, change: "added" })
+  const accepted = await acceptInvitation(invitation, input.userId)
+  if (!accepted) {
+    const currentInvitation = await getInvitationById(input.invitationId)
+    if (currentInvitation && getInvitationStatus(currentInvitation) === "accepted") {
+      const removedMember = await findSoftRemovedMemberForUser({
+        organizationId: currentInvitation.organizationId,
+        userId: input.userId,
+      })
+      if (removedMember) {
+        return {
+          status: "membership_removed",
+          invitation: currentInvitation,
+        }
+      }
+    }
+    return null
+  }
+  if (accepted.newlyAccepted) {
+    await runPostOrganizationMemberChangeHooks({
+      organizationId: accepted.invitation.organizationId,
+      memberId: accepted.member.id,
+      change: "added",
+    })
+  }
   return {
-    invitation,
-    member,
+    status: "accepted",
+    invitation: accepted.invitation,
+    member: accepted.member,
   }
 }
 
@@ -594,6 +969,8 @@ export async function getInvitationPreview(invitationIdRaw: string): Promise<Inv
         id: OrganizationTable.id,
         name: OrganizationTable.name,
         slug: OrganizationTable.slug,
+        logo: OrganizationTable.logo,
+        metadata: OrganizationTable.metadata,
         allowedEmailDomains: OrganizationTable.allowedEmailDomains,
       },
     })
@@ -607,14 +984,23 @@ export async function getInvitationPreview(invitationIdRaw: string): Promise<Inv
     return null
   }
 
+  const organizationMetadata = normalizeOrganizationMetadata(row.organization.metadata).metadata
+
   return {
     invitation: {
       ...row.invitation,
       status: getInvitationStatus(row.invitation),
     },
     organization: {
-      ...row.organization,
+      id: row.organization.id,
+      name: row.organization.name,
+      slug: row.organization.slug,
       allowedEmailDomains: normalizeStoredAllowedEmailDomains(row.organization.allowedEmailDomains),
+      branding: {
+        appName: typeof organizationMetadata.brandAppName === "string" ? organizationMetadata.brandAppName : "OpenWork",
+        logoUrl: typeof organizationMetadata.brandLogoUrl === "string" ? organizationMetadata.brandLogoUrl : row.organization.logo,
+        iconUrl: typeof organizationMetadata.brandIconUrl === "string" ? organizationMetadata.brandIconUrl : null,
+      },
     },
   }
 }
@@ -622,6 +1008,7 @@ export async function getInvitationPreview(invitationIdRaw: string): Promise<Inv
 async function createOrganizationRecord(input: {
   userId: UserId
   name: string
+  slug?: string
   logo?: string | null
   metadata?: Record<string, unknown> | null
 }) {
@@ -637,7 +1024,7 @@ async function createOrganizationRecord(input: {
   await db.insert(OrganizationTable).values({
     id: organizationId,
     name: input.name,
-    slug: organizationId,
+    slug: input.slug ?? organizationId,
     logo: input.logo ?? null,
     metadata,
   })
@@ -660,9 +1047,122 @@ async function createOrganizationRecord(input: {
   return organizationId
 }
 
+export async function getSingletonOrganization() {
+  const rows = await db
+    .select()
+    .from(OrganizationTable)
+    .where(eq(OrganizationTable.slug, env.singleOrg.slug))
+    .limit(1)
+
+  return rows[0] ?? null
+}
+
+export async function getSingletonSsoStatus() {
+  const organization = await getSingletonOrganization()
+  const organizationSlug = organization?.slug || env.singleOrg.slug
+  const fallbackSignInPath = `/sso/${encodeURIComponent(organizationSlug)}`
+
+  if (!organization) {
+    return {
+      configured: false,
+      organizationSlug,
+      signInPath: fallbackSignInPath,
+    }
+  }
+
+  const rows = await db
+    .select({ signInPath: SsoConnectionTable.signInPath })
+    .from(SsoConnectionTable)
+    .where(eq(SsoConnectionTable.organizationId, organization.id))
+    .limit(1)
+  const signInPath = rows[0]?.signInPath || fallbackSignInPath
+
+  return {
+    configured: Boolean(rows[0]),
+    organizationSlug,
+    signInPath,
+  }
+}
+
+async function countActiveOwners(organizationId: OrgId) {
+  const rows = await db
+    .select({ role: MemberTable.role })
+    .from(MemberTable)
+    .where(and(eq(MemberTable.organizationId, organizationId), isNull(MemberTable.removedAt)))
+
+  return rows.filter((row) => roleIncludesOwner(row.role)).length
+}
+
+export async function ensureSingletonOrganizationForUser(userId: UserId) {
+  const userRows = await db
+    .select({
+      email: AuthUserTable.email,
+    })
+    .from(AuthUserTable)
+    .where(eq(AuthUserTable.id, userId))
+    .limit(1)
+  const userEmail = userRows[0]?.email ?? null
+
+  let organization = await getSingletonOrganization()
+  if (!organization) {
+    if (!isSingleOrgOwnerEmailEligible({
+      email: userEmail,
+      ownerEmails: env.singleOrg.ownerEmails,
+    })) {
+      return null
+    }
+
+    try {
+      const organizationId = await createOrganizationRecord({
+        userId,
+        name: env.singleOrg.name,
+        slug: env.singleOrg.slug,
+      })
+      return organizationId
+    } catch {
+      organization = await getSingletonOrganization()
+      if (!organization) {
+        throw new Error("failed_to_create_single_org")
+      }
+    }
+  }
+
+  const activeOwnerCount = await countActiveOwners(organization.id)
+  const role = resolveSingleOrgMembershipRole({
+    activeOwnerCount,
+    email: userEmail,
+    ownerEmails: env.singleOrg.ownerEmails,
+  })
+  if (!role) {
+    return null
+  }
+
+  const member = await ensureBootstrapMembershipForOrganization({
+    organizationId: organization.id,
+    userId,
+    role,
+    email: userEmail,
+  })
+  if (!member) {
+    return null
+  }
+
+  await ensureDefaultDesktopPolicyForOrganization({
+    organizationId: organization.id,
+    createdByOrgMemberId: member.id,
+  })
+  await ensureDefaultDynamicRoles(organization.id)
+
+  return organization.id
+}
+
 export async function ensureUserOrgAccess(input: {
   userId: UserId
 }) {
+  if (env.orgMode === "single_org") {
+    return ensureSingletonOrganizationForUser(input.userId)
+  }
+
   const memberships = await listMembershipRows(input.userId)
   if (memberships.length > 0) {
     const organizationIds = [...new Set(memberships.map((membership) => membership.organizationId))]
@@ -677,6 +1177,10 @@ export async function ensurePersonalOrganizationForUser(userId: UserId) {
   const existingOrgId = await ensureUserOrgAccess({ userId })
   if (existingOrgId) {
     return existingOrgId
+  }
+
+  if (env.orgMode === "single_org") {
+    return null
   }
 
   const userRows = await db
@@ -726,6 +1230,12 @@ export async function updateOrganizationSettings(input: {
   allowedEmailDomains?: readonly string[] | null
   allowedDesktopVersions?: readonly string[] | null
   requireSso?: boolean
+  brandAppName?: string | null
+  brandLogoUrl?: string | null
+  brandIconUrl?: string | null
+  brandLogoAsset?: ManagedBrandAssetMetadata | null
+  brandIconAsset?: ManagedBrandAssetMetadata | null
+  brandAccentColor?: string | null
 }) {
   const nextName = typeof input.name === "string" ? input.name.trim() : null
   if (typeof input.name === "string" && !nextName) {
@@ -739,7 +1249,7 @@ export async function updateOrganizationSettings(input: {
   if (input.allowedEmailDomains !== undefined) {
     updates.allowedEmailDomains = normalizeAllowedEmailDomains(input.allowedEmailDomains).domains
   }
-  if (input.allowedDesktopVersions !== undefined || input.requireSso !== undefined) {
+  if (input.allowedDesktopVersions !== undefined || input.requireSso !== undefined || input.brandAppName !== undefined || input.brandLogoUrl !== undefined || input.brandIconUrl !== undefined || input.brandLogoAsset !== undefined || input.brandIconAsset !== undefined || input.brandAccentColor !== undefined) {
     const rows = await db
       .select({ metadata: OrganizationTable.metadata })
       .from(OrganizationTable)
@@ -765,6 +1275,60 @@ export async function updateOrganizationSettings(input: {
 
     if (input.requireSso !== undefined) {
       nextMetadata.requireSso = input.requireSso
+    }
+
+    if (input.brandAppName !== undefined) {
+      if (input.brandAppName === null) {
+        delete nextMetadata.brandAppName
+      } else {
+        nextMetadata.brandAppName = input.brandAppName
+      }
+    }
+
+    if (input.brandLogoUrl !== undefined) {
+      if (input.brandLogoUrl === null) {
+        delete nextMetadata.brandLogoUrl
+      } else {
+        nextMetadata.brandLogoUrl = input.brandLogoUrl
+      }
+      if (input.brandLogoAsset === undefined) {
+        delete nextMetadata.brandLogoAsset
+      }
+    }
+
+    if (input.brandIconUrl !== undefined) {
+      if (input.brandIconUrl === null) {
+        delete nextMetadata.brandIconUrl
+      } else {
+        nextMetadata.brandIconUrl = input.brandIconUrl
+      }
+      if (input.brandIconAsset === undefined) {
+        delete nextMetadata.brandIconAsset
+      }
+    }
+
+    if (input.brandLogoAsset !== undefined) {
+      if (input.brandLogoAsset === null) {
+        delete nextMetadata.brandLogoAsset
+      } else {
+        nextMetadata.brandLogoAsset = input.brandLogoAsset
+      }
+    }
+
+    if (input.brandIconAsset !== undefined) {
+      if (input.brandIconAsset === null) {
+        delete nextMetadata.brandIconAsset
+      } else {
+        nextMetadata.brandIconAsset = input.brandIconAsset
+      }
+    }
+
+    if (input.brandAccentColor !== undefined) {
+      if (input.brandAccentColor === null) {
+        delete nextMetadata.brandAccentColor
+      } else {
+        nextMetadata.brandAccentColor = input.brandAccentColor
+      }
     }
 
     updates.metadata = normalizeOrganizationMetadata(nextMetadata).metadata
@@ -842,7 +1406,7 @@ export async function listUserOrgs(userId: UserId) {
     slug: row.organization.slug,
     logo: row.organization.logo,
     allowedEmailDomains: normalizeStoredAllowedEmailDomains(row.organization.allowedEmailDomains),
-    metadata: serializeOrganizationMetadata(row.organization.metadata),
+    metadata: serializeMemberFacingOrganizationMetadata(row.organization.metadata),
     role: row.role,
     orgMemberId: row.membershipId,
     membershipId: row.membershipId,
@@ -858,7 +1422,10 @@ export async function resolveUserOrganizations(input: {
 }) {
   await ensureUserOrgAccess({ userId: input.userId })
 
-  const orgs = await listUserOrgs(input.userId)
+  const visibleOrgs = await listUserOrgs(input.userId)
+  const orgs = env.orgMode === "single_org"
+    ? visibleOrgs.filter((org) => org.slug === env.singleOrg.slug)
+    : visibleOrgs
 
   const availableOrgIds = new Set(orgs.map((org) => org.id))
 
@@ -874,7 +1441,9 @@ export async function resolveUserOrganizations(input: {
     }
   }
 
-  activeOrgId ??= orgs[0]?.id ?? null
+  if (!activeOrgId && orgs.length === 1) {
+    activeOrgId = orgs[0].id
+  }
 
   const activeOrg = orgs.find((org) => org.id === activeOrgId) ?? null
 
@@ -963,8 +1532,6 @@ export async function getOrganizationContextForUser(input: {
 
   const teams = await listOrganizationTeams(organization.id)
 
-  const builtInDynamicRoleNames = new Set(Object.keys(denDefaultDynamicOrganizationRoles))
-
   return {
     organization: {
       id: organization.id,
@@ -1014,31 +1581,37 @@ export async function getOrganizationContextForUser(input: {
         createdAt: null,
         updatedAt: null,
       },
-      ...dynamicRoles.map((role) => ({
-        id: role.id,
-        role: role.role,
-        permission: parsePermissionRecord(role.permission),
-        builtIn: builtInDynamicRoleNames.has(role.role),
-        protected: false,
-        createdAt: role.createdAt,
-        updatedAt: role.updatedAt,
-      })),
+      ...dynamicRoles.map((role) => {
+        const builtIn = isProtectedOrganizationRoleName(role.role)
+        return {
+          id: role.id,
+          role: role.role,
+          permission: parsePermissionRecord(role.permission),
+          builtIn,
+          protected: builtIn,
+          createdAt: role.createdAt,
+          updatedAt: role.updatedAt,
+        }
+      }),
     ],
     teams,
   } satisfies OrganizationContext
 }
 
 async function listOrganizationTeams(organizationId: OrgId) {
-  const teams = await db
-    .select({
-      id: TeamTable.id,
-      name: TeamTable.name,
-      createdAt: TeamTable.createdAt,
-      updatedAt: TeamTable.updatedAt,
-    })
-    .from(TeamTable)
-    .where(eq(TeamTable.organizationId, organizationId))
-    .orderBy(asc(TeamTable.createdAt))
+  const [teams, scimManagedTeamIds] = await Promise.all([
+    db
+      .select({
+        id: TeamTable.id,
+        name: TeamTable.name,
+        createdAt: TeamTable.createdAt,
+        updatedAt: TeamTable.updatedAt,
+      })
+      .from(TeamTable)
+      .where(eq(TeamTable.organizationId, organizationId))
+      .orderBy(asc(TeamTable.createdAt)),
+    getScimManagedTeamIds(organizationId),
+  ])
 
   if (teams.length === 0) {
     return []
@@ -1062,6 +1635,7 @@ async function listOrganizationTeams(organizationId: OrgId) {
   return teams.map((team) => ({
     ...team,
     memberIds: memberIdsByTeamId.get(team.id) ?? [],
+    managedByScim: scimManagedTeamIds.has(team.id),
   }))
 }
 
@@ -1095,17 +1669,19 @@ async function listActiveOrganizationMemberGuardRows(organizationId: OrgId) {
     .where(and(eq(MemberTable.organizationId, organizationId), isNull(MemberTable.removedAt)))
 }
 
-export async function organizationHasActiveOwner(organizationId: OrgId) {
-  const activeMembers = await listActiveOrganizationMemberGuardRows(organizationId)
-  return activeMembers.some((member) => member.userId && roleIncludesOwner(member.role))
-}
-
 function memberNotFound(): MemberMutationFailure {
   return {
     ok: false,
     error: "member_not_found",
     message: "The organization member could not be found.",
   }
+}
+
+function ownershipTransferFailure(
+  error: OwnershipTransferFailure["error"],
+  message: string,
+): OwnershipTransferFailure {
+  return { ok: false, error, message }
 }
 
 export async function validateOrganizationMemberRoleUpdate(input: {
@@ -1135,6 +1711,76 @@ export async function validateOrganizationMemberRoleUpdate(input: {
   }
 
   return { ok: true, member }
+}
+
+export async function updateOrganizationMemberRole(input: {
+  organizationId: OrgId
+  memberId: MemberRow["id"]
+  nextRole: string
+}): Promise<MemberRoleUpdateResult> {
+  const updated = await db.transaction(async (tx): Promise<MemberRoleUpdateResult> => {
+    const activeRows = await tx
+      .select({ member: MemberTable, userId: AuthUserTable.id })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
+      .for("update")
+
+    const memberRow = activeRows.find((row) => row.member.id === input.memberId) ?? null
+    if (!memberRow) {
+      return memberNotFound()
+    }
+
+    const validation = validateOrganizationMemberRoleChange({
+      member: memberRow.member,
+      activeMembers: activeRows.map((row) => ({
+        id: row.member.id,
+        role: row.member.role,
+        userId: row.userId,
+      })),
+      nextRole: input.nextRole,
+    })
+    if (!validation.ok) {
+      return validation
+    }
+
+    if (memberRow.member.role === input.nextRole) {
+      return {
+        ok: true,
+        member: memberRow.member,
+        previousRole: memberRow.member.role,
+        nextRole: input.nextRole,
+        changed: false,
+      }
+    }
+
+    await tx
+      .update(MemberTable)
+      .set({ role: input.nextRole })
+      .where(and(eq(MemberTable.id, input.memberId), eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
+
+    return {
+      ok: true,
+      member: memberRow.member,
+      previousRole: memberRow.member.role,
+      nextRole: input.nextRole,
+      changed: true,
+    }
+  })
+
+  if (updated.ok && updated.changed) {
+    await revokeOrganizationApiKeysForMember({
+      organizationId: input.organizationId,
+      orgMembershipId: updated.member.id,
+      userId: updated.member.userId,
+    })
+    await revokeMembershipSessionCredentials({
+      organizationId: input.organizationId,
+      userId: updated.member.userId,
+    })
+  }
+
+  return updated
 }
 
 export async function validateOrganizationMemberRemovalForHook(input: {
@@ -1167,132 +1813,66 @@ export async function transferOrganizationOwnership(input: {
   targetMemberId: MemberRow["id"]
 }): Promise<OwnershipTransferResult> {
   if (input.currentOwnerMemberId === input.targetMemberId) {
-    return {
-      ok: false,
-      error: "owner_transfer_invalid",
-      message: "Choose a different active member to become workspace owner.",
+    return ownershipTransferFailure(
+      "owner_transfer_invalid",
+      "Choose a different active member to become workspace owner.",
+    )
+  }
+
+  const transfer: OwnershipTransferCommitResult = await db.transaction(async (tx): Promise<OwnershipTransferCommitResult> => {
+    const memberRows = await tx
+      .select({ member: MemberTable, userId: AuthUserTable.id })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(
+        eq(MemberTable.organizationId, input.organizationId),
+        isNull(MemberTable.removedAt),
+      ))
+      .for("update")
+
+    const currentOwnerRow = memberRows.find((row) => row.member.id === input.currentOwnerMemberId) ?? null
+    if (!currentOwnerRow || !currentOwnerRow.userId || !roleIncludesOwner(currentOwnerRow.member.role)) {
+      return ownershipTransferFailure(
+        "owner_not_found",
+        "The current workspace owner could not be found.",
+      )
     }
-  }
 
-  const memberRows = await db
-    .select({ member: MemberTable, userId: AuthUserTable.id })
-    .from(MemberTable)
-    .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
-    .where(and(
-      eq(MemberTable.organizationId, input.organizationId),
-      inArray(MemberTable.id, [input.currentOwnerMemberId, input.targetMemberId]),
-      isNull(MemberTable.removedAt),
-    ))
-
-  const currentOwnerRow = memberRows.find((row) => row.member.id === input.currentOwnerMemberId) ?? null
-  if (!currentOwnerRow || !currentOwnerRow.userId || !roleIncludesOwner(currentOwnerRow.member.role)) {
-    return {
-      ok: false,
-      error: "owner_not_found",
-      message: "The current workspace owner could not be found.",
+    const targetRow = memberRows.find((row) => row.member.id === input.targetMemberId) ?? null
+    if (!targetRow || !targetRow.userId) {
+      return ownershipTransferFailure(
+        "target_member_not_found",
+        "Choose an active member to become workspace owner.",
+      )
     }
-  }
 
-  const targetRow = memberRows.find((row) => row.member.id === input.targetMemberId) ?? null
-  if (!targetRow || !targetRow.userId) {
-    return {
-      ok: false,
-      error: "target_member_not_found",
-      message: "Choose an active member to become workspace owner.",
+    if (roleIncludesOwner(targetRow.member.role)) {
+      return ownershipTransferFailure(
+        "owner_transfer_invalid",
+        "This member is already a workspace owner.",
+      )
     }
-  }
 
-  if (roleIncludesOwner(targetRow.member.role)) {
-    return {
-      ok: false,
-      error: "owner_transfer_invalid",
-      message: "This member is already a workspace owner.",
+    if (!roleIncludesSuperAdmin(targetRow.member.role)) {
+      return ownershipTransferFailure(
+        "owner_transfer_invalid",
+        "Choose an active workspace super-admin to become owner.",
+      )
     }
-  }
 
-  const roles = getRoleValueAfterOwnershipTransfer({
-    currentRole: currentOwnerRow.member.role,
-    targetRole: targetRow.member.role,
-  })
+    const roles = getRoleValueAfterOwnershipTransfer({
+      currentRole: currentOwnerRow.member.role,
+      targetRole: targetRow.member.role,
+    })
+    const demotedOwnerRows = memberRows.filter((row) => row.member.id !== targetRow.member.id && roleIncludesOwner(row.member.role))
+    const demotedRoleByMemberId = new Map<string, string>()
 
-  await db.transaction(async (tx) => {
-    await tx
-      .update(MemberTable)
-      .set({ role: roles.previousOwnerRole })
-      .where(eq(MemberTable.id, currentOwnerRow.member.id))
-    await tx
-      .update(MemberTable)
-      .set({ role: roles.newOwnerRole })
-      .where(eq(MemberTable.id, targetRow.member.id))
-  })
-
-  await revokeOrganizationApiKeysForMember({
-    organizationId: input.organizationId,
-    orgMembershipId: currentOwnerRow.member.id,
-    userId: currentOwnerRow.member.userId,
-  })
-  await revokeOrganizationApiKeysForMember({
-    organizationId: input.organizationId,
-    orgMembershipId: targetRow.member.id,
-    userId: targetRow.member.userId,
-  })
-  await revokeMembershipSessionCredentials({
-    organizationId: input.organizationId,
-    userId: currentOwnerRow.member.userId,
-  })
-  await revokeMembershipSessionCredentials({
-    organizationId: input.organizationId,
-    userId: targetRow.member.userId,
-  })
-
-  return {
-    ok: true,
-    previousOwner: currentOwnerRow.member,
-    newOwner: targetRow.member,
-    previousOwnerRole: roles.previousOwnerRole,
-    newOwnerRole: roles.newOwnerRole,
-  }
-}
-
-export async function recoverOrganizationOwnership(input: {
-  organizationId: OrgId
-  targetMemberId: MemberRow["id"]
-}): Promise<OwnershipRecoveryResult> {
-  if (await organizationHasActiveOwner(input.organizationId)) {
-    return {
-      ok: false,
-      error: "owner_transfer_invalid",
-      message: "Only the current workspace owner can transfer ownership while an active owner exists.",
-    }
-  }
-
-  const memberRows = await db
-    .select({ member: MemberTable, userId: AuthUserTable.id })
-    .from(MemberTable)
-    .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
-    .where(and(eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
-
-  const targetRow = memberRows.find((row) => row.member.id === input.targetMemberId) ?? null
-  if (!targetRow || !targetRow.userId || !roleIncludesPrivileged(targetRow.member.role)) {
-    return {
-      ok: false,
-      error: "target_member_not_found",
-      message: "Choose an active workspace admin to become owner.",
-    }
-  }
-
-  const previousOwnerRows = memberRows.filter((row) => roleIncludesOwner(row.member.role))
-  const roles = getRoleValueAfterOwnershipTransfer({
-    currentRole: "owner",
-    targetRole: targetRow.member.role,
-  })
-
-  await db.transaction(async (tx) => {
-    for (const ownerRow of previousOwnerRows) {
+    for (const ownerRow of demotedOwnerRows) {
       const ownerRoles = getRoleValueAfterOwnershipTransfer({
         currentRole: ownerRow.member.role,
         targetRole: targetRow.member.role,
       })
+      demotedRoleByMemberId.set(ownerRow.member.id, ownerRoles.previousOwnerRole)
       await tx
         .update(MemberTable)
         .set({ role: ownerRoles.previousOwnerRole })
@@ -1303,23 +1883,51 @@ export async function recoverOrganizationOwnership(input: {
       .update(MemberTable)
       .set({ role: roles.newOwnerRole })
       .where(eq(MemberTable.id, targetRow.member.id))
+
+    return {
+      ok: true,
+      previousOwner: currentOwnerRow.member,
+      newOwner: targetRow.member,
+      previousOwnerRole: demotedRoleByMemberId.get(currentOwnerRow.member.id) ?? roles.previousOwnerRole,
+      newOwnerRole: roles.newOwnerRole,
+      previousOwnerCount: demotedOwnerRows.length,
+      demotedOwners: demotedOwnerRows.map((row) => row.member),
+    }
   })
+
+  if (!transfer.ok) {
+    return transfer
+  }
+
+  for (const ownerRow of transfer.demotedOwners) {
+    await revokeOrganizationApiKeysForMember({
+      organizationId: input.organizationId,
+      orgMembershipId: ownerRow.id,
+      userId: ownerRow.userId,
+    })
+    await revokeMembershipSessionCredentials({
+      organizationId: input.organizationId,
+      userId: ownerRow.userId,
+    })
+  }
 
   await revokeOrganizationApiKeysForMember({
     organizationId: input.organizationId,
-    orgMembershipId: targetRow.member.id,
-    userId: targetRow.member.userId,
+    orgMembershipId: transfer.newOwner.id,
+    userId: transfer.newOwner.userId,
   })
   await revokeMembershipSessionCredentials({
     organizationId: input.organizationId,
-    userId: targetRow.member.userId,
+    userId: transfer.newOwner.userId,
   })
 
   return {
     ok: true,
-    previousOwnerCount: previousOwnerRows.length,
-    newOwner: targetRow.member,
-    newOwnerRole: roles.newOwnerRole,
+    previousOwner: transfer.previousOwner,
+    newOwner: transfer.newOwner,
+    previousOwnerRole: transfer.previousOwnerRole,
+    newOwnerRole: transfer.newOwnerRole,
+    previousOwnerCount: transfer.previousOwnerCount,
   }
 }
 
@@ -1328,45 +1936,71 @@ export async function removeOrganizationMember(input: {
   memberId: MemberRow["id"]
   removedByOrgMemberId?: MemberRow["id"]
 }): Promise<MemberMutationResult> {
-  const memberRows = await db
-    .select()
-    .from(MemberTable)
-    .where(and(eq(MemberTable.id, input.memberId), eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
-    .limit(1)
+  const removed = await db.transaction(async (tx): Promise<MemberMutationResult> => {
+    const activeRows = await tx
+      .select({ member: MemberTable, userId: AuthUserTable.id })
+      .from(MemberTable)
+      .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+      .where(and(eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
+      .for("update")
 
-  const member = memberRows[0] ?? null
-  if (!member) {
-    return memberNotFound()
-  }
+    const memberRow = activeRows.find((row) => row.member.id === input.memberId) ?? null
+    if (!memberRow) {
+      return memberNotFound()
+    }
 
-  const activeMembers = await listActiveOrganizationMemberGuardRows(input.organizationId)
-  const validation = validateOrganizationMemberRemoval({ member, activeMembers })
-  if (!validation.ok) {
-    return validation
-  }
+    const validation = validateOrganizationMemberRemoval({
+      member: memberRow.member,
+      activeMembers: activeRows.map((row) => ({
+        id: row.member.id,
+        role: row.member.role,
+        userId: row.userId,
+      })),
+    })
+    if (!validation.ok) {
+      return validation
+    }
 
-  await revokeOrganizationApiKeysForMember({
-    organizationId: input.organizationId,
-    orgMembershipId: member.id,
-    userId: member.userId,
-  })
-  await revokeMembershipSessionCredentials({
-    organizationId: input.organizationId,
-    userId: member.userId,
-  })
+    const member = memberRow.member
 
-  await db.transaction(async (tx) => {
+    await tx
+      .delete(ConnectedAccountTable)
+      .where(and(
+        eq(ConnectedAccountTable.organizationId, input.organizationId),
+        eq(ConnectedAccountTable.orgMembershipId, member.id),
+      ))
+
     await tx
       .delete(TeamMemberTable)
       .where(eq(TeamMemberTable.orgMembershipId, member.id))
 
     await tx
+      .delete(LlmProviderAccessTable)
+      .where(eq(LlmProviderAccessTable.orgMembershipId, member.id))
+
+    await tx
       .update(MemberTable)
-      .set({ removedAt: new Date(), removedByOrgMember: input.removedByOrgMemberId ?? null, userId: null })
-      .where(eq(MemberTable.id, member.id))
+      .set({ removedAt: new Date(), removedByOrgMember: input.removedByOrgMemberId ?? null })
+      .where(and(eq(MemberTable.id, member.id), eq(MemberTable.organizationId, input.organizationId), isNull(MemberTable.removedAt)))
+
+    return { ok: true, member }
   })
 
-  await runPostOrganizationMemberChangeHooks({ organizationId: input.organizationId, memberId: member.id, change: "removed" })
+  if (!removed.ok) {
+    return removed
+  }
 
-  return { ok: true, member }
+  await revokeOrganizationApiKeysForMember({
+    organizationId: input.organizationId,
+    orgMembershipId: removed.member.id,
+    userId: removed.member.userId,
+  })
+  await revokeMembershipSessionCredentials({
+    organizationId: input.organizationId,
+    userId: removed.member.userId,
+  })
+
+  await runPostOrganizationMemberChangeHooks({ organizationId: input.organizationId, memberId: removed.member.id, change: "removed" })
+
+  return removed
 }

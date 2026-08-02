@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readGeneratedDesktopVersions } from "./generate-desktop-versions.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const args = process.argv.slice(2);
@@ -16,15 +17,11 @@ if (!tag) {
 const version = tag.startsWith("v") ? tag.slice(1) : tag;
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
-const readText = (path) => readFileSync(path, "utf8");
-
 
 const appVersion = readJson(resolve(root, "apps", "app", "package.json")).version ?? null;
 const desktopVersion = readJson(resolve(root, "apps", "desktop", "package.json")).version ?? null;
-const orchestratorVersion =
-  readJson(resolve(root, "apps", "orchestrator", "package.json")).version ?? null;
 const serverVersion = readJson(resolve(root, "apps", "server", "package.json")).version ?? null;
-const opencodeRouterVersion = readJson(resolve(root, "apps", "opencode-router", "package.json")).version ?? null;
+const publishedDesktopVersions = readGeneratedDesktopVersions();
 
 
 const mismatches = [];
@@ -40,9 +37,8 @@ const check = (label, actual) => {
 
 check("app", appVersion);
 check("desktop", desktopVersion);
-check("openwork-orchestrator", orchestratorVersion);
 check("openwork-server", serverVersion);
-check("opencode-router", opencodeRouterVersion);
+check("desktop release inventory", publishedDesktopVersions[0] ?? null);
 
 if (mismatches.length) {
   console.error(`Release tag ${tag} does not match package versions:`);
@@ -52,4 +48,4 @@ if (mismatches.length) {
   process.exit(1);
 }
 
-console.log(`Release tag ${tag} matches app/desktop/openwork-orchestrator versions.`);
+console.log(`Release tag ${tag} matches app/desktop/openwork-server versions.`);

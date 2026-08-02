@@ -1,18 +1,19 @@
-import { homedir, platform } from "node:os";
+import { platform } from "node:os";
 import { chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { openworkEnvStorePath } from "@openwork/paths";
 
 import { ensureDir, exists } from "./utils.js";
 
 // User-level environment variables, persisted so the desktop shell can inject
-// them into every spawned child (OpenCode, OpenWork server, opencode-router).
+// them into every spawned child (OpenCode and OpenWork server).
 // Motivation: Linux GUI launches don't inherit shell env, so users set
 // ANTHROPIC_API_KEY / GCLOUD_* / GCP_* in .bashrc and hit silent auth failures.
 // Scope: user/machine, not workspace. Not synced to the cloud.
 
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-// Keys reserved for internal wiring by the shell/orchestrator/server. This UI
+// Keys reserved for internal wiring by the desktop shell and server. This UI
 // is for service credentials, not OpenWork/OpenCode runtime knobs; users who
 // need OPENCODE_* process settings should set them from the launching shell.
 // We refuse writes to these and strip them when reading for injection, so a
@@ -50,19 +51,8 @@ function isInternalEnvKey(key: string): boolean {
   return RESERVED_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
-// Deterministic, matches what the Rust/Node shells compute independently.
-// Do NOT key this off ServerConfig.configPath — the shell resolves the path
-// before the server config exists, and must agree with us byte-for-byte.
 export function resolveDefaultEnvStorePath(): string {
-  const override = (process.env.OPENWORK_ENV_STORE ?? "").trim();
-  if (override) return resolve(override);
-
-  if (platform() === "win32") {
-    const appData = (process.env.APPDATA ?? "").trim();
-    const root = appData || join(homedir(), "AppData", "Roaming");
-    return join(root, "openwork", "env.json");
-  }
-  return join(homedir(), ".config", "openwork", "env.json");
+  return openworkEnvStorePath();
 }
 
 function parseRecord(raw: unknown): EnvRecord | null {
@@ -235,9 +225,8 @@ export class EnvService {
     });
   }
 
-  // Used by the Electron + orchestrator shells at spawn time. Keep the
-  // loaders in apps/desktop/electron/runtime.mjs and apps/orchestrator/src/cli.ts
-  // byte-for-byte in sync on path resolution and reserved-keys policy.
+  // Used by the Electron shell at spawn time. Keep desktop runtime injection
+  // in sync on path resolution and reserved-keys policy.
   static async readForInjection(overridePath?: string): Promise<Record<string, string>> {
     const path = overridePath?.trim() ? resolve(overridePath.trim()) : resolveDefaultEnvStorePath();
     const store = await readStore(path, { tolerateInvalid: true });

@@ -1,5 +1,6 @@
 import { WorkerTable } from "@openwork-ee/den-db/schema"
 import { env } from "../env.js"
+import { appLogger } from "../observability/logger.js"
 import {
   deprovisionWorkerOnDaytona,
   provisionWorkerOnDaytona,
@@ -10,6 +11,7 @@ import {
 } from "./vanity-domain.js"
 
 type WorkerId = typeof WorkerTable.$inferSelect.id
+const logger = appLogger.child({ component: "worker_provisioner" })
 
 export type ProvisionInput = {
   workerId: WorkerId
@@ -24,6 +26,7 @@ export type ProvisionedInstance = {
   url: string
   status: "provisioning" | "healthy"
   region?: string
+  imageVersion?: string | null
 }
 
 type RenderService = {
@@ -61,6 +64,10 @@ const slug = (value: string) =>
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`
+}
 
 const hostFromUrl = (value: string | null | undefined) => {
   if (!value) {
@@ -220,18 +227,13 @@ async function attachRenderCustomDomain(
     })
 
     if (!dnsReady) {
-      console.warn(
-        `[provisioner] vanity dns upsert skipped or failed for ${hostname}; using Render URL fallback`,
-      )
+      logger.warn("vanity dns upsert skipped or failed", { hostname })
       return null
     }
 
     return `https://${hostname}`
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown_error"
-    console.warn(
-      `[provisioner] custom domain attach failed for ${serviceId}: ${message}`,
-    )
+    logger.warn("custom domain attach failed", { service_id: serviceId, worker_id: workerId, error })
     return null
   }
 }
@@ -253,17 +255,34 @@ async function provisionWorkerOnRender(
   const serviceName = slug(
     `${env.render.workerNamePrefix}-${input.name}-${input.workerId.slice(0, 8)}`,
   ).slice(0, 62)
-  const orchestratorPackage = env.render.workerOpenworkVersion?.trim()
-    ? `openwork-orchestrator@${env.render.workerOpenworkVersion.trim()}`
-    : "openwork-orchestrator"
+  const openworkServerPackage = env.render.workerOpenworkVersion?.trim()
+    ? `openwork-server@${env.render.workerOpenworkVersion.trim()}`
+    : "openwork-server"
   const buildCommand = [
-    `npm install -g ${orchestratorPackage}`,
+    `npm install -g ${shellQuote(openworkServerPackage)}`,
     "node ./scripts/install-opencode.mjs",
   ].join(" && ")
-  const startCommand = [
-    "mkdir -p /tmp/workspace",
-    "attempt=0; while [ $attempt -lt 3 ]; do attempt=$((attempt + 1)); openwork serve --workspace /tmp/workspace --remote-access --openwork-port ${PORT:-10000} --opencode-host 127.0.0.1 --opencode-port 4096 --connect-host 127.0.0.1 --cors '*' --approval manual --allow-external --opencode-source external --opencode-bin ./bin/opencode --no-opencode-router --verbose && exit 0; echo \"openwork serve failed (attempt $attempt); retrying in 3s\"; sleep 3; done; exit 1",
-  ].join(" && ")
+  const startScript = `
+set -u
+mkdir -p /tmp/workspace
+plugin_dir="$(npm root -g)/openwork-server/dist/opencode-plugins"
+if [ ! -d "$plugin_dir" ]; then
+  echo "openwork-server extension plugins missing at $plugin_dir" >&2
+  exit 1
+fi
+attempt=0
+while [ "$attempt" -lt 3 ]; do
+  attempt=$((attempt + 1))
+  if OPENWORK_MANAGE_OPENCODE=1 OPENWORK_OPENCODE_BIN=./bin/opencode OPENWORK_EXTENSIONS_PLUGIN_DIR="$plugin_dir" openwork-server --workspace /tmp/workspace --host 0.0.0.0 --port "\${PORT:-10000}" --cors '*' --approval manual --verbose; then
+    exit 0
+  fi
+  status=$?
+  echo "openwork-server failed (attempt $attempt, exit $status); retrying in 3s"
+  sleep 3
+done
+exit 1
+`.trim()
+  const startCommand = `sh -lc ${shellQuote(startScript)}`
 
   const payload = {
     type: "web_service",
@@ -318,9 +337,7 @@ async function provisionWorkerOnRender(
       await waitForHealth(customUrl, env.render.customDomainReadyTimeoutMs)
       url = customUrl
     } catch {
-      console.warn(
-        `[provisioner] vanity domain not ready yet for ${input.workerId}; returning Render URL fallback`,
-      )
+      logger.warn("vanity domain not ready yet", { worker_id: input.workerId })
     }
   }
 
@@ -398,9 +415,6 @@ export async function deprovisionWorker(input: {
       body: JSON.stringify({}),
     })
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown_error"
-    console.warn(
-      `[provisioner] failed to suspend Render service ${target.id}: ${message}`,
-    )
+    logger.warn("failed to suspend Render service", { worker_id: input.workerId, service_id: target.id, error })
   }
 }

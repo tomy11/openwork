@@ -7,6 +7,7 @@ const EnvSchema = z.object({
   DATABASE_PASSWORD: z.string().optional(),
   DB_MODE: z.enum(["mysql", "planetscale"]).optional(),
   PORT: z.string().optional(),
+  DEN_MARKETING_URL: z.string().optional(),
   DAYTONA_API_URL: z.string().optional(),
   DAYTONA_API_KEY: z.string().optional(),
   DAYTONA_TARGET: z.string().optional(),
@@ -57,6 +58,7 @@ export const env = {
   dbMode: parsed.DB_MODE ?? (parsed.DATABASE_URL ? "mysql" : "planetscale"),
   planetscale: planetscaleCredentials,
   port: Number(parsed.PORT ?? "8789"),
+  marketingUrl: optionalString(parsed.DEN_MARKETING_URL),
   daytona: {
     apiUrl: optionalString(parsed.DAYTONA_API_URL) ?? "https://app.daytona.io/api",
     apiKey: optionalString(parsed.DAYTONA_API_KEY),

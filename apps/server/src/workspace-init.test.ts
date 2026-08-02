@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm, writeFile, mkdir, stat } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ensureWorkspaceFiles } from "./workspace-init.js";
+import {
+  defaultWorkspaceOpenworkConfig,
+  ensureWorkspaceFiles,
+  ensureLocalWorkspaceFiles,
+} from "./workspace-init.js";
 import { openworkExtensionsPreviewPluginPath, openworkPluginPath } from "./openwork-extensions-plugin-path.js";
 
 async function withWorkspace(fn: (root: string) => Promise<void>) {
@@ -16,12 +20,15 @@ async function withWorkspace(fn: (root: string) => Promise<void>) {
 }
 
 describe("ensureWorkspaceFiles", () => {
-  test("creates OpenWork workspace config without writing opencode config", async () => {
+  test("does not write an openwork.json file (config is DB-backed now)", async () => {
     await withWorkspace(async (root) => {
       const result = await ensureWorkspaceFiles(root, "starter");
-      const openwork = await readFile(join(root, ".opencode", "openwork.json"), "utf8");
+      // openwork config no longer lands on disk; it is seeded into the runtime
+      // DB by the workspace-creation route.
+      await expect(
+        readFile(join(root, ".opencode", "openwork.json"), "utf8"),
+      ).rejects.toThrow();
       await expect(readFile(join(root, "opencode.jsonc"), "utf8")).rejects.toThrow();
-      expect(openwork).toContain('"authorizedRoots"');
       expect(result.reloadReasons).toEqual([]);
 
       const secondResult = await ensureWorkspaceFiles(root, "starter");
@@ -29,11 +36,20 @@ describe("ensureWorkspaceFiles", () => {
     });
   });
 
+  test("defaultWorkspaceOpenworkConfig carries authorizedRoots + workspace metadata", async () => {
+    await withWorkspace(async (root) => {
+      const config = defaultWorkspaceOpenworkConfig(root, "starter");
+      expect(config.authorizedRoots).toEqual([root]);
+      expect(config.workspace?.preset).toBe("starter");
+      expect(config.version).toBe(1);
+    });
+  });
+
   test("uses shipped extension preview plugin", async () => {
     const pluginPath = openworkExtensionsPreviewPluginPath();
     const plugin = await readFile(pluginPath, "utf8");
     expect(pluginPath).toContain(join("opencode-plugins", "openwork-extensions-preview.ts"));
-    expect(plugin).toContain("openwork_extension_call");
+    expect(plugin).toContain("openwork_execute");
   });
 
   test("uses external resources plugin path in packaged Electron", () => {
@@ -130,5 +146,38 @@ describe("ensureWorkspaceFiles", () => {
 `);
       expect(result.reloadReasons).not.toContain("config");
     });
+  });
+});
+
+describe("ensureLocalWorkspaceFiles", () => {
+  test("provisions local workspaces and skips remote ones", async () => {
+    await withWorkspace(async (root) => {
+      await ensureLocalWorkspaceFiles([
+        { path: root, preset: "starter", workspaceType: "local" },
+        { path: "", preset: "remote", workspaceType: "remote" },
+      ]);
+      // No openwork.json file is written; provisioning does not crash on the
+      // remote (empty-path) entry.
+      await expect(
+        readFile(join(root, ".opencode", "openwork.json"), "utf8"),
+      ).rejects.toThrow();
+    });
+  });
+
+  test("does not throw when a remote workspace has an empty path", async () => {
+    // Regression: a remote workspace is persisted with an empty path, which used
+    // to reach ensureWorkspaceFiles() and throw invalid_workspace_path, aborting
+    // server startup so local workspaces could never connect to the engine.
+    await expect(
+      ensureLocalWorkspaceFiles([{ path: "", preset: "remote", workspaceType: "remote" }]),
+    ).resolves.toBeUndefined();
+  });
+
+  test("skips a non-remote workspace that has no local path", async () => {
+    // A legacy/migrated entry can default to workspaceType "local" with an empty
+    // path; it has no local files to provision and must be skipped, not crash.
+    await expect(
+      ensureLocalWorkspaceFiles([{ path: "", preset: "starter", workspaceType: "local" }]),
+    ).resolves.toBeUndefined();
   });
 });

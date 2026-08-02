@@ -1,5 +1,7 @@
 import type { Context, Hono } from "hono"
 import { describeRoute } from "hono-openapi"
+import { z } from "zod"
+import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { queryValidator, jsonValidator, orgMemberRoute, paramValidator, resolveMemberTeamsMiddleware } from "../../../middleware/index.js"
 import { emptyResponse, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../../openapi.js"
 import type { OrgRouteVariables } from "../shared.js"
@@ -36,6 +38,10 @@ import {
   githubConnectorDiscoveryResponseSchema,
   githubDiscoveryApplyResponseSchema,
   githubDiscoveryApplySchema,
+  githubPluginMcpImportPreviewResponseSchema,
+  githubPluginMcpImportPreviewSchema,
+  githubPluginMcpImportResponseSchema,
+  githubPluginMcpImportSchema,
   githubDiscoveryTreeQuerySchema,
   githubDiscoveryTreeResponseSchema,
   connectorInstanceDetailResponseSchema,
@@ -91,6 +97,8 @@ import {
   pluginDetailResponseSchema,
   pluginListQuerySchema,
   pluginListResponseSchema,
+  pluginMcpRequirementConfigureResponseSchema,
+  pluginMcpRequirementConfigureSchema,
   pluginMembershipListResponseSchema,
   pluginMembershipMutationResponseSchema,
   pluginMembershipWriteSchema,
@@ -98,9 +106,13 @@ import {
   pluginParamsSchema,
   pluginUpdateSchema,
   resourceAccessGrantWriteSchema,
+  teamParamsSchema,
+  teamPluginAccessListResponseSchema,
 } from "./schemas.js"
-import { requirePluginArchCapability, type PluginArchActorContext, PluginArchAuthorizationError } from "./access.js"
+import { isPluginArchOrgAdmin, requirePluginArchCapability, type PluginArchActorContext, PluginArchAuthorizationError } from "./access.js"
 import { pluginArchRoutePaths } from "./contracts.js"
+import { ensureOrganizationAdmin, orgAccessFailureStatus } from "../shared.js"
+import { isAgentOAuthClientConnection } from "../mcp-connections.js"
 import {
   PluginArchRouteFailure,
   addPluginMembership,
@@ -112,7 +124,8 @@ import {
   createConnectorMapping,
   createGithubConnectorAccount,
   createMarketplace,
-  createPlugin,
+  createPluginBundle,
+  configureMarketplacePluginMcpRequirement,
   createResourceAccessGrant,
   createConnectorTarget,
   deleteConnectorMapping,
@@ -143,12 +156,15 @@ import {
   listPluginMemberships,
   listPlugins,
   listResourceAccess,
+  listTeamEffectivePluginAccess,
   attachPluginToMarketplace,
   completeGithubConnectorInstall,
   applyGithubConnectorDiscovery,
   getConnectorInstanceConfiguration,
   getGithubConnectorDiscovery,
   getGithubConnectorDiscoveryTree,
+  importGithubPluginMcps,
+  previewGithubPluginMcpImport,
   removeConnectorInstance,
   setConnectorInstanceAutoImport,
   queueConnectorTargetResync,
@@ -170,6 +186,12 @@ import {
 } from "./store.js"
 
 type OrgContext = Context<{ Variables: OrgRouteVariables }>
+type PluginCreateBody = z.infer<typeof pluginCreateSchema>
+
+const marketplaceConflictSchema = z.object({
+  error: z.string(),
+  message: z.string().optional(),
+}).meta({ ref: "PluginArchMarketplaceConflictError" })
 
 function validRequestPart<T>(c: OrgContext, target: "json" | "param" | "query") {
   return (c.req as unknown as { valid: (part: typeof target) => unknown }).valid(target) as T
@@ -210,6 +232,38 @@ function routeErrorResponse(c: OrgContext, error: unknown) {
     return c.json({ error: failure.error, message: failure.message }, failure.status)
   }
   throw error
+}
+
+async function configurePluginMcpConnectionResponse(c: OrgContext) {
+  try {
+    const params = validParam<z.infer<typeof pluginParamsSchema>>(c)
+    const body = validJson<z.infer<typeof pluginMcpRequirementConfigureSchema>>(c)
+    if (isAgentPluginMcpSecretSetup({ apiKey: body.apiKey, oauthClient: body.oauthClient, sessionId: c.get("session")?.id })) {
+      return c.json({ error: "invalid_request", message: "Plugin MCP credentials cannot be set from the agent. Add them in the OpenWork Cloud dashboard under Connections." }, 400)
+    }
+    const admin = ensureOrganizationAdmin(c, "Only workspace owners and admins can configure plugin MCP requirements.")
+    if (!admin.ok) return c.json(admin.response, orgAccessFailureStatus(admin.response))
+    return c.json({ ok: true, item: await configureMarketplacePluginMcpRequirement({
+      authType: body.authType,
+      apiKey: body.apiKey,
+      configObjectId: body.configObjectId,
+      context: actorContext(c),
+      credentialMode: body.credentialMode ?? (body.authType === "oauth" ? "per_member" : "shared"),
+      oauthClient: body.oauthClient,
+      pluginId: normalizeDenTypeId("plugin", params.pluginId),
+      serverName: body.serverName,
+    }) })
+  } catch (error) {
+    return routeErrorResponse(c, error)
+  }
+}
+
+export function isAgentPluginMcpSecretSetup(input: { apiKey?: string | null; oauthClient?: unknown; sessionId?: string | null }) {
+  return isAgentOAuthClientConnection(input) || (input.sessionId === "mcp_internal" && Boolean(input.apiKey?.trim()))
+}
+
+export function isAgentPluginMcpOAuthClientSetup(input: { apiKey?: string | null; oauthClient?: unknown; sessionId?: string | null }) {
+  return isAgentPluginMcpSecretSetup(input)
 }
 
 function withPluginArchOrgContext(app: Hono<any>, method: "delete" | "get" | "patch" | "post", path: string, ...handlers: unknown[]) {
@@ -370,8 +424,8 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     jsonValidator(configObjectCreateVersionSchema),
     describeRoute({
       tags: ["Config Objects"],
-      summary: "Create config object version",
-      description: "Creates a new immutable config object version.",
+      summary: "Update config object with new version",
+      description: "Updates an existing config object, including a Cloud skill, by creating a new immutable version without creating a duplicate.",
       responses: {
         201: jsonResponse("Config object version created successfully.", configObjectMutationResponseSchema),
         400: jsonResponse("The config object version request was invalid.", invalidRequestSchema),
@@ -648,20 +702,37 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     describeRoute({
       tags: ["Plugins"],
       summary: "Create plugin",
-      description: "Creates a new private plugin and grants the creator manager access.",
+      description: "Creates a plugin and can also create components, share org-wide, and publish to a marketplace in one request.",
       responses: {
         201: jsonResponse("Plugin created successfully.", pluginMutationResponseSchema),
         400: jsonResponse("The plugin creation request was invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to create plugins.", unauthorizedSchema),
         403: jsonResponse("The caller lacks permission to create plugins.", forbiddenSchema),
+        404: jsonResponse("The marketplace could not be found.", notFoundSchema),
       },
     }),
     async (c: OrgContext) => {
       try {
         const context = actorContext(c)
         await requirePluginArchCapability(context, "plugin.create")
-        const body = validJson<any>(c)
-        return c.json({ ok: true, item: await createPlugin({ context, description: body.description, name: body.name }) }, 201)
+        const body = validJson<PluginCreateBody>(c)
+        if (body.orgWide === true && !isPluginArchOrgAdmin(context)) {
+          throw new PluginArchAuthorizationError(403, "forbidden", "Only organization owners and admins can create org-wide plugins.")
+        }
+        if ((body.components?.length ?? 0) > 0) {
+          await requirePluginArchCapability(context, "config_object.create")
+        }
+        return c.json({
+          ok: true,
+          item: await createPluginBundle({
+            components: body.components?.map((component) => ({ type: component.type, value: component.input })),
+            context,
+            description: body.description,
+            marketplaceId: body.marketplaceId,
+            name: body.name,
+            orgWide: body.orgWide,
+          }),
+        }, 201)
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -832,6 +903,84 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       }
     })
 
+  withPluginArchOrgContext(app, "post", pluginArchRoutePaths.pluginMcpConnections,
+    paramValidator(pluginParamsSchema),
+    jsonValidator(pluginMcpRequirementConfigureSchema),
+    describeRoute({
+      tags: ["Plugins"],
+      summary: "Configure plugin MCP requirement",
+      description: "Admin-only privileged setup for one declared remote MCP server. The server name and URL are derived from the active plugin config object; the request never supplies a URL and does not start OAuth.",
+      responses: {
+        200: jsonResponse("Plugin MCP requirement configured successfully.", pluginMcpRequirementConfigureResponseSchema),
+        400: jsonResponse("The plugin MCP requirement request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to configure plugin MCP requirements.", unauthorizedSchema),
+        403: jsonResponse("Only workspace owners and admins can configure plugin MCP requirements.", forbiddenSchema),
+        404: jsonResponse("The plugin MCP requirement could not be found.", notFoundSchema),
+      },
+    }),
+    configurePluginMcpConnectionResponse)
+
+  withPluginArchOrgContext(app, "post", pluginArchRoutePaths.pluginGithubMcpImportPreview,
+    jsonValidator(githubPluginMcpImportPreviewSchema),
+    describeRoute({
+      tags: ["GitHub"],
+      summary: "Preview GitHub plugin marketplace import",
+      description: "Reads a public GitHub plugin URL and returns skills and remote MCP servers that can be imported into an organization marketplace.",
+      responses: {
+        200: jsonResponse("GitHub plugin MCP import preview returned successfully.", githubPluginMcpImportPreviewResponseSchema),
+        400: jsonResponse("The GitHub plugin MCP import preview request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to preview plugin MCP imports.", unauthorizedSchema),
+        404: jsonResponse("The GitHub plugin path could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const body = validJson<{
+          githubUrl: string
+        }>(c)
+        return c.json({ ok: true, item: await previewGithubPluginMcpImport({ githubUrl: body.githubUrl }) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "post", pluginArchRoutePaths.pluginGithubMcpImport,
+    jsonValidator(githubPluginMcpImportSchema),
+    describeRoute({
+      tags: ["GitHub"],
+      summary: "Create a plugin from GitHub",
+      description: "Creates one plugin from selected skills and remote MCP servers in a public GitHub plugin URL, applies the requested access grants, and optionally publishes it into an organization marketplace. Declared and known-server authentication requirements take precedence over the request-wide auth fallback.",
+      responses: {
+        200: jsonResponse("GitHub plugin MCPs imported successfully.", githubPluginMcpImportResponseSchema),
+        400: jsonResponse("The GitHub plugin MCP import request was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to import plugin MCPs.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks permission to import plugin MCPs.", forbiddenSchema),
+        404: jsonResponse("The GitHub plugin path or marketplace could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const context = actorContext(c)
+        await requirePluginArchCapability(context, "plugin.create")
+        const body = validJson<z.infer<typeof githubPluginMcpImportSchema>>(c)
+        return c.json({ ok: true, item: await importGithubPluginMcps({
+          access: body.access,
+          authType: body.authType,
+          context,
+          credentialMode: body.credentialMode,
+          description: body.description,
+          githubUrl: body.githubUrl,
+          marketplaceId: body.marketplaceId,
+          name: body.name,
+          selectedSkillKeys: body.selectedSkillKeys,
+          selectedServerKeys: body.selectedServerKeys,
+          selectedServerNames: body.selectedServerNames,
+        }) })
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
   withPluginArchOrgContext(app, "get", pluginArchRoutePaths.pluginAccess,
     paramValidator(pluginParamsSchema),
     describeRoute({
@@ -850,6 +999,32 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       try {
         const params = validParam<any>(c)
         return c.json(await listResourceAccess({ context: actorContext(c), resourceId: params.pluginId, resourceKind: "plugin" }))
+      } catch (error) {
+        return routeErrorResponse(c, error)
+      }
+    })
+
+  withPluginArchOrgContext(app, "get", pluginArchRoutePaths.teamPluginAccess,
+    paramValidator(teamParamsSchema),
+    describeRoute({
+      tags: ["Plugins"],
+      summary: "List effective team plugin access",
+      description: "Lists plugins available to a team through direct grants, marketplace grants, and organization-wide grants.",
+      responses: {
+        200: jsonResponse("Effective team plugin access returned successfully.", teamPluginAccessListResponseSchema),
+        400: jsonResponse("The team access path parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to view team plugin access.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks permission to view this team's plugin access.", forbiddenSchema),
+        404: jsonResponse("The team could not be found.", notFoundSchema),
+      },
+    }),
+    async (c: OrgContext) => {
+      try {
+        const params = validParam<z.infer<typeof teamParamsSchema>>(c)
+        return c.json(await listTeamEffectivePluginAccess({
+          context: actorContext(c),
+          teamId: normalizeDenTypeId("team", params.teamId),
+        }))
       } catch (error) {
         return routeErrorResponse(c, error)
       }
@@ -991,19 +1166,28 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
       }
     })
 
-  for (const [path, action] of [[pluginArchRoutePaths.marketplaceArchive, "archive"], [pluginArchRoutePaths.marketplaceRestore, "restore"]] as const) {
+  for (const [path, action] of [
+    [pluginArchRoutePaths.marketplaceArchive, "archive"],
+    [pluginArchRoutePaths.marketplaceDelete, "delete"],
+    [pluginArchRoutePaths.marketplaceRestore, "restore"],
+  ] as const) {
     withPluginArchOrgContext(app, "post", path,
       paramValidator(marketplaceParamsSchema),
       describeRoute({
         tags: ["Marketplaces"],
         summary: `${action} marketplace`,
-        description: `${action} a marketplace without touching membership history.`,
+        description: action === "delete"
+          ? "Permanently deletes a custom marketplace and its relationships."
+          : `${action} a marketplace without deleting its plugins.`,
         responses: {
           200: jsonResponse("Marketplace lifecycle updated successfully.", marketplaceMutationResponseSchema),
           400: jsonResponse("The marketplace lifecycle path parameters were invalid.", invalidRequestSchema),
           401: jsonResponse("The caller must be signed in to manage marketplaces.", unauthorizedSchema),
           403: jsonResponse("The caller lacks permission to manage this marketplace.", forbiddenSchema),
           404: jsonResponse("The marketplace could not be found.", notFoundSchema),
+          ...(action === "delete" ? {
+            409: jsonResponse("A built-in or connector-managed marketplace cannot be deleted.", marketplaceConflictSchema),
+          } : {}),
         },
       }),
       async (c: OrgContext) => {
@@ -1042,8 +1226,8 @@ export function registerPluginArchRoutes<T extends { Variables: OrgRouteVariable
     paramValidator(marketplaceParamsSchema),
     describeRoute({
       tags: ["Marketplaces"],
-      summary: "Get marketplace resolved",
-      description: "Returns marketplace detail with plugins and derived source info.",
+      summary: "Get resolved marketplace plugin readiness",
+      description: "Returns marketplace detail with plugins, derived source info, and each plugin's cloud readiness or required setup state.",
       responses: {
         200: jsonResponse("Marketplace resolved detail returned successfully.", marketplaceResolvedResponseSchema),
         400: jsonResponse("The marketplace path parameters were invalid.", invalidRequestSchema),

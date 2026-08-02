@@ -48,6 +48,16 @@ function installMenuOverlayDismissListeners() {
   }
 }
 
+let desktopBootstrap = null;
+let desktopDistribution = null;
+try {
+  desktopBootstrap = ipcRenderer.sendSync("openwork:desktop-bootstrap-sync");
+  desktopDistribution = ipcRenderer.sendSync("openwork:desktop-distribution-sync");
+} catch {
+  desktopBootstrap = null;
+  desktopDistribution = null;
+}
+
 contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
   invokeDesktop(command, ...args) {
     return ipcRenderer.invoke("openwork:desktop", command, ...args);
@@ -79,6 +89,27 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
       return ipcRenderer.invoke("openwork:migration:ack");
     },
   },
+  brandIcon: {
+    apply(url) {
+      return ipcRenderer.invoke("openwork:desktop", "__applyBrandIcon", url ?? null);
+    },
+    getState() {
+      return ipcRenderer.invoke("openwork:desktop", "__getBrandIconState");
+    },
+  },
+  dev: {
+    evalRelaunch() {
+      return ipcRenderer.invoke("openwork:desktop", "__evalRelaunch");
+    },
+  },
+  nuke: {
+    preview(options) {
+      return ipcRenderer.invoke("openwork:desktop", "nukeOpenworkAndOpencodeConfigPreview", options);
+    },
+    execute(options) {
+      return ipcRenderer.invoke("openwork:desktop", "nukeOpenworkAndOpencodeConfigAndExit", options);
+    },
+  },
   updater: {
     getChannel() {
       return ipcRenderer.invoke("openwork:updater:getChannel");
@@ -86,8 +117,8 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     setChannel(channel) {
       return ipcRenderer.invoke("openwork:updater:setChannel", channel);
     },
-    check(channel) {
-      return ipcRenderer.invoke("openwork:updater:check", channel);
+    check(channel, targetVersion) {
+      return ipcRenderer.invoke("openwork:updater:check", channel, targetVersion);
     },
     download() {
       return ipcRenderer.invoke("openwork:updater:download");
@@ -157,6 +188,8 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     },
   },
   meta: {
+    desktopBootstrap,
+    distribution: desktopDistribution,
     initialDeepLinks: [],
     platform: normalizePlatform(process.platform),
     version: process.versions.electron,

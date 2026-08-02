@@ -63,6 +63,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install eval workspace
+        run: pnpm --dir evals install --frozen-lockfile
+
       - name: Install Xvfb
         run: |
           sudo apt-get update -qq
@@ -92,6 +95,13 @@ jobs:
           tail -100 /tmp/openwork-dev.log >&2
           exit 1
 
+      - name: Run core reliability soak
+        shell: bash
+        env:
+          DISPLAY: ":99"
+          OPENWORK_EVAL_DESKTOP_SURFACE: "0"
+        run: pnpm evals --stack den --flow invite-reliability --flow mcp-connect-reliability --repeat 3
+
       - name: Run eval flows
         shell: bash
         env:
@@ -99,7 +109,21 @@ jobs:
           # Optional cloud coverage: flows skip cleanly when unset.
           OPENWORK_EVAL_DEN_API_URL: ${{ secrets.OPENWORK_EVAL_DEN_API_URL }}
           OPENWORK_EVAL_DEN_TOKEN: ${{ secrets.OPENWORK_EVAL_DEN_TOKEN }}
-        run: pnpm evals --all
+        run: pnpm fraimz --all
+
+      - name: Run nightly eval spec lane
+        shell: bash
+        env:
+          DISPLAY: ":99"
+          OPENWORK_EVAL_APP_SPECS: "1"
+          OPENWORK_EVAL_CDP_URL: "http://127.0.0.1:9823"
+          OPENWORK_EVAL_DEN_API_URL: ${{ secrets.OPENWORK_EVAL_DEN_API_URL }}
+          OPENWORK_EVAL_DEN_TOKEN: ${{ secrets.OPENWORK_EVAL_DEN_TOKEN }}
+        # The migrated app-driving specs are still being stabilised against a
+        # real app (state readiness/restoration). They produce photo rolls as
+        # evidence; they must not gate the nightly run until they are green.
+        continue-on-error: true
+        run: pnpm --dir evals run spec:nightly
 
       - name: Upload eval reports
         if: always()

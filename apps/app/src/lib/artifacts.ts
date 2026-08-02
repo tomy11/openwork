@@ -4,10 +4,11 @@ import * as React from "react";
 import {
   isApplyPatchToolPart,
   isEditToolPart,
+  isReadToolPart,
   isWriteToolPart,
 } from "@/lib/build-in-tools";
 import { useOpenTargets } from "@/lib/target-provider";
-import { isCollectibleArtifactTarget, isOpenableFileTarget, type OpenTarget, type OpenTargetPreview } from "@/react-app/domains/session/artifacts/open-target";
+import { filePathFromFileUrl, isCollectibleArtifactTarget, isOpenableFileTarget, type OpenTarget, type OpenTargetPreview } from "@/react-app/domains/session/artifacts/open-target";
 
 export type ArtifactType = "website" | "markdown" | "sheet" | "slides" | "document" | "image" | "video" | "audio" | "pdf" | "html" | "text" | "unknown";
 
@@ -161,6 +162,7 @@ function artifactTypeToPreview(type: ArtifactType): OpenTargetPreview {
   if (type === "markdown") return "markdown";
   if (type === "sheet") return "sheet";
   if (type === "slides") return "slides";
+  if (type === "document") return "document";
   if (type === "image") return "image";
   if (type === "pdf") return "pdf";
   if (type === "html") return "html";
@@ -246,6 +248,14 @@ function getArtifactPathsFromMessage(message: UIMessage) {
       continue;
     }
 
+    if (part.type === "file") {
+      // Chat attachments carry workspace `file://` URLs; surface them as
+      // artifacts so users can click/preview what they attached.
+      const path = filePathFromFileUrl(part.url);
+      if (path) paths.push(path);
+      continue;
+    }
+
     if (part.type === "source-document") {
       if (part.filename) {
         paths.push(part.filename);
@@ -265,6 +275,12 @@ function getArtifactPathsFromMessage(message: UIMessage) {
     }
 
     if (isEditToolPart(part)) {
+      paths.push(part.input.filePath);
+      continue;
+    }
+
+    // Paper artifact strip covers every file "read, edited, or created".
+    if (isReadToolPart(part)) {
       paths.push(part.input.filePath);
       continue;
     }
@@ -347,6 +363,22 @@ export function useArtifacts(messages: UIMessage[], options: GetArtifactsOptions
     () => getArtifactsFromMessages(messages, openTargets, { includeTargetFallbacks }),
     [includeTargetFallbacks, messages, openTargets],
   );
+}
+
+/** Open any file path in the artifact preview panel (markdown, code, images…). */
+export function useOpenArtifactPath() {
+  const { openTargets, onOpenTarget } = useOpenTargets();
+
+  return React.useCallback((path: string, options?: { external?: boolean }) => {
+    const normalized = normalizeArtifactPath(path);
+    const target = openTargetFromArtifactPath(
+      normalized,
+      getArtifactName(normalized),
+      getArtifactType(normalized),
+      openTargets,
+    );
+    onOpenTarget?.(target, options);
+  }, [onOpenTarget, openTargets]);
 }
 
 export function usePreviewArtifact() {

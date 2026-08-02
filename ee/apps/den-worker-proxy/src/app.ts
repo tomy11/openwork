@@ -1,7 +1,7 @@
 import "./load-env.js"
 import { Daytona } from "@daytonaio/sdk"
 import { Hono } from "hono"
-import { and, eq, isNull } from "@openwork-ee/den-db/drizzle"
+import { and, eq, isNull, sql } from "@openwork-ee/den-db/drizzle"
 import { createDenDb, DaytonaSandboxTable, RateLimitTable, WorkerTokenTable } from "@openwork-ee/den-db"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { env } from "./env.js"
@@ -31,6 +31,18 @@ type WorkerId = typeof DaytonaSandboxTable.$inferSelect.worker_id
 type WorkerTokenScope = typeof WorkerTokenTable.$inferSelect.scope
 
 const refreshPromises = new Map<WorkerId, Promise<string | null>>()
+
+app.get("/health", (c) => c.json({ ok: true, service: "den-worker-proxy" }))
+
+app.get("/ready", async (c) => {
+  try {
+    await db.execute(sql`select 1`)
+    return c.json({ ok: true, service: "den-worker-proxy", checks: { database: "ok" } })
+  } catch (error) {
+    console.error("[readiness] den-worker-proxy database check failed", error)
+    return c.json({ ok: false, service: "den-worker-proxy", checks: { database: "error" } }, 503)
+  }
+})
 
 function assertDaytonaConfig() {
   if (!env.daytona.apiKey) {
@@ -343,7 +355,10 @@ async function proxyRequest(workerId: WorkerId, request: Request) {
 app.all("*", async (c) => {
   const requestUrl = new URL(c.req.url)
   if (requestUrl.pathname === "/") {
-    return Response.redirect("https://openworklabs.com", 302)
+    if (env.marketingUrl) {
+      return Response.redirect(env.marketingUrl, 302)
+    }
+    return c.json({ ok: true, service: "den-worker-proxy" })
   }
 
   if (c.req.method === "OPTIONS") {

@@ -384,10 +384,26 @@ hr {
   }
 }
 
+.hero-prompt-caret {
+  animation: hero-prompt-caret-blink 1s steps(1, end) infinite;
+}
+
+@keyframes hero-prompt-caret-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  46%,
+  100% {
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .word-cycle span,
   .animate-fade-up,
   .den-running-dot,
+  .hero-prompt-caret,
   .doc-button,
   .secondary-button,
   .feature-card {

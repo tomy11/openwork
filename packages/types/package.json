@@ -9,6 +9,26 @@
       "development": "./src/index.ts",
       "default": "./src/index.ts"
     },
+    "./agent-context-diagnostics": {
+      "types": "./src/agent-context-diagnostics.ts",
+      "development": "./src/agent-context-diagnostics.ts",
+      "default": "./src/agent-context-diagnostics.ts"
+    },
+    "./openwork-affordance": {
+      "types": "./src/openwork-affordance.ts",
+      "development": "./src/openwork-affordance.ts",
+      "default": "./src/openwork-affordance.ts"
+    },
+    "./openwork-context": {
+      "types": "./src/openwork-context.ts",
+      "development": "./src/openwork-context.ts",
+      "default": "./src/openwork-context.ts"
+    },
+    "./openwork-provider": {
+      "types": "./src/openwork-provider.ts",
+      "development": "./src/openwork-provider.ts",
+      "default": "./src/openwork-provider.ts"
+    },
     "./den/desktop-app-restrictions": {
       "types": "./src/den/desktop-app-restrictions.ts",
       "development": "./src/den/desktop-app-restrictions.ts",
@@ -19,10 +39,30 @@
       "development": "./src/den/desktop-policies.ts",
       "default": "./src/den/desktop-policies.ts"
     },
+    "./den/connect-diagnostics": {
+      "types": "./src/den/connect-diagnostics.ts",
+      "development": "./src/den/connect-diagnostics.ts",
+      "default": "./src/den/connect-diagnostics.ts"
+    },
+    "./den/egress-diagnostics": {
+      "types": "./src/den/egress-diagnostics.ts",
+      "development": "./src/den/egress-diagnostics.ts",
+      "default": "./src/den/egress-diagnostics.ts"
+    },
     "./den/inference": {
       "types": "./src/den/inference.ts",
       "development": "./src/den/inference.ts",
       "default": "./src/den/inference.ts"
+    },
+    "./den/microsoft-365": {
+      "types": "./src/den/microsoft-365.ts",
+      "development": "./src/den/microsoft-365.ts",
+      "default": "./src/den/microsoft-365.ts"
+    },
+    "./den/mcp-connection-action": {
+      "types": "./src/den/mcp-connection-action.ts",
+      "development": "./src/den/mcp-connection-action.ts",
+      "default": "./src/den/mcp-connection-action.ts"
     },
     "./workspace": {
       "types": "./src/workspace.ts",
@@ -33,6 +73,16 @@
       "types": "./src/desktop-ipc.ts",
       "development": "./src/desktop-ipc.ts",
       "default": "./src/desktop-ipc.ts"
+    },
+    "./connect-link": {
+      "types": "./src/connect-link.ts",
+      "development": "./src/connect-link.ts",
+      "default": "./src/connect-link.ts"
+    },
+    "./url": {
+      "types": "./src/url.ts",
+      "development": "./src/url.ts",
+      "default": "./src/url.ts"
     }
   },
   "files": [

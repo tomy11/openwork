@@ -1,11 +1,12 @@
 /** @jsxImportSource react */
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useState, useSyncExternalStore } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { t } from "../../i18n";
 import {
   pickDirectory,
   resolveWorkspaceListSelectedId,
+  workspaceCreateRemote,
   workspaceSetRuntimeActive,
   workspaceSetSelected,
   type WorkspaceInfo,
@@ -19,18 +20,38 @@ import { WelcomePage } from "../domains/onboarding/welcome-page";
 import { ProviderSelectionStep } from "../domains/onboarding/provider-selection-step";
 import { AttributionStep, type AttributionSource } from "../domains/onboarding/attribution-step";
 import { CreateWorkspaceModal } from "../domains/workspace/create-workspace-modal";
+import type { CreateWorkspaceOptions } from "../domains/workspace/types";
 import {
   getOpenWorkModelsActionUrl,
   hideOpenWorkModelsPromo,
+  useOpenWorkModelsPromoEligibility,
   markOpenWorkModelsStartupPromoShown,
 } from "../domains/cloud/openwork-models-promo";
 import { useDenAuth } from "../domains/cloud/den-auth-provider";
+import { JoinOrganizationDialog } from "../domains/cloud/join-organization-dialog";
 import { resolveOpenworkConnection } from "./openwork-connection";
 import { captureAnalyticsEvent } from "../../app/lib/analytics";
 import { buildOpenworkWorkspaceBaseUrl, createOpenworkServerClient } from "../../app/lib/openwork-server";
-import { writeActiveWorkspaceId, writeLastSessionFor } from "./session-memory";
+import { buildDenAuthUrl, clearDenSession, DEFAULT_DEN_BASE_URL, readDenSettings } from "../../app/lib/den";
+import {
+  denSettingsChangedEvent,
+  dispatchDenSessionUpdated,
+} from "../../app/lib/den-session-events";
+import { writeActiveWorkspaceId, writeLastSessionFor, writeWorkspaceProjectDimension } from "./session-memory";
 import { workspaceSessionRoute } from "./workspace-routes";
 import { ensureDesktopLocalOpenworkConnection } from "./desktop-local-openwork";
+import { saveControlPlaneUrl } from "../domains/settings/cloud/control-plane-url";
+import { shouldHoldWelcomeForDenSession } from "./welcome-den-session";
+
+function subscribeToDenSettings(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(denSettingsChangedEvent, onStoreChange);
+  return () => window.removeEventListener(denSettingsChangedEvent, onStoreChange);
+}
+
+function readDenAuthTokenSnapshot() {
+  return readDenSettings().authToken?.trim() ?? "";
+}
 
 function folderNameFromPath(path: string) {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -112,8 +133,8 @@ function welcomeReducer(state: WelcomeState, action: WelcomeAction): WelcomeStat
  * the user has no workspaces and has not completed onboarding.
  *
  * Clicking "Get started" opens the CreateWorkspaceModal. Once a
- * workspace is created, hasCompletedOnboarding is set and the user
- * is redirected to /session.
+ * workspace is created, provider and attribution onboarding runs before
+ * hasCompletedOnboarding is set and the user is redirected to /session.
  */
 export function WelcomeRoute() {
   const navigate = useNavigate();
@@ -122,6 +143,21 @@ export function WelcomeRoute() {
   const denAuth = useDenAuth();
   const [state, dispatch] = useReducer(welcomeReducer, initialWelcomeState);
   const [manualFolder, setManualFolder] = useState("");
+  const [organizationServerUrl, setOrganizationServerUrl] = useState(() => readDenSettings().baseUrl);
+  const [organizationServerBusy, setOrganizationServerBusy] = useState(false);
+  const [organizationServerError, setOrganizationServerError] = useState<string | null>(null);
+  const [joinOrganizationOpen, setJoinOrganizationOpen] = useState(false);
+  const showOpenWorkModelsPromo = useOpenWorkModelsPromoEligibility();
+  const denAuthTokenSnapshot = useSyncExternalStore(
+    subscribeToDenSettings,
+    readDenAuthTokenSnapshot,
+    readDenAuthTokenSnapshot,
+  );
+  const holdSignedOutSurface = shouldHoldWelcomeForDenSession({
+    authStatus: denAuth.status,
+    hasStoredAuthToken: Boolean(denAuthTokenSnapshot),
+    isSignedIn: denAuth.isSignedIn,
+  });
 
   // If user already completed onboarding, redirect away immediately.
   useEffect(() => {
@@ -130,19 +166,55 @@ export function WelcomeRoute() {
     }
   }, [local.prefs.hasCompletedOnboarding, navigate]);
 
+  useEffect(() => {
+    if (denAuth.isSignedIn) {
+      navigate("/onboarding", { replace: true });
+    }
+  }, [denAuth.isSignedIn, navigate]);
+
   const markOnboardingComplete = useCallback(() => {
     local.setPrefs((prev) => ({ ...prev, hasCompletedOnboarding: true }));
   }, [local]);
 
+  useEffect(() => {
+    const handleDenSettingsChanged = () => setOrganizationServerUrl(readDenSettings().baseUrl);
+    window.addEventListener(denSettingsChangedEvent, handleDenSettingsChanged);
+    return () => window.removeEventListener(denSettingsChangedEvent, handleDenSettingsChanged);
+  }, []);
+
+  const handleOrganizationServerSave = useCallback(async (url: string) => {
+    setOrganizationServerBusy(true);
+    setOrganizationServerError(null);
+    try {
+      const persisted = await saveControlPlaneUrl(url);
+      if (!persisted) {
+        setOrganizationServerError(t("welcome.organization_server_error"));
+        return false;
+      }
+      clearDenSession({ includeBaseUrls: false });
+      dispatchDenSessionUpdated({ status: "signed_out", baseUrl: persisted.baseUrl });
+      setOrganizationServerUrl(persisted.baseUrl);
+      return true;
+    } catch (error) {
+      setOrganizationServerError(
+        error instanceof Error ? error.message : t("welcome.organization_server_error"),
+      );
+      return false;
+    } finally {
+      setOrganizationServerBusy(false);
+    }
+  }, []);
+
   const handleCreateWorkspace = useCallback(
-    async (_preset: string, folder: string | null) => {
+    async (_preset: string, folder: string | null, options?: CreateWorkspaceOptions) => {
       if (!folder) return;
+      const projectLabel = options?.projectLabel?.trim() ?? "";
       dispatch({ type: "create:start" });
       try {
         const workspaceName = folderNameFromPath(folder);
         let list: WorkspaceList | null = null;
-        let serverBaseUrl = "";
-        let serverToken = "";
+        let sessionBaseUrl = "";
+        let sessionToken = "";
         try {
           const { normalizedBaseUrl, resolvedToken, resolvedHostToken } =
             await resolveOpenworkConnection();
@@ -157,8 +229,8 @@ export function WelcomeRoute() {
               name: workspaceName,
               preset: "starter",
             });
-            serverBaseUrl = normalizedBaseUrl;
-            serverToken = resolvedToken;
+            sessionBaseUrl = normalizedBaseUrl;
+            sessionToken = resolvedToken;
           }
         } catch {
           list = null;
@@ -184,14 +256,19 @@ export function WelcomeRoute() {
             workspace: targetWorkspace,
             allWorkspaces: list.workspaces,
           }).catch(() => undefined);
+          const fresh = await resolveOpenworkConnection().catch(() => null);
+          if (fresh?.normalizedBaseUrl && fresh.resolvedToken) {
+            sessionBaseUrl = fresh.normalizedBaseUrl;
+            sessionToken = fresh.resolvedToken;
+          }
         }
-        if (targetWorkspaceId && serverBaseUrl && serverToken) {
+        if (targetWorkspaceId && sessionBaseUrl && sessionToken) {
           try {
             const workspacePath = targetWorkspace?.path?.trim() || folder;
             const session = unwrap(await createClient(
-              `${(buildOpenworkWorkspaceBaseUrl(serverBaseUrl, targetWorkspaceId) ?? serverBaseUrl).replace(/\/+$/, "")}/opencode`,
+              `${(buildOpenworkWorkspaceBaseUrl(sessionBaseUrl, targetWorkspaceId) ?? sessionBaseUrl).replace(/\/+$/, "")}/opencode`,
               workspacePath || undefined,
-              { token: serverToken, mode: "openwork" },
+              { token: sessionToken, mode: "openwork" },
             ).session.create({ directory: workspacePath || undefined }));
             targetSessionId = session.id;
             captureAnalyticsEvent("task_created", { source: "onboarding", workspace_type: "local" });
@@ -201,9 +278,13 @@ export function WelcomeRoute() {
         }
         if (targetWorkspaceId) {
           writeActiveWorkspaceId(targetWorkspaceId);
+          if (projectLabel) {
+            writeWorkspaceProjectDimension(targetWorkspaceId, {
+              label: projectLabel,
+            });
+          }
           if (targetSessionId) writeLastSessionFor(targetWorkspaceId, targetSessionId);
         }
-        markOnboardingComplete();
         dispatch({ type: "close" });
         // Show the provider selection step before navigating to the session.
         dispatch({ type: "provider-step", workspaceId: targetWorkspaceId, sessionId: targetSessionId });
@@ -217,7 +298,7 @@ export function WelcomeRoute() {
         dispatch({ type: "create:finish" });
       }
     },
-    [markOnboardingComplete, navigate],
+    [],
   );
 
   const handleCreateRemote = useCallback(
@@ -241,18 +322,22 @@ export function WelcomeRoute() {
           remoteType,
         };
         let list: WorkspaceList | null = null;
-        try {
-          const { normalizedBaseUrl, resolvedToken, resolvedHostToken } =
-            await resolveOpenworkConnection();
-          if (normalizedBaseUrl && (resolvedToken || resolvedHostToken)) {
-            list = await createOpenworkServerClient({
-              baseUrl: normalizedBaseUrl,
-              token: resolvedToken || undefined,
-              hostToken: resolvedHostToken || undefined,
-            }).createRemoteWorkspace(payload);
+        if (isDesktopRuntime()) {
+          list = await workspaceCreateRemote(payload);
+        } else {
+          try {
+            const { normalizedBaseUrl, resolvedToken, resolvedHostToken } =
+              await resolveOpenworkConnection();
+            if (normalizedBaseUrl && (resolvedToken || resolvedHostToken)) {
+              list = await createOpenworkServerClient({
+                baseUrl: normalizedBaseUrl,
+                token: resolvedToken || undefined,
+                hostToken: resolvedHostToken || undefined,
+              }).createRemoteWorkspace(payload);
+            }
+          } catch {
+            list = null;
           }
-        } catch {
-          list = null;
         }
         if (!list) {
           throw new Error("OpenWork server is unavailable. Start or reconnect the server before connecting a remote workspace.");
@@ -301,10 +386,17 @@ export function WelcomeRoute() {
     await handleCreateWorkspace("starter", folder);
   }, [handleCreateWorkspace, manualFolder]);
 
+  const handleTeamSignIn = useCallback(() => {
+    markOnboardingComplete();
+    const settings = readDenSettings();
+    platform.openLink(buildDenAuthUrl(settings.baseUrl || DEFAULT_DEN_BASE_URL, "sign-in"));
+  }, [markOnboardingComplete, platform]);
+
   const finishOnboarding = useCallback(() => {
+    markOnboardingComplete();
     navigate(state.pendingRoute ?? "/session", { replace: true });
     if (state.pendingSessionId) focusPromptSoon();
-  }, [navigate, state.pendingRoute, state.pendingSessionId]);
+  }, [markOnboardingComplete, navigate, state.pendingRoute, state.pendingSessionId]);
 
   const handleAttributionSubmit = useCallback(
     (source: AttributionSource, aiPrompt?: string) => {
@@ -325,17 +417,34 @@ export function WelcomeRoute() {
     finishOnboarding();
   }, [finishOnboarding]);
 
+  if (holdSignedOutSurface) {
+    return null;
+  }
+
   return (
     <>
       <WelcomePage
         onGetStarted={handleGetStarted}
-        getStartedLabel={t("welcome.pick_folder")}
         busy={state.createBusy}
         error={state.createError}
         manualFolder={manualFolder}
         onManualFolderChange={setManualFolder}
         onUseManualFolder={handleUseManualFolder}
         showManualFolder={import.meta.env.DEV && isDesktopRuntime()}
+        onTeamSignIn={handleTeamSignIn}
+        onJoinOrganization={() => setJoinOrganizationOpen(true)}
+        organizationServerBusy={organizationServerBusy}
+        organizationServerError={organizationServerError}
+        organizationServerUrl={organizationServerUrl}
+        onOrganizationServerSave={handleOrganizationServerSave}
+      />
+      <JoinOrganizationDialog
+        open={joinOrganizationOpen}
+        onOpenChange={setJoinOrganizationOpen}
+        onConnected={() => {
+          markOnboardingComplete();
+          setJoinOrganizationOpen(false);
+        }}
       />
       <CreateWorkspaceModal
         open={state.modalOpen}
@@ -360,6 +469,7 @@ export function WelcomeRoute() {
       />
       {state.providerStep ? (
         <ProviderSelectionStep
+          showOpenWorkModels={showOpenWorkModelsPromo}
           onOpenWorkModels={() => {
             // Land on the OpenWork Models value-prop page when already
             // signed in to Den; otherwise start sign-up. Previously this

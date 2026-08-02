@@ -18,7 +18,9 @@ import {
   type AppNotification,
   type NotificationSeverity,
 } from "@/react-app/kernel/notification-store";
+import { useNavigate } from "react-router-dom";
 import { requestOpenModelPicker } from "./new-providers-listener";
+import { useControlAction, type OpenworkControlAction } from "./control/control-provider";
 import { openNotificationCenterEvent } from "./notifications";
 import { useReloadCoordinator } from "./reload-coordinator";
 import { useShellConfig } from "./shell-config";
@@ -61,6 +63,28 @@ export function NotificationBell() {
   const markAllRead = useNotificationStore((state) => state.markAllRead);
   const clearAll = useNotificationStore((state) => state.clearAll);
   const reloadCoordinator = useReloadCoordinator();
+  const navigate = useNavigate();
+
+  const notificationsListAction = useMemo<OpenworkControlAction>(() => ({
+    id: "notifications.list",
+    label: "List notifications",
+    description: "Return the current notification center entries.",
+    kind: "query",
+    effects: { data: "read", ui: "none", external: false },
+    sideEffect: "none",
+    execute: () => notifications.map((n) => ({
+      id: n.id,
+      kind: n.kind,
+      severity: n.severity,
+      title: n.title,
+      body: n.body,
+      count: n.count,
+      readAt: n.readAt,
+      actionType: n.action?.type ?? null,
+      actionLabel: n.actionLabel ?? null,
+    })),
+  }), [notifications]);
+  useControlAction(notificationsListAction);
 
   const unreadCount = useMemo(
     () => notifications.filter((notification) => notification.readAt === null).length,
@@ -91,9 +115,13 @@ export function NotificationBell() {
         requestOpenModelPicker(action.providerIds);
       } else if (action.type === "reload-engine") {
         void reloadCoordinator.reloadWorkspaceEngine();
+      } else if (action.type === "open-extensions-marketplace") {
+        navigate("/extensions");
+      } else if (action.type === "install-marketplace-plugin") {
+        navigate("/extensions");
       }
     },
-    [markAllRead, reloadCoordinator],
+    [markAllRead, navigate, reloadCoordinator],
   );
 
   if (!config.notifications) return null;

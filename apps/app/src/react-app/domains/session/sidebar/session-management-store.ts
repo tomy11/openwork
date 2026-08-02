@@ -31,7 +31,12 @@ type SessionGroupSyncHandler = {
   createGroup: (workspaceId: string, group: SessionGroupDefinition) => Promise<SessionGroupServerState | null>;
   assignGroup: (workspaceId: string, sessionId: string, groupId: string | null) => Promise<SessionGroupServerState | null>;
   reorderGroups: (workspaceId: string, groupIds: string[]) => Promise<SessionGroupServerState | null>;
-  removeGroup: (workspaceId: string, groupId: string) => Promise<SessionGroupServerState | null>;
+  renameGroup: (workspaceId: string, groupId: string, label: string) => Promise<SessionGroupServerState | null>;
+  removeGroup: (
+    workspaceId: string,
+    groupId: string,
+    destinationGroupId: string | null,
+  ) => Promise<SessionGroupServerState | null>;
 };
 
 type SessionGroupMutationSuccess = {
@@ -55,20 +60,24 @@ type SessionGroupSyncStatus = {
 
 type SessionManagementState = {
   pinnedIds: string[];
+  unreadIds: string[];
   orderByWorkspace: Record<string, string[]>;
   groupsByWorkspace: Record<string, WorkspaceGroupState>;
 };
 
 type SessionManagementActions = {
   togglePin: (sessionId: string) => void;
+  markUnread: (sessionId: string) => void;
+  clearUnread: (sessionId: string) => void;
   reorderSessions: (workspaceId: string, sessionIds: string[]) => void;
   assignGroup: (workspaceId: string, sessionId: string, groupId: string | null) => void;
   createGroup: (workspaceId: string, label: string) => void;
+  renameGroup: (workspaceId: string, groupId: string, label: string) => void;
   reorderGroups: (workspaceId: string, groupIds: string[]) => void;
   toggleGroupExpanded: (workspaceId: string, groupId: string) => void;
   replaceWorkspaceGroups: (workspaceId: string, state: SessionGroupServerState) => void;
-  /** Remove a group definition. Sessions assigned to it become ungrouped. */
-  removeGroup: (workspaceId: string, groupId: string) => void;
+  /** Remove a group definition and move its sessions to another group or ungrouped. */
+  removeGroup: (workspaceId: string, groupId: string, destinationGroupId?: string | null) => void;
   forgetWorkspace: (workspaceId: string) => void;
 };
 
@@ -166,6 +175,7 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
   persist(
     (set) => ({
       pinnedIds: [],
+      unreadIds: [],
       orderByWorkspace: {},
       groupsByWorkspace: {},
 
@@ -179,6 +189,20 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
                 : [...state.pinnedIds, sessionId],
           };
         }),
+
+      markUnread: (sessionId) =>
+        set((state) => (
+          state.unreadIds.includes(sessionId)
+            ? state
+            : { unreadIds: [...state.unreadIds, sessionId] }
+        )),
+
+      clearUnread: (sessionId) =>
+        set((state) => (
+          state.unreadIds.includes(sessionId)
+            ? { unreadIds: state.unreadIds.filter((id) => id !== sessionId) }
+            : state
+        )),
 
       reorderSessions: (workspaceId, sessionIds) =>
         set((state) => ({
@@ -220,6 +244,22 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
           };
         });
         syncServerState(sessionGroupSyncHandler?.createGroup(workspaceId, group), workspaceId);
+      },
+
+      renameGroup: (workspaceId, groupId, label) => {
+        set((state) => {
+          const ws = state.groupsByWorkspace[workspaceId] ?? EMPTY_GROUP_STATE;
+          return {
+            groupsByWorkspace: {
+              ...state.groupsByWorkspace,
+              [workspaceId]: {
+                ...ws,
+                groups: ws.groups.map((group) => group.id === groupId ? { ...group, label } : group),
+              },
+            },
+          };
+        });
+        syncServerState(sessionGroupSyncHandler?.renameGroup(workspaceId, groupId, label), workspaceId);
       },
 
       reorderGroups: (workspaceId, groupIds) => {
@@ -283,14 +323,24 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
           };
         }),
 
-      removeGroup: (workspaceId, groupId) => {
+      removeGroup: (workspaceId, groupId, destinationGroupId = null) => {
+        const ws = useSessionManagementStore.getState().groupsByWorkspace[workspaceId] ?? EMPTY_GROUP_STATE;
+        const validDestinationGroupId = destinationGroupId && ws.groups.some(
+          (group) => group.id === destinationGroupId && group.id !== groupId,
+        ) ? destinationGroupId : null;
+        const sessionIds = Object.entries(ws.assignments)
+          .filter(([, assignedGroupId]) => assignedGroupId === groupId)
+          .map(([sessionId]) => sessionId);
         set((state) => {
           const ws = state.groupsByWorkspace[workspaceId] ?? EMPTY_GROUP_STATE;
           const groups = ws.groups.filter((g) => g.id !== groupId);
-          // Unassign sessions that belonged to the removed group.
-          const assignments: Record<string, string> = {};
-          for (const [sid, gid] of Object.entries(ws.assignments)) {
-            if (gid !== groupId) assignments[sid] = gid;
+          const assignments = { ...ws.assignments };
+          for (const sessionId of sessionIds) {
+            if (validDestinationGroupId) {
+              assignments[sessionId] = validDestinationGroupId;
+            } else {
+              delete assignments[sessionId];
+            }
           }
           const collapsedGroupIds = (ws.collapsedGroupIds ?? []).filter((id) => id !== groupId);
           return {
@@ -300,7 +350,14 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
             },
           };
         });
-        syncServerState(sessionGroupSyncHandler?.removeGroup(workspaceId, groupId), workspaceId);
+        syncServerState(
+          sessionGroupSyncHandler?.removeGroup(
+            workspaceId,
+            groupId,
+            validDestinationGroupId,
+          ),
+          workspaceId,
+        );
       },
 
       forgetWorkspace: (workspaceId) =>
@@ -322,6 +379,7 @@ export const useSessionManagementStore = create<SessionManagementStore>()(
 // ---------------------------------------------------------------------------
 
 const EMPTY_PINNED = new Set<string>();
+const EMPTY_UNREAD = new Set<string>();
 const EMPTY_ORDER: string[] = [];
 
 export function usePinnedSessionIds(): Set<string> {
@@ -329,6 +387,11 @@ export function usePinnedSessionIds(): Set<string> {
   // Derive a Set; reference-stable when the array is the same object.
   // Consumers only need membership checks so Set is ideal.
   return ids.length ? new Set(ids) : EMPTY_PINNED;
+}
+
+export function useUnreadSessionIds(): Set<string> {
+  const ids = useSessionManagementStore((s) => s.unreadIds);
+  return ids.length ? new Set(ids) : EMPTY_UNREAD;
 }
 
 export function useSessionOrder(workspaceId: string): string[] {

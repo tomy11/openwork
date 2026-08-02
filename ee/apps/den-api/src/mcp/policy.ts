@@ -9,16 +9,17 @@ const SAFE_INCLUDED_TAGS = new Set([
   "Teams",
   "Templates",
   "LLM Providers",
-  "Skills",
-  "Skill Hubs",
   "Workers",
   "Worker Runtime",
   "Worker Activity",
+  "Memory",
   "Config Objects",
   "Plugins",
   "Marketplaces",
   "Connectors",
+  "Desktop Policies",
   "GitHub",
+  "Capability Sources",
 ])
 
 const BLOCKED_OPERATION_IDS = new Set([
@@ -31,6 +32,8 @@ const BLOCKED_OPERATION_IDS = new Set([
   "deleteV1OrgsByOrgId",
   "postWorkersByWorkerIdTokens",
   "postV1WorkersByWorkerIdTokens",
+  "postOauthProvidersByProviderIdDisconnect",
+  "postV1OauthProvidersByProviderIdDisconnect",
 ])
 
 export type OpenApiOperation = {

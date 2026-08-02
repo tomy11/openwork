@@ -45,6 +45,7 @@ export type DenOrgTeam = {
   createdAt: string | null;
   updatedAt: string | null;
   memberIds: string[];
+  managedByScim: boolean;
 };
 
 export type DenCurrentMemberTeam = {
@@ -69,6 +70,11 @@ export type DenInvitationPreview = {
     name: string;
     slug: string;
     allowedEmailDomains: string[] | null;
+    branding: {
+      appName: string;
+      logoUrl: string | null;
+      iconUrl: string | null;
+    };
   };
 };
 
@@ -80,6 +86,32 @@ export type DenOrgRole = {
   protected: boolean;
   createdAt: string | null;
   updatedAt: string | null;
+};
+
+export type DenCanonicalRole = "owner" | "super-admin" | "admin" | "member";
+
+export type DenOrgAccessFlags = {
+  canonicalRole: DenCanonicalRole;
+  isOwner: boolean;
+  isSuperAdmin: boolean;
+  isAdminRole: boolean;
+  isMember: boolean;
+  isAdmin: boolean;
+  canViewSettings: boolean;
+  canManageSettings: boolean;
+  canManageSecurityConfiguration: boolean;
+  canInviteMembers: boolean;
+  canCancelInvitations: boolean;
+  canManageMembers: boolean;
+  canRemoveMembers: boolean;
+  canManageRoles: boolean;
+  canManageTeams: boolean;
+  canManageApiKeys: boolean;
+  canManageScim: boolean;
+  canManageSso: boolean;
+  canTransferOwnership: boolean;
+  canDeleteOrganization: boolean;
+  canStartSeatCheckout: boolean;
 };
 
 export type DenOrgApiKey = {
@@ -109,6 +141,7 @@ export type DenOrgScimConnection = {
   id: string;
   providerId: string;
   organizationId: string;
+  groupMappingMode: "metadata_only" | "create_teams";
   createdAt: string | null;
   updatedAt: string | null;
 };
@@ -188,6 +221,7 @@ export type DenOrgContext = {
   currentMemberTeams: DenCurrentMemberTeam[];
   entitlements: DenOrgEntitlements;
   authMethods: DenOrgAuthMethods;
+  capabilities: DenOrgCapabilities;
 };
 
 export type DenOrgAuthMethods = {
@@ -202,10 +236,36 @@ export type DenOrgEntitlements = {
   analytics: boolean;
 };
 
+/** Per-org feature flags controlled by platform admins; everything defaults to off. */
+export type DenOrgCapabilities = {
+  installLinks: boolean;
+  mcpConnections: boolean;
+  cloud: boolean;
+};
+
 export type DenOrganizationMetadata = {
   allowedDesktopVersions?: string[];
   requireSso?: boolean;
+  brandAppName?: string;
+  brandLogoUrl?: string;
+  brandIconUrl?: string;
+  brandLogoAsset?: DenManagedBrandAsset;
+  brandIconAsset?: DenManagedBrandAsset;
+  brandAccentColor?: string;
 } & Record<string, unknown>;
+
+export type DenManagedBrandAsset = {
+  kind: "logo" | "icon";
+  version: string;
+  extension: "png" | "jpg";
+  contentType: "image/png" | "image/jpeg";
+  url: string;
+  width: number;
+  height: number;
+  byteLength: number;
+  originalName: string;
+  uploadedAt: string;
+};
 
 export const DEN_ROLE_PERMISSION_OPTIONS = {
   organization: ["update", "delete"],
@@ -217,6 +277,8 @@ export const DEN_ROLE_PERMISSION_OPTIONS = {
 } as const;
 
 export const PENDING_ORG_INVITATION_STORAGE_KEY = "openwork:web:pending-org-invitation";
+export const PENDING_WORKSPACE_CLAIM_STORAGE_KEY = "openwork:web:pending-workspace-claim";
+export const PENDING_ORG_SELECTION_STORAGE_KEY = "openwork:web:pending-org-selection";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -278,6 +340,46 @@ export function getRequireSsoFromMetadata(metadata: string | null): boolean {
   return parsed?.requireSso === true;
 }
 
+export function getManagedBrandAssetFromMetadata(
+  metadata: string | null,
+  kind: "logo" | "icon",
+): DenManagedBrandAsset | null {
+  const parsed = parseOrganizationMetadata(metadata);
+  const value = kind === "logo" ? parsed?.brandLogoAsset : parsed?.brandIconAsset;
+  if (!isRecord(value) || value.kind !== kind) {
+    return null;
+  }
+  if (
+    typeof value.version !== "string" ||
+    (value.extension !== "png" && value.extension !== "jpg") ||
+    (value.contentType !== "image/png" && value.contentType !== "image/jpeg") ||
+    typeof value.url !== "string" ||
+    typeof value.width !== "number" ||
+    typeof value.height !== "number" ||
+    typeof value.byteLength !== "number" ||
+    typeof value.originalName !== "string" ||
+    typeof value.uploadedAt !== "string"
+  ) {
+    return null;
+  }
+  return {
+    kind,
+    version: value.version,
+    extension: value.extension,
+    contentType: value.contentType,
+    url: value.url,
+    width: value.width,
+    height: value.height,
+    byteLength: value.byteLength,
+    originalName: value.originalName,
+    uploadedAt: value.uploadedAt,
+  };
+}
+
+export function getManagedBrandIconUrl(metadata: string | null): string | null {
+  return getManagedBrandAssetFromMetadata(metadata, "icon")?.url ?? null;
+}
+
 function parsePermissionRecord(value: unknown): Record<string, string[]> {
   if (!isRecord(value)) {
     return {};
@@ -300,33 +402,85 @@ export function splitRoleString(value: string): string[] {
     .filter(Boolean);
 }
 
-function roleHasSecurityConfigurationPermission(roleValue: string, roles: readonly DenOrgRole[]) {
-  const roleNames = new Set(splitRoleString(roleValue));
-  return roles.some((role) => (
-    roleNames.has(role.role)
-    && (role.permission.security_configuration?.includes("manage") ?? false)
-  ));
+function normalizeCanonicalRole(value: string): DenCanonicalRole | null {
+  const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (normalized === "owner") return "owner";
+  if (normalized === "super-admin") return "super-admin";
+  if (normalized === "admin") return "admin";
+  if (normalized === "member") return "member";
+  return null;
 }
 
-export function getOrgAccessFlags(roleValue: string, isOwner: boolean, roleDefinitions: readonly DenOrgRole[] = []) {
-  const roleNames = new Set(splitRoleString(roleValue));
-  const isAdmin = isOwner || roleNames.has("admin");
-  const canManageSecurityConfiguration = isOwner || roleHasSecurityConfigurationPermission(roleValue, roleDefinitions);
+function getCanonicalRoleSet(roleValue: string) {
+  const roles = new Set<DenCanonicalRole>();
+  for (const roleName of splitRoleString(roleValue)) {
+    const canonicalRole = normalizeCanonicalRole(roleName);
+    if (canonicalRole) {
+      roles.add(canonicalRole);
+    }
+  }
+  return roles;
+}
+
+export function roleIncludesCanonicalRole(roleValue: string, role: DenCanonicalRole): boolean {
+  return getCanonicalRoleSet(roleValue).has(role);
+}
+
+export function getHighestCanonicalRole(roleValue: string, isOwner: boolean): DenCanonicalRole {
+  const canonicalRoles = getCanonicalRoleSet(roleValue);
+  if (isOwner || canonicalRoles.has("owner")) return "owner";
+  if (canonicalRoles.has("super-admin")) return "super-admin";
+  if (canonicalRoles.has("admin")) return "admin";
+  return "member";
+}
+
+export function isAssignableOrgRole(role: DenOrgRole): boolean {
+  return !roleIncludesCanonicalRole(role.role, "owner") && (role.builtIn || !role.protected);
+}
+
+export function canRefreshInvitationRole(role: string, access: Pick<DenOrgAccessFlags, "canInviteMembers" | "canManageRoles">): boolean {
+  return access.canInviteMembers && (access.canManageRoles || role === "member");
+}
+
+export function getOrgAccessFlags(roleValue: string, isOwner: boolean, _roleDefinitions: readonly DenOrgRole[] = []): DenOrgAccessFlags {
+  const canonicalRole = getHighestCanonicalRole(roleValue, isOwner);
+  const resolvedIsOwner = canonicalRole === "owner";
+  const isSuperAdmin = canonicalRole === "super-admin";
+  const isAdminRole = canonicalRole === "admin";
+  const isAdmin = resolvedIsOwner || isSuperAdmin || isAdminRole;
+  const canManageSettings = resolvedIsOwner || isSuperAdmin;
 
   return {
-    isOwner,
+    canonicalRole,
+    isOwner: resolvedIsOwner,
+    isSuperAdmin,
+    isAdminRole,
+    isMember: canonicalRole === "member",
     isAdmin,
-    canManageSecurityConfiguration,
+    canViewSettings: isAdmin,
+    canManageSettings,
+    canManageSecurityConfiguration: canManageSettings,
     canInviteMembers: isAdmin,
     canCancelInvitations: isAdmin,
-    canManageMembers: isOwner,
+    canManageMembers: isAdmin,
     canRemoveMembers: isAdmin,
-    canManageRoles: isOwner,
+    canManageRoles: canManageSettings,
     canManageTeams: isAdmin,
-    canManageApiKeys: canManageSecurityConfiguration,
-    canManageScim: canManageSecurityConfiguration,
-    canManageSso: canManageSecurityConfiguration,
+    canManageApiKeys: canManageSettings,
+    canManageScim: canManageSettings,
+    canManageSso: canManageSettings,
+    canTransferOwnership: resolvedIsOwner,
+    canDeleteOrganization: resolvedIsOwner,
+    canStartSeatCheckout: isAdmin,
   };
+}
+
+export function shouldRequireOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
+  return orgs.length > 1 && !orgs.some((org) => org.isActive);
+}
+
+export function shouldOfferOrgSelection(orgs: readonly DenOrgSummary[]): boolean {
+  return orgs.length > 1;
 }
 
 export function formatRoleLabel(role: string): string {
@@ -349,6 +503,10 @@ export function getJoinOrgRoute(invitationId: string): string {
   return `/join-org?invite=${encodeURIComponent(invitationId)}`;
 }
 
+export function getWorkspaceClaimRoute(token: string): string {
+  return `/workspace-claim?token=${encodeURIComponent(token)}`;
+}
+
 export function getAnalyticsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/analytics`;
 }
@@ -361,6 +519,10 @@ export function getMembersRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/members`;
 }
 
+export function getTeamRoute(orgSlug: string | null | undefined, teamId: string): string {
+  return `${getMembersRoute(orgSlug)}/teams/${encodeURIComponent(teamId)}`;
+}
+
 export function getBackgroundAgentsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/background-agents`;
 }
@@ -371,6 +533,10 @@ export function getCustomLlmProvidersRoute(orgSlug?: string | null): string {
 
 export function getInferenceRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/inference`;
+}
+
+export function getWebRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/web`;
 }
 
 export function getLlmProvidersRoute(orgSlug?: string | null): string {
@@ -409,6 +575,14 @@ export function getOrgSettingsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/org-settings`;
 }
 
+export function getDiagnosticsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/diagnostics`;
+}
+
+export function getBrandAppearanceRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/brand-appearance`;
+}
+
 export function getApiKeysRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/api-keys`;
 }
@@ -429,8 +603,24 @@ export function getPluginRoute(orgSlug: string | null | undefined, pluginId: str
   return `${getPluginsRoute(orgSlug)}/${encodeURIComponent(pluginId)}`;
 }
 
+export function getPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string, skillId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/skills/${encodeURIComponent(skillId)}`;
+}
+
+export function getNewPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/skills/new`;
+}
+
+export function getEditPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string, skillId: string): string {
+  return `${getPluginSkillRoute(orgSlug, pluginId, skillId)}/edit`;
+}
+
 export function getNewPluginRoute(orgSlug?: string | null): string {
   return `${getPluginsRoute(orgSlug)}/new`;
+}
+
+export function getImportPluginRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}/import`;
 }
 
 export function getMarketplacesRoute(orgSlug?: string | null): string {
@@ -447,6 +637,14 @@ export function getIntegrationsRoute(orgSlug?: string | null): string {
 
 export function getGithubIntegrationRoute(orgSlug?: string | null): string {
   return `${getIntegrationsRoute(orgSlug)}/github`;
+}
+
+export function getMcpConnectionsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/mcp-connections`;
+}
+
+export function getYourConnectionsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/your-connections`;
 }
 
 export function getGithubIntegrationSetupRoute(orgSlug: string | null | undefined, connectorInstanceId: string): string {
@@ -635,6 +833,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
             createdAt: asIsoString(entry.createdAt),
             updatedAt: asIsoString(entry.updatedAt),
             memberIds,
+            managedByScim: asBoolean(entry.managedByScim),
           } satisfies DenOrgTeam;
         })
         .filter((entry): entry is DenOrgTeam => entry !== null)
@@ -699,6 +898,7 @@ export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
     currentMemberTeams,
     entitlements: parseOrgEntitlements(payload.entitlements),
     authMethods: parseOrgAuthMethods(payload.authMethods),
+    capabilities: parseOrgCapabilities(payload.capabilities),
   };
 }
 
@@ -710,6 +910,18 @@ function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
   return {
     sso: value.sso === true,
     scim: value.scim === true,
+  };
+}
+
+function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
+  if (!isRecord(value)) {
+    return { installLinks: false, mcpConnections: false, cloud: false };
+  }
+
+  return {
+    installLinks: value.installLinks === true,
+    mcpConnections: value.mcpConnections === true,
+    cloud: value.cloud === true,
   };
 }
 
@@ -742,6 +954,7 @@ export function parseInvitationPreviewPayload(payload: unknown): DenInvitationPr
   const organizationId = asString(organization.id);
   const organizationName = asString(organization.name);
   const organizationSlug = asString(organization.slug);
+  const branding = isRecord(organization.branding) ? organization.branding : null;
 
   if (!invitationId || !invitationEmail || !invitationRole || !invitationStatus || !organizationId || !organizationName || !organizationSlug) {
     return null;
@@ -761,6 +974,11 @@ export function parseInvitationPreviewPayload(payload: unknown): DenInvitationPr
       name: organizationName,
       slug: organizationSlug,
       allowedEmailDomains: asStringArray(organization.allowedEmailDomains),
+      branding: {
+        appName: asString(branding?.appName) ?? "OpenWork",
+        logoUrl: asString(branding?.logoUrl),
+        iconUrl: asString(branding?.iconUrl),
+      },
     },
   };
 }
@@ -830,6 +1048,7 @@ export function parseOrgApiKeysPayload(payload: unknown): DenOrgApiKey[] {
 
 export function parseOrgScimPayload(payload: unknown): {
   baseUrl: string | null;
+  ssoReady: boolean;
   connection: DenOrgScimConnection | null;
   health: DenOrgScimHealth;
   scimToken: string | null;
@@ -837,6 +1056,7 @@ export function parseOrgScimPayload(payload: unknown): {
   if (!isRecord(payload)) {
     return {
       baseUrl: null,
+      ssoReady: false,
       connection: null,
       health: {
         unresolvedFailureCount: 0,
@@ -856,6 +1076,9 @@ export function parseOrgScimPayload(payload: unknown): {
         const id = asString(rawConnection.id);
         const providerId = asString(rawConnection.providerId);
         const organizationId = asString(rawConnection.organizationId);
+        const groupMappingMode = rawConnection.groupMappingMode === "create_teams"
+          ? "create_teams"
+          : "metadata_only";
 
         if (!id || !providerId || !organizationId) {
           return null;
@@ -865,6 +1088,7 @@ export function parseOrgScimPayload(payload: unknown): {
           id,
           providerId,
           organizationId,
+          groupMappingMode,
           createdAt: asIsoString(rawConnection.createdAt),
           updatedAt: asIsoString(rawConnection.updatedAt),
         } satisfies DenOrgScimConnection;
@@ -885,6 +1109,7 @@ export function parseOrgScimPayload(payload: unknown): {
 
   return {
     baseUrl: asString(payload.baseUrl),
+    ssoReady: payload.ssoReady === true,
     connection,
     health,
     scimToken: asString(payload.scimToken),

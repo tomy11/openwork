@@ -1,14 +1,19 @@
 /** @jsxImportSource react */
-import { Building2, Check, LogOut, Loader2 } from "lucide-react";
+import { ArrowUpRight, Building2, Check, LogOut, Loader2 } from "lucide-react";
 
-import type { DenOrgSummary } from "../../../../app/lib/den";
+import {
+  formatDenOrgRoleLabel,
+  type DenOrgSummary,
+} from "../../../../app/lib/den";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   SettingsNotice,
   SettingsSectionHeaderDescription,
 } from "../settings-section";
 import { t } from "@/i18n";
 import { useCloudSession } from "./cloud-session-provider";
+import { useOrgListWindow } from "../../cloud/use-org-list-window";
 
 export interface CloudAccountSectionProps {
   activeOrgId: string;
@@ -19,6 +24,7 @@ export interface CloudAccountSectionProps {
   orgsError: string | null;
   sessionBusy: boolean;
   onActiveOrgChange: (orgId: string) => void | Promise<void>;
+  onOpenDashboard: () => void;
   onRefreshOrgs: () => void | Promise<void>;
   onSignOut: () => void | Promise<void>;
 }
@@ -32,6 +38,7 @@ export function CloudAccountSection({
   orgsError,
   sessionBusy,
   onActiveOrgChange,
+  onOpenDashboard,
   onRefreshOrgs,
   onSignOut,
 }: CloudAccountSectionProps) {
@@ -42,7 +49,7 @@ export function CloudAccountSection({
   return (
     <section className="flex flex-col gap-y-6">
       {/* User identity */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div className="min-w-0 flex items-center gap-3">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-dls-hover text-sm font-semibold text-dls-text">
             {(user?.name ?? user?.email ?? "?").charAt(0).toUpperCase()}
@@ -56,16 +63,26 @@ export function CloudAccountSection({
             ) : null}
           </div>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => void onSignOut()}
-          disabled={controlsDisabled}
-        >
-          <LogOut className="size-3.5" />
-          {authBusy ? t("den.signing_out") : t("den.sign_out")}
-        </Button>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onOpenDashboard}
+            disabled={controlsDisabled}
+          >
+            {t("den.open_dashboard")}
+            <ArrowUpRight className="size-3.5" />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void onSignOut()}
+            disabled={controlsDisabled}
+          >
+            <LogOut className="size-3.5" />
+            {authBusy ? t("den.signing_out") : t("den.sign_out")}
+          </Button>
+        </div>
       </div>
 
       {/* Org picker (stepper-style) or connected org display */}
@@ -104,7 +121,7 @@ function ConnectedOrg({ org }: { org: DenOrgSummary }) {
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium text-dls-text">{org.name}</div>
         <div className="text-xs text-dls-secondary">
-          {org.role === "owner" ? "Owner" : "Member"} &middot; Connected
+          {formatDenOrgRoleLabel(org.role)} &middot; Connected
         </div>
       </div>
       <Check size={16} className="shrink-0 text-green-11" />
@@ -129,6 +146,9 @@ function OrgPicker({
   onSelect: (orgId: string) => void | Promise<void>;
   onRefresh: () => void | Promise<void>;
 }) {
+  const { filtered, query, showMore, updateQuery, visible } = useOrgListWindow(orgs);
+  const hasMore = visible.length < filtered.length;
+
   if (orgsBusy) {
     return (
       <div className="flex flex-col items-center gap-3 py-6 text-sm text-dls-secondary">
@@ -161,8 +181,17 @@ function OrgPicker({
       <div className="text-xs text-dls-secondary">
         Choose the organization to use with this workspace. Sign out to switch later.
       </div>
+      {orgs.length > 10 ? (
+        <Input
+          aria-label="Search organizations"
+          placeholder="Search organizations..."
+          value={query}
+          className="h-auto rounded-xl border-dls-border bg-dls-surface px-4 py-2.5 text-sm text-dls-text shadow-none placeholder:text-dls-secondary focus-visible:border-dls-text/30 focus-visible:ring-0 dark:bg-dls-surface"
+          onChange={(event) => updateQuery(event.target.value)}
+        />
+      ) : null}
       <div className="flex flex-col gap-2">
-        {orgs.map((org) => (
+        {visible.map((org) => (
           <button
             key={org.id}
             type="button"
@@ -176,12 +205,33 @@ function OrgPicker({
             <div className="min-w-0 flex-1">
               <div className="text-sm font-medium text-dls-text">{org.name}</div>
               <div className="text-xs text-dls-secondary">
-                {org.role === "owner" ? "Owner" : "Member"}
+                {formatDenOrgRoleLabel(org.role)}
               </div>
             </div>
           </button>
         ))}
       </div>
+      {filtered.length === 0 && query.trim() ? (
+        <div className="text-sm text-dls-secondary">
+          No organizations match your search.
+        </div>
+      ) : null}
+      {hasMore ? (
+        <div className="flex flex-col items-start gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="rounded-xl border-dls-border text-dls-text hover:bg-dls-hover"
+            onClick={showMore}
+          >
+            Show more
+          </Button>
+          <div className="text-xs text-dls-secondary">
+            Showing {visible.length} of {filtered.length} organizations
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

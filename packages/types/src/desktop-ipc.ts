@@ -12,6 +12,7 @@
  * main process resolves. Results marked `unknown` are not yet modeled —
  * tighten them instead of widening call sites.
  */
+import type { ConnectLinkVerifyFailure, ConnectLinkVerifyResult } from "./connect-link.js";
 import type { WorkspaceWire } from "./workspace.js";
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@ export type OpencodeExecutionSnapshot = {
 export type EngineInfo = {
   running: boolean;
   runtime: "direct";
+  managedByServer: boolean;
   baseUrl: string | null;
   projectDir: string | null;
   hostname: string | null;
@@ -47,6 +49,40 @@ export type EngineInfo = {
   lastStdout: string | null;
   lastStderr: string | null;
   execution: OpencodeExecutionSnapshot | null;
+};
+
+export type DesktopNotificationInput = {
+  title: string;
+  body?: string;
+  href?: string;
+  silent?: boolean;
+};
+
+export type DesktopNotificationResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+export type DesktopIntegrationIssue =
+  | "appimage-path"
+  | "desktop-entry"
+  | "icon"
+  | "protocol-handler"
+  | "version";
+
+export type DesktopIntegrationStatus = {
+  supported: boolean;
+  state: "unsupported" | "not_integrated" | "integrated" | "needs_repair" | "managed_externally";
+  ownership: "none" | "openwork" | "external";
+  appImagePath: string | null;
+  desktopEntryPath: string | null;
+  handlerDesktopId: string | null;
+  issues: DesktopIntegrationIssue[];
+};
+
+export type DesktopIntegrationResult = {
+  ok: boolean;
+  status: DesktopIntegrationStatus;
+  error?: string;
 };
 
 export type OpenworkServerInfo = {
@@ -95,6 +131,10 @@ export type WorkspaceExportSummary = {
   excluded: string[];
 };
 
+export type BrandIconApplyResult = { ok: boolean; reason?: string };
+export type BrandIconState = { applied: boolean; sourceUrl: string | null; reason: string | null };
+export type EvalRelaunchResult = { ok: true };
+
 export type OpencodeCommandDraft = {
   name: string;
   description?: string;
@@ -127,45 +167,54 @@ export type AppBuildInfo = {
   arch?: string | null;
 };
 
+export type DesktopDistributionInfo = {
+  flavor: "public" | "enterprise";
+  appName: string;
+  appIdentifier: string;
+  protocolScheme: string;
+  requireSignin: boolean;
+  requireActivation: boolean;
+};
+
+/** Org + first-skill identity shared by the handoff and prepared records. */
+export type DesktopBootstrapOrgSkill = {
+  orgId: string;
+  orgName: string;
+  orgSlug: string;
+  skillId: string;
+  skillTitle: string;
+};
+
 export type DesktopBootstrapConfig = {
   baseUrl: string;
   apiBaseUrl?: string | null;
   requireSignin: boolean;
-};
-
-export type OrchestratorDetachedHost = {
-  openworkUrl: string;
-  token: string;
-  ownerToken?: string | null;
-  hostToken: string;
-  port: number;
-  /** "none" | "docker" | "microsandbox" today; kept open like WorkspaceWire. */
-  sandboxBackend?: string | null;
-  sandboxRunId?: string | null;
-  sandboxContainerName?: string | null;
-};
-
-export type SandboxDoctorResult = {
-  installed: boolean;
-  daemonRunning: boolean;
-  permissionOk: boolean;
-  ready: boolean;
-  clientVersion?: string | null;
-  serverVersion?: string | null;
-  error?: string | null;
-  debug?: {
-    candidates: string[];
-    selectedBin?: string | null;
-    versionCommand?: {
-      status: number;
-      stdout: string;
-      stderr: string;
-    } | null;
-    infoCommand?: {
-      status: number;
-      stdout: string;
-      stderr: string;
-    } | null;
+  requireActivation?: boolean;
+  brandAppName?: string | null;
+  brandLogoUrl?: string | null;
+  brandIconUrl?: string | null;
+  writtenAt?: string | null;
+  fromFile?: boolean;
+  claimLinks?: Array<{
+    id: string;
+    role: string;
+    token?: string;
+    url: string;
+    expiresAt: string;
+  }> | null;
+  handoff?: (DesktopBootstrapOrgSkill & {
+    grant: string;
+    denBaseUrl: string;
+    createdAt: string;
+  }) | null;
+  prepared?: (DesktopBootstrapOrgSkill & {
+    skillsDir: string;
+    skillPath: string;
+    preparedAt: string;
+  }) | null;
+  enterpriseActivation?: {
+    activatedAt: string;
+    denBaseUrl: string;
   } | null;
 };
 
@@ -173,38 +222,6 @@ export type OpenworkDockerCleanupResult = {
   candidates: string[];
   removed: string[];
   errors: string[];
-};
-
-export type SandboxDebugProbeResult = {
-  startedAt: number;
-  finishedAt: number;
-  runId: string;
-  workspacePath: string;
-  ready: boolean;
-  doctor: SandboxDoctorResult;
-  detachedHost?: OrchestratorDetachedHost | null;
-  dockerInspect?: {
-    status: number;
-    stdout: string;
-    stderr: string;
-  } | null;
-  dockerLogs?: {
-    status: number;
-    stdout: string;
-    stderr: string;
-  } | null;
-  cleanup: {
-    containerName?: string | null;
-    containerRemoved: boolean;
-    removeResult?: {
-      status: number;
-      stdout: string;
-      stderr: string;
-    } | null;
-    workspaceRemoved: boolean;
-    errors: string[];
-  };
-  error?: string | null;
 };
 
 export type ExecResult = {
@@ -245,11 +262,40 @@ export type CacheResetResult = {
   errors: string[];
 };
 
+export type NukeManifestPreview = {
+  deletePaths: string[];
+  bootstrapPath: string;
+  preserveBootstrapPath: string | null;
+  partitions: string[];
+};
+
+export type NukeOptions = {
+  preserveBootstrap: boolean;
+};
+
+export type NukeReceiptError = {
+  path: string;
+  message: string;
+  code?: string;
+};
+
+export type NukeReceipt = {
+  deleted: string[];
+  pendingRetry: string[];
+  errors: NukeReceiptError[];
+  preservedBootstrap: boolean;
+  relaunchMode: "cleanup_worker" | "direct";
+  workerScheduled: boolean;
+};
+
 export type DesktopFetchInit = {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
   timeoutMs?: number;
+  agentContextDiagnostics?: {
+    deadlineAtMs: number;
+  };
 };
 
 export type DesktopFetchResult = {
@@ -364,16 +410,19 @@ export type DesktopCommandMap = {
   engineInfo: { args: []; result: EngineInfo };
   engineDoctor: { args: [projectDir?: string]; result: EngineDoctorResult };
   engineInstall: { args: []; result: unknown };
-  orchestratorStatus: { args: []; result: unknown };
-  orchestratorWorkspaceActivate: { args: [input?: Record<string, unknown>]; result: unknown };
-  orchestratorInstanceDispose: { args: [instanceId: string]; result: unknown };
-  orchestratorStartDetached: {
-    args: [input?: Record<string, unknown>];
-    result: OrchestratorDetachedHost;
-  };
 
   // App / bridge info
   appBuildInfo: { args: []; result: AppBuildInfo };
+  desktopNotificationShow: {
+    args: [input: DesktopNotificationInput];
+    result: DesktopNotificationResult;
+  };
+  desktopIntegrationStatus: { args: []; result: DesktopIntegrationStatus };
+  desktopIntegrationInstall: {
+    args: [options?: { useExternalLauncher?: boolean }];
+    result: DesktopIntegrationResult;
+  };
+  desktopIntegrationRemove: { args: []; result: DesktopIntegrationResult };
   getUiControlBridgeInfo: { args: []; result: UiControlBridgeInfo | null };
   getOpenworkUiMcpCommand: { args: []; result: string[] };
   getComputerUseMcpCommand: { args: []; result: string[] };
@@ -388,17 +437,26 @@ export type DesktopCommandMap = {
   // Bootstrap config
   getDesktopBootstrapConfig: { args: []; result: DesktopBootstrapConfig };
   debugDesktopBootstrapConfig: { args: []; result: unknown };
+  clearDesktopBootstrapConfig: { args: []; result: unknown };
   setDesktopBootstrapConfig: {
     args: [config: Partial<DesktopBootstrapConfig>];
     result: DesktopBootstrapConfig;
   };
-  nukeOpenworkAndOpencodeConfigAndExit: { args: []; result: unknown };
+
+  // Connect links use a short-lived HTTPS exchange by default and can use an
+  // embedded-key signed token when explicitly enabled. The renderer relays
+  // only the raw URL. `connectLinkAccept` resolves it again after confirmation,
+  // enforces one-time use, and persists the target as desktop bootstrap config.
+  connectLinkVerify: { args: [rawUrl: string]; result: ConnectLinkVerifyResult };
+  connectLinkAccept: {
+    args: [rawUrl: string];
+    result: { ok: true; config: DesktopBootstrapConfig } | ConnectLinkVerifyFailure;
+  };
+  nukeOpenworkAndOpencodeConfigPreview: { args: [options?: NukeOptions]; result: NukeManifestPreview };
+  nukeOpenworkAndOpencodeConfigAndExit: { args: [options?: NukeOptions]; result: NukeReceipt };
 
   // Sandbox
-  sandboxDoctor: { args: []; result: SandboxDoctorResult };
-  sandboxStop: { args: [runId: string]; result: unknown };
   sandboxCleanupOpenworkContainers: { args: []; result: OpenworkDockerCleanupResult };
-  sandboxDebugProbe: { args: []; result: SandboxDebugProbeResult };
 
   // Openwork server sidecar
   openworkServerInfo: { args: []; result: OpenworkServerInfo };
@@ -467,6 +525,10 @@ export type DesktopCommandMap = {
   __openPath: { args: [target: string]; result: unknown };
   __revealItemInDir: { args: [target: string]; result: unknown };
   __getFileIcon: { args: [target: string, size?: "small" | "normal" | "large"]; result: string | null };
+  __applyBrandAppName: { args: [appName: string | null]; result: { ok: true; appName: string } };
+  __applyBrandIcon: { args: [url: string | null]; result: BrandIconApplyResult };
+  __getBrandIconState: { args: []; result: BrandIconState };
+  __evalRelaunch: { args: []; result: EvalRelaunchResult };
   __getApplicationsForFile: { args: [target: string]; result: { name: string; appPath: string; icon: string | null }[] };
   __openWithApp: { args: [target: string, appPath: string]; result: unknown };
   __fetch: { args: [url: string, init?: DesktopFetchInit]; result: DesktopFetchResult };
@@ -495,12 +557,16 @@ export type DesktopCommandResult<C extends DesktopCommandName> = DesktopCommandM
  * narrowing rewrites in the plain-JS main process for no runtime gain.
  * Key parity and result types are still enforced.
  */
+type DesktopCommandHandler<Event, C extends DesktopCommandName> = (
+  event: Event,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ...args: any[]
+) => Promise<DesktopCommandResult<C>>;
+
 export type DesktopCommandHandlers<Event = unknown> = {
-  [C in DesktopCommandName]: (
-    event: Event,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ...args: any[]
-  ) => Promise<DesktopCommandResult<C>>;
+  [C in Exclude<DesktopCommandName, "__evalRelaunch">]: DesktopCommandHandler<Event, C>;
+} & {
+  __evalRelaunch?: DesktopCommandHandler<Event, "__evalRelaunch">;
 };
 
 /** Renderer-side bridge: one async function per command. */

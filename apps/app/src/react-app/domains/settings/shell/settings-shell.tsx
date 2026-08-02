@@ -19,17 +19,20 @@ import {
 } from "@/components/ui/sidebar";
 import { t } from "../../../../i18n";
 import { NotificationBell } from "../../../shell/notification-center";
+import { usePlatform } from "../../../kernel/platform";
 import type { SettingsTab } from "../../../../app/types";
 import {
-  CLOUD_SETTINGS_TABS,
   SettingsPage,
+  SettingsBetaBadge,
   SettingsSidebar,
+  getCloudSettingsTabs,
   getGlobalSettingsTabs,
   getSettingsTabIcon,
   getSettingsTabLabel,
   getWorkspaceSettingsTabs,
+  isSettingsTabBeta,
 } from "./settings-page";
-import { WorkspaceIcon } from "../../../design-system/workspace-icon";
+import { useFeatureFlagsPreferences } from "../state/feature-flags-preferences";
 
 type SettingsPageFrameProps = Omit<React.ComponentProps<typeof SettingsPage>, "children">;
 
@@ -70,7 +73,6 @@ export function SettingsShell(props: SettingsShellProps) {
             />
           </div>
           <div className="flex shrink-0 items-center gap-1 mac:titlebar-no-drag">
-            <NotificationBell />
             <Button
               variant="ghost"
               type="button"
@@ -99,7 +101,7 @@ export function SettingsShell(props: SettingsShellProps) {
 
   return (
     <div className="flex h-dvh min-h-screen w-full overflow-hidden">
-      <SidebarProvider open={true} className="relative min-h-0 flex-1">
+      <SidebarProvider defaultOpen className="relative min-h-0 flex-1">
         <SettingsSidebar
           activeTab={props.activeTab}
           onSelectTab={props.onSelectTab}
@@ -117,7 +119,7 @@ export function SettingsShell(props: SettingsShellProps) {
               <div className="flex min-w-0 items-center gap-3">
                 <SidebarTrigger className="mac:titlebar-no-drag md:hidden" />
                 {props.headerLeadingSlot}
-                <h1 className="truncate text-[15px] font-semibold text-dls-text">{title}</h1>
+                <div className="truncate text-[15px] font-semibold text-dls-text">{title}</div>
                 <span className="hidden truncate text-[13px] text-dls-secondary lg:inline">
                   {props.selectedWorkspaceName}
                 </span>
@@ -162,11 +164,13 @@ export function SettingsShell(props: SettingsShellProps) {
 }
 
 function SettingsSectionMenu(props: Pick<SettingsPageFrameProps, "activeTab" | "developerMode" | "onSelectTab">) {
+  const platform = usePlatform();
+  const { memoryEnabled } = useFeatureFlagsPreferences();
   const sections: Array<{ label: string | null; tabs: SettingsTab[] }> = [
     { label: null, tabs: ["general"] },
     { label: t("settings.group_workspace"), tabs: getWorkspaceSettingsTabs() },
-    { label: t("settings.group_global"), tabs: getGlobalSettingsTabs(props.developerMode) },
-    { label: t("settings.group_cloud"), tabs: CLOUD_SETTINGS_TABS },
+    { label: t("settings.group_global"), tabs: getGlobalSettingsTabs(props.developerMode, platform.capabilities) },
+    { label: t("settings.group_cloud"), tabs: getCloudSettingsTabs(memoryEnabled) },
   ];
   const ActiveIcon = getSettingsTabIcon(props.activeTab);
 
@@ -177,6 +181,7 @@ function SettingsSectionMenu(props: Pick<SettingsPageFrameProps, "activeTab" | "
           <Button variant="outline" size="sm" className="min-w-0 max-w-46 justify-start gap-2">
             <ActiveIcon className="size-4 shrink-0" />
             <span className="truncate">{getSettingsTabLabel(props.activeTab)}</span>
+            {isSettingsTabBeta(props.activeTab) ? <SettingsBetaBadge /> : null}
             <ChevronDown className="ml-auto size-4 shrink-0" />
           </Button>
         )}
@@ -196,6 +201,7 @@ function SettingsSectionMenu(props: Pick<SettingsPageFrameProps, "activeTab" | "
                 >
                   <Icon />
                   <span>{getSettingsTabLabel(tab)}</span>
+                  {isSettingsTabBeta(tab) ? <SettingsBetaBadge className="ml-auto" /> : null}
                 </DropdownMenuItem>
               );
             })}
@@ -212,7 +218,6 @@ function WorkspaceMenu(props: Pick<SettingsShellProps, "selectedWorkspaceId" | "
       <DropdownMenuTrigger
         render={(
           <Button variant="ghost" size="sm" className="min-w-0 max-w-36 justify-start gap-2 text-dls-secondary">
-            <WorkspaceIcon workspaceId={props.selectedWorkspaceId} sizeClass="size-4" />
             <span className="truncate">{props.selectedWorkspaceName}</span>
             <ChevronDown className="ml-auto size-4 shrink-0" />
           </Button>
@@ -225,7 +230,6 @@ function WorkspaceMenu(props: Pick<SettingsShellProps, "selectedWorkspaceId" | "
             onClick={() => props.onSelectWorkspace(workspace.id)}
             disabled={workspace.id === props.selectedWorkspaceId}
           >
-            <WorkspaceIcon workspaceId={workspace.id} sizeClass="size-4" />
             <span className="truncate">{workspace.name}</span>
           </DropdownMenuItem>
         ))}

@@ -8,7 +8,7 @@ import {
 } from "../src/app/lib/den";
 
 describe("resolveDenBaseUrls", () => {
-  test("heals a stale bare web-app apiBaseUrl through the /api/den proxy", () => {
+  test("adds the API proxy path to an explicit API base URL", () => {
     const resolved = resolveDenBaseUrls({
       baseUrl: "https://app.openworklabs.com",
       apiBaseUrl: "https://app.openworklabs.com",
@@ -16,25 +16,28 @@ describe("resolveDenBaseUrls", () => {
     expect(resolved.apiBaseUrl).toBe("https://app.openworklabs.com/api/den");
   });
 
-  test("keeps an explicit API origin verbatim", () => {
+  test("keeps an explicit API origin independent from the web base URL", () => {
     const resolved = resolveDenBaseUrls({
       baseUrl: "https://app.openworklabs.com",
-      apiBaseUrl: "https://api.openworklabs.com",
+      apiBaseUrl: "https://api.example.com",
     });
-    expect(resolved.apiBaseUrl).toBe("https://api.openworklabs.com");
+    expect(resolved.baseUrl).toBe("https://app.openworklabs.com");
+    expect(resolved.apiBaseUrl).toBe("https://api.example.com/api/den");
   });
 
-  test("keeps an explicit loopback apiBaseUrl verbatim (dev den-api)", () => {
+  test("keeps an explicit loopback API URL when a base URL is present", () => {
     const resolved = resolveDenBaseUrls({
       baseUrl: "http://localhost:3000",
       apiBaseUrl: "http://127.0.0.1:8787",
     });
-    expect(resolved.apiBaseUrl).toBe("http://127.0.0.1:8787");
+    expect(resolved.baseUrl).toBe("http://localhost:3000");
+    expect(resolved.apiBaseUrl).toBe("http://127.0.0.1:8787/api/den");
   });
 
   test("derives the /api/den proxy from a web-app baseUrl when no apiBaseUrl is set", () => {
-    const resolved = resolveDenBaseUrls({ baseUrl: "https://app.openworklabs.com" });
-    expect(resolved.apiBaseUrl).toBe("https://app.openworklabs.com/api/den");
+    const resolved = resolveDenBaseUrls({ baseUrl: "https://den.self-hosted.example.com" });
+    expect(resolved.baseUrl).toBe("https://den.self-hosted.example.com");
+    expect(resolved.apiBaseUrl).toBe("https://den.self-hosted.example.com/api/den");
   });
 });
 
@@ -53,7 +56,6 @@ describe("isLegacyWebAppMcpUrl", () => {
   });
 
   test("accepts valid MCP URLs", () => {
-    expect(isLegacyWebAppMcpUrl("https://api.openworklabs.com/mcp")).toBe(false);
     expect(isLegacyWebAppMcpUrl("https://app.openworklabs.com/api/den/mcp")).toBe(false);
     expect(isLegacyWebAppMcpUrl("http://127.0.0.1:8787/mcp")).toBe(false);
   });
@@ -75,9 +77,6 @@ describe("resolveCloudMcpResourceUrl", () => {
   });
 
   test("keeps healthy resources verbatim", () => {
-    expect(resolveCloudMcpResourceUrl("https://api.openworklabs.com/mcp")).toBe(
-      "https://api.openworklabs.com/mcp",
-    );
     expect(resolveCloudMcpResourceUrl("https://app.openworklabs.com/api/den/mcp")).toBe(
       "https://app.openworklabs.com/api/den/mcp",
     );

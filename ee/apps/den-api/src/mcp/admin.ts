@@ -1,13 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StreamableHTTPTransport } from "@hono/mcp"
-import { eq } from "@openwork-ee/den-db/drizzle"
-import { AuthUserTable } from "@openwork-ee/den-db/schema"
-import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
-import { db } from "../db.js"
-import { isAdminEmailAllowed } from "../middleware/admin.js"
-import { tokenRoute } from "../middleware/index.js"
-import { getMcpResourceUrl, verifyMcpRequest } from "./auth.js"
+import { isPlatformAdminUserId } from "../middleware/admin.js"
+import { publicRoute, tokenRoute } from "../middleware/index.js"
+import { getMcpResourceContext, verifyMcpRequest } from "./auth.js"
+import { protectedResourceMetadata } from "./index.js"
+import { preflightMcpJsonRpcRequest } from "./json-rpc-preflight.js"
 import { DEN_ADMIN_MCP_VERSION, registerAdminMcpTools } from "./admin-tools.js"
 
 /**
@@ -24,32 +22,41 @@ import { DEN_ADMIN_MCP_VERSION, registerAdminMcpTools } from "./admin-tools.js"
  * /mcp exposure policy keeps blocking everything tagged Admin.
  */
 export function registerAdminMcpRoutes<T extends { Variables: Record<string, unknown> }>(app: Hono<T>) {
+  // OAuth protected-resource discovery for the admin endpoint. A spec-compliant
+  // MCP client connecting to `<origin>/mcp/admin` may self-construct the
+  // metadata URL (RFC 9728) instead of following the 401 WWW-Authenticate
+  // header — the SDK requests `/.well-known/oauth-protected-resource/mcp/admin`
+  // first. Serve the same metadata there so discovery resolves either way.
+  // The metadata still declares the route's parent resource for first-party
+  // desktop and legacy discovery. Public OAuth JWTs are scoped to /mcp/agent
+  // only, so this route relies on first-party opaque MCP tokens and still
+  // requires the platform-admin allowlist below.
+  app.get("/.well-known/oauth-protected-resource/mcp/admin", publicRoute, (c) =>
+    c.json(protectedResourceMetadata(c.req.raw, "admin")))
+  app.get("/mcp/admin/.well-known/oauth-protected-resource", publicRoute, (c) =>
+    c.json(protectedResourceMetadata(c.req.raw, "admin")))
+
   app.all("/mcp/admin", tokenRoute, async (c) => {
-    const principal = await verifyMcpRequest(c.req.raw.headers, getMcpResourceUrl(c.req.raw))
+    const requestIdValue = c.get("requestId")
+    const requestId = typeof requestIdValue === "string" ? requestIdValue : "unknown"
+    const principal = await verifyMcpRequest(
+      c.req.raw.headers,
+      getMcpResourceContext(c.req.raw, "admin", requestId),
+    )
     if (principal instanceof Response) {
       return principal
     }
 
-    let userId: ReturnType<typeof normalizeDenTypeId<"user">> | null = null
-    try {
-      userId = normalizeDenTypeId("user", principal.userId)
-    } catch {
-      userId = null
-    }
-
-    const user = userId
-      ? (await db
-          .select({ email: AuthUserTable.email })
-          .from(AuthUserTable)
-          .where(eq(AuthUserTable.id, userId))
-          .limit(1))[0]
-      : undefined
-
-    if (!user || !(await isAdminEmailAllowed(user.email))) {
+    if (!(await isPlatformAdminUserId(principal.userId))) {
       return c.json({
         error: "admin_required",
         message: "The den-admin MCP is restricted to allowlisted platform admins.",
       }, 403)
+    }
+
+    const preflightResponse = await preflightMcpJsonRpcRequest(c.req.raw, requestId)
+    if (preflightResponse) {
+      return preflightResponse
     }
 
     const server = new McpServer({

@@ -41,6 +41,19 @@ export class EmailSendError extends Error {
   }
 }
 
+function emailNotConfigured(input: {
+  template: EmailTemplate
+  recipient: string
+  detail: string
+}) {
+  return new EmailSendError({
+    template: input.template,
+    reason: "email_not_configured",
+    recipient: input.recipient,
+    detail: input.detail,
+  })
+}
+
 export type SendEmailInput<Template extends EmailTemplate = EmailTemplate> = {
   to: string
   template: Template
@@ -79,11 +92,11 @@ export async function sendEmail<Template extends EmailTemplate>(input: SendEmail
 }
 
 function getEmailProvider(config: EmailSendConfig): EmailProvider {
-  if (config.resendApiKey) {
-    return "resend"
-  }
-  if (config.smtp?.host) {
+  if (config.smtp?.host?.trim()) {
     return "nodemailer"
+  }
+  if (config.resendApiKey?.trim()) {
+    return "resend"
   }
   if (config.devMode) {
     return "dev"
@@ -103,7 +116,11 @@ async function sendViaResend(input: {
   const from = input.config.from
   const apiKey = input.config.resendApiKey
   if (!apiKey || !from) {
-    throw new EmailSendError({ template: input.template, reason: "email_not_configured", recipient: input.to })
+    throw emailNotConfigured({
+      template: input.template,
+      recipient: input.to,
+      detail: "Resend transactional email requires EMAIL_FROM and RESEND_API_KEY",
+    })
   }
 
   try {
@@ -146,7 +163,11 @@ async function sendViaNodemailer(input: {
   const from = input.config.from
   const smtp = input.config.smtp
   if (!from || !smtp?.host) {
-    throw new EmailSendError({ template: input.template, reason: "email_not_configured", recipient: input.to })
+    throw emailNotConfigured({
+      template: input.template,
+      recipient: input.to,
+      detail: "SMTP transactional email requires EMAIL_FROM and SMTP_HOST, or configure RESEND_API_KEY",
+    })
   }
 
   try {

@@ -47,6 +47,10 @@ For requests like `What did I say in the customer migration session?` or `Remind
 
 This may navigate OpenWork away from the user's current session while the lookup runs. If multiple sessions match, ask which one to inspect.
 
+### OpenWork agents
+
+Inside OpenWork, agents control the app through the semantic tools (`openwork_context`, `openwork_query`, `openwork_execute`) using affordance ids from context. External MCP clients can also use the hidden **OpenWork UI Control** MCP via **Settings -> Extensions -> Show hidden**.
+
 ## Install
 
 ```bash

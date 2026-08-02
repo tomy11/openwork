@@ -32,6 +32,41 @@ To maximize merge speed, include evidence of the end-to-end flow:
 
 If you cannot run tests or capture the video, say so explicitly and explain why, and include the exact commands/steps for the reviewer to reproduce.
 
+## Validate Every Experience
+
+Almost everything we change has an effect on the outside world — the
+filesystem, the runtime DB, server API responses, provisioning, sessions,
+or config. So the default is not "write code and hope"; it is **propose a
+flow, then drive it as the end user and validate it against reality until
+it actually holds.**
+
+A change is an *experience*: it might be a persistent feature, a single new
+button, or an entirely new screen. Every experience gets validated the same
+way — by producing **fraimz**, the frame-by-frame proof
+(`evals/results/<run-id>/fraimz.html`) where each frame binds a claim, the user
+action, an observable assertion, and a validated screenshot.
+
+The deliverable and the full loop (frame → coded flow → drive the real app via
+CDP → validate/repair → verdict) live in the **`fraimz` skill** — load it
+whenever a task asks you to "create a fraimz" / "prove it works", or whenever a
+change touches anything observable outside the process. Run it via the
+`/fraimz` command or `pnpm fraimz --flow <id>`.
+
+Report `Passed` only when `fraimz.html` exists and every claim is backed by an
+observable assertion; otherwise `Incomplete` / `Failed`, stated honestly with
+repro steps. Pure docs/comments and types-only changes with no runtime path may
+skip — but say so explicitly. For changes you expect to be inert, the `fraimz`
+skill's canonical core flow proves the core experience is unchanged.
+
+## Demo-Driven Development (the paved path)
+
+Feature work starts with the demo, not a PRD:
+
+1. `/voiceover <feature>` — align on the demo script; **no code until it is approved** (`voiceover` skill).
+2. Build on a fresh worktree/branch (`git worktree add ...`), never on the user's checkout.
+3. Prove it with fraimz until every frame holds (`fraimz` skill).
+4. Open a PR against `dev` and post the proof on it: `pnpm fraimz --flow <id> --pr`.
+
 ## Coding Guidelines
 
 ### TypeScript

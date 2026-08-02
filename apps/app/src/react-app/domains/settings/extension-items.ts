@@ -3,12 +3,30 @@ import type { CloudImportedPlugin, CloudImportedPluginFile } from "../../../app/
 import type { PendingCloudPluginChange } from "../../../app/cloud/desktop-cloud-sync";
 import { evaluateEnablement, type EnablementContext } from "../../../app/enablement";
 import type { EnablementResult } from "../../../app/extensions";
-import type { DenOrgMarketplaceResolved, DenOrgPlugin } from "../../../app/lib/den";
-import type { McpServerEntry } from "../../../app/types";
+import type {
+  DenExternalMcpConnection,
+  DenOrgMarketplaceResolved,
+  DenOrgPlugin,
+  DenPluginCloudReadiness,
+} from "../../../app/lib/den";
+import type { McpServerEntry, SkillCard } from "../../../app/types";
+import { connectionNeedsReconnect } from "../connections/native-provider-connections";
+import {
+  resolveConnectRowGroup,
+  resolveConnectionRowGroup,
+  type ConnectOrgRole,
+} from "./connect-cloud-readiness";
 
-export type ExtensionItemSource = "builtin" | "marketplace" | "mcp-directory" | "skill";
+export type ExtensionItemSource = "builtin" | "marketplace" | "org-connection" | "mcp-directory" | "skill";
 export type ExtensionInstallState = "available" | "installed" | "update_available";
 export type ExtensionSetupState = "ready" | "needs_setup" | "partial";
+export type ExtensionInventoryGroup = "needs_signin" | "needs_admin_setup" | "ready" | "available" | "disabled";
+
+export type ResolveExtensionInventoryGroupOptions = {
+  role?: ConnectOrgRole;
+  disabledReason?: string | null;
+  cloudReadiness?: DenPluginCloudReadiness | null;
+};
 
 export type ExtensionResourceItem = {
   id: string;
@@ -34,9 +52,40 @@ export type ExtensionItem = {
   importedPlugin?: CloudImportedPlugin;
   /** Installed cloud plugin that was removed from the organization marketplace. */
   removedUpstream?: boolean;
+  orgMcpConnection?: DenExternalMcpConnection;
   mcpEntry?: McpDirectoryInfo;
   skill?: { name: string; description?: string; path: string };
 };
+
+/**
+ * Map an inventory item into the unified Extensions readiness groups.
+ * Org/cloud readiness wins when present; otherwise fall back to install state.
+ */
+export function resolveExtensionInventoryGroup(
+  item: ExtensionItem,
+  opts: ResolveExtensionInventoryGroupOptions = {},
+): ExtensionInventoryGroup {
+  if (opts.disabledReason) return "disabled";
+
+  if (item.orgMcpConnection) {
+    return resolveConnectionRowGroup(item.orgMcpConnection);
+  }
+
+  const readiness = opts.cloudReadiness ?? item.plugin?.cloudReadiness;
+  if (item.source === "marketplace" || readiness) {
+    const group = resolveConnectRowGroup(
+      readiness,
+      opts.role,
+      item.plugin?.componentCounts ?? {},
+    );
+    if (group === "needs_signin" || group === "needs_admin_setup" || group === "ready") {
+      return group;
+    }
+  }
+
+  if (item.installState === "available") return "available";
+  return "ready";
+}
 
 export type ExtensionItemBuildInput = {
   quickConnect: McpDirectoryInfo[];
@@ -45,11 +94,23 @@ export type ExtensionItemBuildInput = {
   importedCloudPlugins: Record<string, CloudImportedPlugin>;
   pendingCloudPluginChanges?: Record<string, PendingCloudPluginChange>;
   cloudMarketplaces: DenOrgMarketplaceResolved[];
+  orgMcpConnections?: DenExternalMcpConnection[];
   enablementContext: EnablementContext;
   isBuiltInConnected: (entry: McpDirectoryInfo) => boolean;
 };
 
 const MCP_IMPORT_PATH_PREFIX = "opencode.jsonc#mcp.";
+const OPENWORK_PROVIDED_SKILL_NAMES = new Set([
+  "workspace-guide",
+  "skill-creator",
+]);
+
+export function isOpenworkProvidedSkill(skill: Pick<SkillCard, "name" | "path">) {
+  const normalizedName = skill.name.trim().toLowerCase();
+  const normalizedPath = skill.path.replace(/\\/g, "/").toLowerCase();
+  return normalizedPath.includes("/.opencode/skills/") &&
+    OPENWORK_PROVIDED_SKILL_NAMES.has(normalizedName);
+}
 
 export function isToggleControlledExtension(entry: McpDirectoryInfo) {
   return entry.extensionManifest?.enablement?.some((condition) => condition.type === "toggle-enabled") === true;
@@ -68,6 +129,32 @@ function cloudPluginStatus(imported: CloudImportedPlugin | null, plugin: DenOrgP
   return "installed";
 }
 
+export function isOrgMcpConnectionReady(connection: Pick<DenExternalMcpConnection, "credentialMode" | "connected" | "connectedForMe" | "needsReconnect" | "missingFeatures">) {
+  return connection.credentialMode === "shared" ? connection.connected : connection.connectedForMe && !connectionNeedsReconnect(connection);
+}
+
+export function orgMcpConnectionDescription(connection: Pick<DenExternalMcpConnection, "credentialMode" | "connectedForMe" | "needsReconnect" | "missingFeatures">) {
+  if (connection.credentialMode === "shared") return "One org account managed by your organization — the AI acts as it.";
+  if (connection.connectedForMe && connectionNeedsReconnect(connection)) return "Reconnect your account to grant newly requested permissions.";
+  if (connection.connectedForMe) return "Connected with your own account.";
+  return "Available from your organization. Connect your own account to use it.";
+}
+
+export function orgMcpConnectionActionLabel(connection: Pick<DenExternalMcpConnection, "credentialMode" | "connected" | "connectedForMe" | "needsReconnect" | "missingFeatures">) {
+  if (connection.credentialMode === "shared") return "Managed by your organization";
+  if (connection.connectedForMe && connectionNeedsReconnect(connection)) return "Reconnect";
+  if (connection.connectedForMe) return "Connected";
+  return "Connect your account";
+}
+
+export function isOrgMcpConnectionItem(item: ExtensionItem): item is ExtensionItem & { orgMcpConnection: DenExternalMcpConnection } {
+  return item.source === "org-connection" && Boolean(item.orgMcpConnection);
+}
+
+function orgConnectionCanRender(connection: DenExternalMcpConnection) {
+  return connection.credentialMode === "per_member" || connection.connected;
+}
+
 function resourceFromImportedFile(file: CloudImportedPluginFile): ExtensionResourceItem {
   return {
     id: file.configObjectId,
@@ -79,11 +166,15 @@ function resourceFromImportedFile(file: CloudImportedPluginFile): ExtensionResou
 
 function childKeysForPlugin(plugin: CloudImportedPlugin) {
   const mcpServerNames = new Set<string>();
+  const externalMcpConnectionIds = new Set<string>();
   const skillPaths = new Set<string>();
   const skillNames = new Set<string>();
   for (const file of plugin.files) {
     if (file.path.startsWith(MCP_IMPORT_PATH_PREFIX)) {
       mcpServerNames.add(file.path.slice(MCP_IMPORT_PATH_PREFIX.length));
+    }
+    if (file.externalMcpConnectionId) {
+      externalMcpConnectionIds.add(file.externalMcpConnectionId);
     }
     if (file.objectType === "skill") {
       skillPaths.add(file.path);
@@ -92,7 +183,7 @@ function childKeysForPlugin(plugin: CloudImportedPlugin) {
       skillNames.add(file.title);
     }
   }
-  return { mcpServerNames, skillPaths, skillNames };
+  return { externalMcpConnectionIds, mcpServerNames, skillPaths, skillNames };
 }
 
 export function buildExtensionItems(input: ExtensionItemBuildInput) {
@@ -126,14 +217,24 @@ export function buildExtensionItems(input: ExtensionItemBuildInput) {
     const enablement = manifest?.enablement ? evaluateEnablement(manifest.enablement, input.enablementContext) : null;
     const pendingChange = input.pendingCloudPluginChanges?.[plugin.id];
     const installState = imported && pendingChange === "modified" ? "update_available" : cloudPluginStatus(imported, plugin);
+    const externalConnectionIds = new Set(imported?.files.flatMap((file) => file.externalMcpConnectionId ? [file.externalMcpConnectionId] : []) ?? []);
+    const connectionStates = [...externalConnectionIds].flatMap((id) => {
+      const connection = input.orgMcpConnections?.find((entry) => entry.id === id);
+      return connection ? [isOrgMcpConnectionReady(connection)] : [false];
+    });
+    const connectionSetupState = connectionStates.length === 0
+      ? null
+      : connectionStates.every(Boolean)
+        ? "ready"
+        : "needs_setup";
     return {
       id: `marketplace:${marketplace.marketplace.id}:${plugin.id}`,
       source: "marketplace",
       name: plugin.extension?.name ?? plugin.name,
       description: plugin.extension?.description ?? plugin.description,
       installState,
-      setupState: enablement ? setupStateFromEnablement(enablement) : installState === "available" ? "needs_setup" : "ready",
-      active: enablement?.active ?? installState !== "available",
+      setupState: enablement ? setupStateFromEnablement(enablement) : installState === "available" ? "needs_setup" : connectionSetupState ?? "ready",
+      active: enablement?.active ?? (installState !== "available" && connectionSetupState !== "needs_setup"),
       enablement,
       resources: imported?.files.map(resourceFromImportedFile) ?? Object.entries(plugin.componentCounts).flatMap(([type, count]) => count > 0 ? [{
         id: `${plugin.id}:${type}`,
@@ -165,11 +266,30 @@ export function buildExtensionItems(input: ExtensionItemBuildInput) {
     }];
   });
 
+  const orgMcpConnectionItems = (input.orgMcpConnections ?? []).flatMap((connection): ExtensionItem[] => {
+    if (!orgConnectionCanRender(connection)) return [];
+    const ready = isOrgMcpConnectionReady(connection);
+    return [{
+      id: `org-mcp:${connection.id}`,
+      source: "org-connection",
+      name: connection.name,
+      description: orgMcpConnectionDescription(connection),
+      installState: ready ? "installed" : "available",
+      setupState: ready ? "ready" : "needs_setup",
+      active: ready,
+      enablement: null,
+      resources: [{ id: connection.id, type: "mcp", title: connection.name }],
+      orgMcpConnection: connection,
+    }];
+  });
+
   const groupedMcpServerNames = new Set<string>();
+  const groupedExternalMcpConnectionIds = new Set<string>();
   const groupedSkillPaths = new Set<string>();
   const groupedSkillNames = new Set<string>();
   for (const plugin of Object.values(input.importedCloudPlugins)) {
     const keys = childKeysForPlugin(plugin);
+    keys.externalMcpConnectionIds.forEach((value) => groupedExternalMcpConnectionIds.add(value));
     keys.mcpServerNames.forEach((value) => groupedMcpServerNames.add(value));
     keys.skillPaths.forEach((value) => groupedSkillPaths.add(value));
     keys.skillNames.forEach((value) => groupedSkillNames.add(value));
@@ -199,7 +319,11 @@ export function buildExtensionItems(input: ExtensionItemBuildInput) {
     skill,
   }));
 
+  const visibleOrgMcpConnectionItems = orgMcpConnectionItems.filter((item) =>
+    !item.orgMcpConnection || !groupedExternalMcpConnectionIds.has(item.orgMcpConnection.id));
+
   return {
+    // Org-managed MCP connections are beta, so keep them last in unified lists.
     items: [...builtInItems, ...cloudPluginItems, ...importedPluginItems, ...standaloneMcpEntries.map((entry): ExtensionItem => ({
       id: `mcp:${getMcpServerName(entry)}`,
       source: "mcp-directory",
@@ -211,27 +335,20 @@ export function buildExtensionItems(input: ExtensionItemBuildInput) {
       enablement: null,
       resources: [{ id: getMcpServerName(entry), type: "mcp", title: entry.name }],
       mcpEntry: entry,
-    })), ...standaloneSkillItems],
+    })), ...standaloneSkillItems, ...visibleOrgMcpConnectionItems],
     builtInItems,
     cloudPluginItems: [...cloudPluginItems, ...importedPluginItems],
+    orgMcpConnectionItems: visibleOrgMcpConnectionItems,
     installedMcpEntries: [
       ...builtInItems.flatMap((item) => item.active && item.builtInEntry ? [item.builtInEntry] : []),
       ...standaloneMcpEntries,
     ],
-    // The MCP quick-connect surface ("Available apps · One-click connect")
-    // needs unconfigured directory entries too — otherwise Notion, Linear,
-    // OpenWork Cloud Control, etc. are undiscoverable for anyone who is not
-    // signed in to cloud (regression from #2008, which narrowed the section
-    // to installed entries only).
+    // Extensions is an inventory, not a browse catalog: built-ins always show
+    // so they can be turned on, and everything else only shows once it is
+    // configured here. Third-party connections arrive through the organization.
     quickConnectEntries: [
-      ...builtInItems.flatMap((item) => item.active && item.builtInEntry ? [item.builtInEntry] : []),
+      ...builtInItems.flatMap((item) => item.builtInEntry ? [item.builtInEntry] : []),
       ...standaloneMcpEntries,
-      ...input.quickConnect.filter((entry) => {
-        if (isBuiltInOpenWorkExtension(entry)) return false;
-        const serverName = getMcpServerName(entry);
-        if (groupedMcpServerNames.has(serverName)) return false;
-        return !input.mcpServers.some((server) => server.name === serverName);
-      }),
     ],
     installedSkills: standaloneSkillItems.flatMap((item) => item.skill ? [item.skill] : []),
     installedCloudPlugins: Object.values(input.importedCloudPlugins),

@@ -7,11 +7,13 @@ import type { OpenworkServerClient } from "@/app/lib/openwork-server";
 import { getDesktopFileIcon, openDesktopPath, revealDesktopItemInDir } from "@/app/lib/desktop";
 import { isElectronRuntime } from "@/app/utils";
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatFileSize } from "@/lib/utils";
+import { usePlatform } from "@/react-app/kernel/platform";
 import { type ArtifactPanelTab, usePanelTabStore } from "../panel/panel-tab-store";
 import { isCollectibleArtifactTarget, type BinaryData, type Data, type OpenTarget, type TextData } from "./open-target";
-import { HTMLPreview, ImagePreview, MarkdownPreview, PlainText, PreviewError, PreviewLoading, PreviewUnavailable } from "./preview";
+import { HTMLPreview, ImagePreview, MarkdownPreview, PdfPreview, PlainText, PreviewError, PreviewLoading, PreviewUnavailable } from "./preview";
 
 const ArtifactTextEditor = lazy(() =>
   import("./artifact-text-editor").then((module) => ({ default: module.ArtifactTextEditor })),
@@ -21,6 +23,16 @@ const ArtifactSpreadsheetEditor = lazy(() =>
 );
 
 const EMPTY_TRANSCRIPT_TARGETS: OpenTarget[] = [];
+const MARKDOWN_PRIMITIVE_EVAL_ARTIFACT_PATH = "artifacts/markdown-primitive-proof.md";
+const MARKDOWN_PRIMITIVE_EVAL_ARTIFACT_NAME = "markdown-primitive-proof.md";
+
+function isMarkdownPrimitiveEvalArtifact(target: OpenTarget) {
+  return import.meta.env.DEV &&
+    target.kind === "file" &&
+    target.reason === "eval" &&
+    target.value === MARKDOWN_PRIMITIVE_EVAL_ARTIFACT_PATH &&
+    target.name === MARKDOWN_PRIMITIVE_EVAL_ARTIFACT_NAME;
+}
 
 type ArtifactPanelProps = {
   sessionId: string;
@@ -80,22 +92,24 @@ export function ArtifactPanel({ sessionId, tab, client, workspaceId, workspaceRo
 }
 
 function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspace = false, target, onClose }: ArtifactPanelViewProps) {
+  const platform = usePlatform();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
-  const isDirectTextEdit = isTextContent(target) && target.preview === "markdown";
+  const isDirectTextEdit = isTextContent(target) && target.preview === "markdown" && !isMarkdownPrimitiveEvalArtifact(target);
   const externalPath = useMemo(() => target.kind === "file" ? absoluteWorkspacePath(workspaceRoot, target.value) : target.value, [target.kind, target.value, workspaceRoot]);
+  const canUseDesktopFileActions = target.kind === "file" && !isRemoteWorkspace && platform.capabilities.revealInFileManager;
 
   const { data: fileIcon } = useQuery<string | null>({
     queryKey: ["desktop-file-icon", externalPath] as const,
     queryFn: async () => getDesktopFileIcon(externalPath, "small"),
-    enabled: target.kind === "file" && !isRemoteWorkspace && isElectronRuntime(),
+    enabled: canUseDesktopFileActions && isElectronRuntime(),
     staleTime: Infinity,
     gcTime: 5 * 60 * 1000,
   });
 
   const { data, error, isError, isLoading } = useQuery<ArtifactQueryState>({
-    queryKey: ["artifact-panel", workspaceId, target.id] as const,
+    queryKey: ["artifact-panel", workspaceId, target.id, target.updatedAt ?? null] as const,
     queryFn: async () => {
       if (target.kind === "url") {
         throw new Error("URLs open in browser tabs.");
@@ -106,7 +120,7 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
 
       if (isTextContent(target)) {
         const result = await client.readWorkspaceFile(workspaceId, target.value);
-        
+
         return { kind: "text", data: result.content, updatedAt: result.updatedAt ?? null };
       }
 
@@ -117,6 +131,7 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
+    gcTime: 0,
   });
 
   const [binaryObjectUrl, setBinaryObjectUrl] = useState<string | null>(null);
@@ -128,12 +143,13 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
       return;
     }
 
-    const url = URL.createObjectURL(new Blob([data.data], { type: data.contentType ?? "application/octet-stream" }));
+    const fallbackType = target.preview === "pdf" ? "application/pdf" : "application/octet-stream";
+    const url = URL.createObjectURL(new Blob([data.data], { type: data.contentType ?? fallbackType }));
 
     setBinaryObjectUrl(url);
 
     return () => URL.revokeObjectURL(url);
-  }, [data]);
+  }, [data, target.preview]);
 
   useEffect(() => {
     setEditing(false);
@@ -160,7 +176,7 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
     },
     onSuccess: (result, input) => {
       queryClient.setQueryData<ArtifactQueryState>(
-        ["artifact-panel", workspaceId, target.id] as const,
+        ["artifact-panel", workspaceId, target.id, target.updatedAt ?? null] as const,
         input.kind === "text"
           ? { kind: "text", data: input.data, updatedAt: result.updatedAt ?? null }
           : { kind: "binary", data: input.data, contentType: data?.kind === "binary" ? data.contentType : null, updatedAt: result.updatedAt ?? null },
@@ -195,7 +211,11 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
       return;
     }
     else if (!isRemoteWorkspace) {
-      void openDesktopPath(externalPath);
+      try {
+        await openDesktopPath(externalPath);
+      } catch (cause) {
+        toast.error(cause instanceof Error ? cause.message : "Could not open this file.");
+      }
 
       return;
     }
@@ -205,7 +225,11 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
 
   const revealExternal = async () => {
     if (target.kind !== "file" || isRemoteWorkspace) return;
-    await revealDesktopItemInDir(externalPath);
+    try {
+      await revealDesktopItemInDir(externalPath);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : "Could not show this file in your file manager.");
+    }
   };
 
   const save = () => {
@@ -242,13 +266,14 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
             {fileIcon ? (
               <img src={fileIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
             ) : null}
-            <h3 className="text-sm font-medium text-foreground">
-              <span className="truncate">{target.name}</span>
+            <h3 className="min-w-0 truncate text-sm font-medium text-foreground">
+              {target.name}
             </h3>
-            <span className="truncate text-xs text-muted-foreground">
+            <span className="shrink-0 text-xs text-muted-foreground">
               {target.exists === false ? "missing" : target.size !== undefined ? `${formatFileSize(target.size)}` : ""}
             </span>
           </div>
+          <div className="flex shrink-0 items-center gap-2">
           {isTextContent(target) && data?.kind === "text" ? (
             editing || isDirectTextEdit ? (
               <>
@@ -304,7 +329,7 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
               <TooltipContent>Download artifact</TooltipContent>
             </Tooltip>
           ) : null}
-          {target.kind === "file" && !isRemoteWorkspace ? (
+          {canUseDesktopFileActions ? (
             <Tooltip>
               <TooltipTrigger
                 render={(
@@ -316,16 +341,18 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
               <TooltipContent>Show in folder</TooltipContent>
             </Tooltip>
           ) : null}
-          <Tooltip>
-            <TooltipTrigger
-              render={(
-                <Button variant="ghost" size="icon-sm" onClick={() => void openExternal()} aria-label={isRemoteWorkspace ? "Download artifact" : "Open externally"}>
-                  <ExternalLink />
-                </Button>
-              )}
-            />
-            <TooltipContent>{isRemoteWorkspace ? "Download artifact" : "Open externally"}</TooltipContent>
-          </Tooltip>
+          {target.kind === "url" || isRemoteWorkspace || canUseDesktopFileActions ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={(
+                  <Button variant="ghost" size="icon-sm" onClick={() => void openExternal()} aria-label={isRemoteWorkspace ? "Download artifact" : "Open externally"}>
+                    <ExternalLink />
+                  </Button>
+                )}
+              />
+              <TooltipContent>{isRemoteWorkspace ? "Download artifact" : "Open externally"}</TooltipContent>
+            </Tooltip>
+          ) : null}
           <Tooltip>
             <TooltipTrigger
               render={(
@@ -336,6 +363,7 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
             />
             <TooltipContent>Close artifact</TooltipContent>
           </Tooltip>
+          </div>
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
@@ -358,7 +386,9 @@ function ArtifactPanelView({ client, workspaceId, workspaceRoot, isRemoteWorkspa
           <HTMLPreview type="text" title={target.name} content={data.data} />
         ) : target.preview === "image" && data?.kind === "binary" && binaryObjectUrl ? (
           <ImagePreview src={binaryObjectUrl} alt={target.name} />
-        ) : data?.kind === "binary" && binaryObjectUrl && (target.preview === "pdf" || target.preview === "html") ? (
+        ) : target.preview === "pdf" && data?.kind === "binary" && binaryObjectUrl ? (
+          <PdfPreview url={binaryObjectUrl} title={target.name} />
+        ) : data?.kind === "binary" && binaryObjectUrl && target.preview === "html" ? (
           <HTMLPreview type="binary" title={target.name} url={binaryObjectUrl} />
         ) : data?.kind === "text" ? (
           <PlainText content={data.data} />

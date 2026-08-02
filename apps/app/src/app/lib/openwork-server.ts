@@ -1,5 +1,17 @@
 import type { Message, Part, Session, Todo } from "@opencode-ai/sdk/v2/client";
-import { desktopFetch } from "./desktop";
+import {
+  agentContextDiagnosticsReportSchema,
+  agentContextDiagnosticsRequestSchema,
+  type AgentContextDiagnosticsReport,
+  type AgentContextDiagnosticsRequest,
+} from "@openwork/types/agent-context-diagnostics";
+import { normalizeBaseUrl } from "@openwork/types/url";
+import {
+  AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
+  requestAgentContextDiagnosticsPayload,
+} from "./agent-context-diagnostics-transport";
+import { desktopFetch, desktopFetchAgentContextDiagnostics } from "./desktop";
+import { isOpenworkGatewayRuntime } from "./gateway-runtime";
 import { isDesktopRuntime } from "./runtime-env";
 import type { ExecResult, OpencodeConfigFile, WorkspaceInfo, WorkspaceList } from "./desktop";
 import type { DenOrgMarketplace, DenOrgPluginResolved, DenResourceSnapshot } from "./den-types";
@@ -7,13 +19,6 @@ import type { CloudImportedMarketplace, CloudImportedPlugin } from "../cloud/imp
 
 export type OpenworkServerCapabilities = {
   skills: { read: boolean; write: boolean; source: "openwork" | "opencode" };
-  hub?: {
-    skills?: {
-      read: boolean;
-      install: boolean;
-      repo?: { owner: string; name: string; ref: string };
-    };
-  };
   plugins: { read: boolean; write: boolean };
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
@@ -67,10 +72,6 @@ export type OpenworkRuntimeServiceSnapshot = {
 
 export type OpenworkRuntimeSnapshot = {
   ok: boolean;
-  orchestrator?: {
-    version: string;
-    startedAt: number;
-  };
   worker?: {
     workspace: string;
     sandboxMode: string;
@@ -139,24 +140,6 @@ export type OpenworkSkillContent = {
   content: string;
 };
 
-export type OpenworkHubSkillItem = {
-  name: string;
-  description: string;
-  trigger?: string;
-  source: {
-    owner: string;
-    repo: string;
-    ref: string;
-    path: string;
-  };
-};
-
-export type OpenworkHubRepo = {
-  owner?: string;
-  repo?: string;
-  ref?: string;
-};
-
 export type OpenworkWorkspaceFileContent = {
   path: string;
   content: string;
@@ -199,10 +182,30 @@ export type OpenworkRuntimeConfigMigrationResult = {
   legacyError?: string | null;
 };
 
+export type OpenworkRuntimeDisabledProvidersResult = {
+  ok: true;
+  disabledProviders: string[];
+};
+
+export type OpenworkLegacyConfigSweepState = {
+  version: 1;
+  sweptAt: string;
+  files: Array<{
+    path: string;
+    removedKeys: string[];
+    backupPath: string | null;
+  }>;
+  error?: string;
+};
+
 export type OpenworkRuntimeConfigStatus = {
   runtime: Record<string, unknown>;
   runtimeKeys: string[];
   effectiveRuntime: Record<string, unknown>;
+  managedFilePath: string;
+  managedFileRebuiltAt: number | null;
+  managedFileContentRedacted: string | null;
+  sweep: OpenworkLegacyConfigSweepState | null;
   sources?: {
     projectOpencode: { path: string; exists: boolean; keys: string[]; config: Record<string, unknown> };
     globalOpencode: { path: string; exists: boolean; keys: string[]; config: Record<string, unknown> };
@@ -246,6 +249,7 @@ export type OpenworkDesktopCloudSyncResult = {
 
 export type OpenworkCloudPluginInstallResult = {
   item: CloudImportedPlugin;
+  warnings: string[];
 };
 
 export type OpenworkCloudPluginsResult = {
@@ -300,6 +304,282 @@ export type OpenworkMcpEngineSync = {
   status: "ok" | "failed";
   at: number;
   failures: Array<{ name: string; status?: number; message?: string }>;
+};
+
+export type OpenworkCloudMcpProviderModelContext = {
+  provider: string;
+  model: string;
+};
+
+export type OpenworkCloudMcpFailureStage =
+  | "prerequisites"
+  | "token_mint"
+  | "desired_config"
+  | "engine_delivery"
+  | "transport_auth"
+  | "tool_registration"
+  | "provider_projection"
+  | "plugin_load"
+  | "steering"
+  | "desired"
+  | "workspace"
+  | "configuration"
+  | "registration"
+  | "engine_status"
+  | "tool_ids"
+  | "plugin_canary";
+
+export type OpenworkCloudMcpFailureCode =
+  | "cloud_desired_missing"
+  | "cloud_mcp_missing"
+  | "cloud_mcp_disabled"
+  | "cloud_endpoint_invalid"
+  | "cloud_token_org_mismatch"
+  | "cloud_mcp_needs_auth"
+  | "invalid_mcp_token"
+  | "mcp_session_revoked"
+  | "mcp_membership_revoked"
+  | "insufficient_mcp_scope"
+  | "wrong_mcp_resource"
+  | "workspace_directory_ambiguous"
+  | "opencode_unconfigured"
+  | "opencode_engine_unreachable"
+  | "opencode_unreachable"
+  | "cloud_status_missing"
+  | "cloud_disabled"
+  | "openwork_cloud_auth_required"
+  | "openwork_cloud_auth_invalid"
+  | "openwork_cloud_token_expired"
+  | "openwork_cloud_membership_required"
+  | "openwork_cloud_scope_missing"
+  | "openwork_cloud_resource_forbidden"
+  | "openwork_cloud_resource_not_found"
+  | "openwork_cloud_client_registration_required"
+  | "cloud_connection_failed"
+  | "cloud_registration_failed"
+  | "cloud_tools_denied"
+  | "opencode_tool_ids_unsupported"
+  | "opencode_tool_ids_unavailable"
+  | "cloud_tools_missing"
+  | "provider_projection_unavailable"
+  | "provider_projection_missing"
+  | "extensions_plugin_missing"
+  | string;
+
+export type OpenworkCloudMcpFailure = {
+  code: OpenworkCloudMcpFailureCode;
+  stage: OpenworkCloudMcpFailureStage | string;
+  retryable: boolean;
+  recommendedAction: string;
+  message: string;
+  aliases?: string[];
+  requestId?: string;
+  referenceId?: string;
+  details?: unknown;
+};
+
+export type OpenworkCloudMcpCompatibility = {
+  openwork: {
+    serverVersion: string | null;
+    app: Record<string, string | number | boolean | null> | null;
+  };
+  opencode: {
+    expectedVersion: string | null;
+    actualVersion: string | null;
+    probe: "ok" | "unavailable" | "not_checked" | string;
+    error?: unknown;
+  };
+  pluginFileHashes: Array<{
+    name: string;
+    sha256: string | null;
+    error?: string;
+  }>;
+  supportedFeatures: {
+    dynamicMcp: boolean;
+    directoryScoping: boolean;
+    toolIds: boolean;
+    providerToolProjection: boolean;
+    pluginCanaries: boolean;
+  };
+  experimentalToolIds: {
+    checked: boolean;
+    expected: string[];
+    present: string[];
+    missing: string[];
+    includesMcpTools: boolean | null;
+    limitation?: string;
+    error?: unknown;
+  };
+  experimentalProviderTools: {
+    checked: boolean;
+    provider?: string;
+    model?: string;
+    expected: string[];
+    present: string[];
+    missing: string[];
+    includesMcpTools: boolean | null;
+    limitation?: string;
+    error?: unknown;
+  };
+};
+
+export type OpenworkCloudMcpHealthPhase =
+  | "missing_desired"
+  | "workspace_ambiguous"
+  | "engine_unconfigured"
+  | "engine_unreachable"
+  | "engine_missing"
+  | "engine_disabled"
+  | "engine_needs_auth"
+  | "engine_needs_client_registration"
+  | "engine_failed"
+  | "registration_failed"
+  | "denied_by_tools"
+  | "tool_ids_unsupported"
+  | "cloud_tools_missing"
+  | "provider_projection_missing"
+  | "extensions_plugin_missing"
+  | "ready"
+  | string;
+
+export type OpenworkCloudMcpDeliverySnapshot = {
+  state: "not_desired" | "pending" | "registering" | "ready" | "failed" | "stale" | string;
+  desiredRevision: string | null;
+  appliedRevision: string | null;
+  updatedAt: number | null;
+  appliedAt: number | null;
+  lastAttemptAt: number | null;
+  trigger?: string;
+  failure?: OpenworkCloudMcpFailure;
+};
+
+export type OpenworkCloudMcpProbeStep = {
+  step: "initialize" | "initialized_notice" | "tools_list" | string;
+  ok: boolean;
+  httpStatus?: number;
+  latencyMs: number;
+  error?: unknown;
+};
+
+export type OpenworkCloudMcpProbeTrace = {
+  endpoint: string | null;
+  startedAt: string;
+  latencyMs: number;
+  protocolVersion: string | null;
+  serverInfo: { name: string | null; version: string | null } | null;
+  steps: OpenworkCloudMcpProbeStep[];
+};
+
+export type OpenworkCloudMcpEngineRefreshStep = {
+  step: "engine_disconnect" | "reapply" | string;
+  ok: boolean;
+  latencyMs: number;
+  detail?: unknown;
+};
+
+export type OpenworkCloudMcpEngineRefresh = {
+  performed: boolean;
+  reason?: "desired_missing" | string;
+  trigger: string;
+  startedAt: string;
+  finishedAt: string;
+  steps: OpenworkCloudMcpEngineRefreshStep[];
+};
+
+export type OpenworkCloudMcpEngineRefreshResult = {
+  refresh: OpenworkCloudMcpEngineRefresh;
+  health: OpenworkCloudMcpHealth;
+};
+
+export type OpenworkCloudMcpHealth = {
+  schemaVersion: 1;
+  phase: OpenworkCloudMcpHealthPhase;
+  usable: boolean;
+  usableByCurrentModel: boolean | null;
+  connectCatalogEnabled: boolean;
+  workspace: {
+    id: string;
+    type: string;
+    directory: string | null;
+    path: string;
+  };
+  desired: {
+    present: boolean;
+    name: "openwork-cloud";
+    revision: string | null;
+    config: Record<string, unknown> | null;
+    token: {
+      present: boolean;
+      metadata: Record<string, string | number | boolean | null>;
+    };
+    org?: Record<string, string | number | boolean | null>;
+    app?: Record<string, string | number | boolean | null>;
+    updatedAt?: number;
+  };
+  delivery: OpenworkCloudMcpDeliverySnapshot;
+  engine: {
+    status: "not_checked" | "missing" | "connected" | "disabled" | "failed" | "needs_auth" | "needs_client_registration" | "unreachable" | "unknown" | string;
+    error?: unknown;
+  };
+  /** The engine's own view of every MCP server it tracks (older servers omit this). */
+  engineInspection?: {
+    checked: boolean;
+    cloudPresent?: boolean;
+    serverCount?: number;
+    servers?: Array<{ name: string; status: string; error?: string }>;
+  };
+  tools: {
+    expected: string[];
+    present: string[];
+    missing: string[];
+    direct: {
+      checked: boolean;
+      source: "mcp_tools_list" | string;
+      expected: string[];
+      present: string[];
+      missing: string[];
+      trace?: OpenworkCloudMcpProbeTrace;
+      error?: unknown;
+      failure?: OpenworkCloudMcpFailure;
+    };
+    providerProjection: {
+      checked: boolean;
+      provider?: string;
+      model?: string;
+      source?: "experimental_tool" | "provider_capability" | string;
+      limitation?: string;
+      modelExists?: boolean;
+      toolCalling?: boolean | null;
+      present: string[];
+      missing: string[];
+      error?: unknown;
+    };
+  };
+  pluginCanaries: {
+    expected: string[];
+    present: string[];
+    missing: string[];
+  };
+  compatibility: OpenworkCloudMcpCompatibility;
+  toolDenies: unknown[];
+  firstFailure: OpenworkCloudMcpFailure | null;
+  checkedAt: string;
+  durationMs?: number;
+};
+
+export type OpenworkCloudMcpReconcilePayload = {
+  workspaceId: string;
+  name: "openwork-cloud";
+  config: Record<string, unknown>;
+  tokenMetadata?: Record<string, string | number | boolean | null>;
+  org?: Record<string, string | number | boolean | null>;
+  app?: Record<string, string | number | boolean | null>;
+  appVersion?: string;
+  buildSha?: string;
+  connectCatalogEnabled?: boolean;
+  trigger?: string;
+  provider?: string;
+  model?: string;
 };
 
 export type OpenworkWorkspaceExport = {
@@ -361,48 +641,12 @@ export type OpenworkArtifactList = {
   items: OpenworkArtifactItem[];
 };
 
-export type GoogleWorkspaceAccount = {
-  accountId: string | null;
-  email: string | null;
-  name: string | null;
-  picture: string | null;
-  sub: string | null;
-  scopes?: string[];
-  connectedAt?: string | null;
-};
-
-export type GoogleWorkspaceAuthStatus = {
-  configured: boolean;
-  missing: string[];
-  customClient: boolean;
-  vault: "encrypted" | "plaintext-dev" | "unavailable";
-  connected: boolean;
-  account: GoogleWorkspaceAccount | null;
-  accounts: GoogleWorkspaceAccount[];
-  activeAccountId: string | null;
-  scopes: string[];
-  connectedAt: string | null;
-  error: string | null;
-  testStatus: string | null;
-  smokeTest: {
-    driveFileId: string | null;
-    driveFileName: string | null;
-    gmailDraftId: string | null;
-  } | null;
-};
-
-export type GoogleWorkspaceConnectStart = {
-  flowId: string;
-  authUrl: string;
-  expiresAt: number;
-};
-
-export type GoogleWorkspaceConnectStatus = {
-  flowId: string;
-  status: "pending" | "connected" | "failed" | "expired";
-  expiresAt: number;
-  error: string | null;
-  googleWorkspace: GoogleWorkspaceAuthStatus | null;
+export type OpenworkConnectState = {
+  ok: true;
+  schemaVersion: 1;
+  connectEnabled: boolean;
+  cloudMcpPresent: boolean;
+  googleWorkspace: { legacyConfigured: boolean };
 };
 
 export type OpenworkExtensionActionCall = {
@@ -412,13 +656,19 @@ export type OpenworkExtensionActionCall = {
   context?: Record<string, unknown>;
 };
 
-export type OpenworkExtensionActionResult = {
-  ok: boolean;
-  extensionId: string;
-  action: string;
-  result: unknown;
-  context?: Record<string, unknown>;
-};
+export type OpenworkExtensionActionResult =
+  | {
+    ok: true;
+    extensionId: string;
+    action: string;
+    result: unknown;
+    context?: Record<string, unknown>;
+  }
+  | {
+    ok: false;
+    error: string;
+    message: string;
+  };
 
 export type OpenworkResolvedArtifactTarget = {
   id: string;
@@ -531,11 +781,21 @@ const STORAGE_TOKEN = "openwork.server.token";
 const STORAGE_HOST_AUTH_KEY = "openwork.server.hostToken";
 const STORAGE_REMOTE_ACCESS = "openwork.server.remoteAccessEnabled";
 
+type OpenworkBootstrap = {
+  token?: string;
+};
+
+declare global {
+  interface Window {
+    __OPENWORK_BOOTSTRAP__?: OpenworkBootstrap;
+  }
+}
+
 export function normalizeOpenworkServerUrl(input: string) {
   const trimmed = input.trim();
   if (!trimmed) return null;
   const withProtocol = /^https?:\/\//.test(trimmed) ? trimmed : `http://${trimmed}`;
-  return withProtocol.replace(/\/+$/, "");
+  return normalizeBaseUrl(withProtocol);
 }
 
 export function isLoopbackOpenworkServerUrl(input: string) {
@@ -611,42 +871,6 @@ const OPENWORK_INVITE_PARAM_URL = "ow_url";
 const OPENWORK_INVITE_PARAM_TOKEN = "ow_token";
 const OPENWORK_INVITE_PARAM_STARTUP = "ow_startup";
 const OPENWORK_INVITE_PARAM_AUTO_CONNECT = "ow_auto_connect";
-
-export type OpenworkOpenCodeRouterHealthSnapshot = {
-  ok: boolean;
-  opencode: Record<string, unknown>;
-  channels: Record<string, unknown>;
-  config: Record<string, unknown>;
-  activity?: {
-    inboundToday?: number;
-    outboundToday?: number;
-    lastMessageAt?: number | null;
-    [key: string]: unknown;
-  };
-  agent?: {
-    loaded?: boolean;
-    selected?: string;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-};
-
-export type OpenworkOpenCodeRouterIdentityItem = {
-  id: string;
-  channel?: string;
-  enabled?: boolean;
-  peerId?: string;
-  [key: string]: unknown;
-};
-
-export type OpenworkOpenCodeRouterSendResult = {
-  ok: boolean;
-  sent: number;
-  attempted: number;
-  failures?: Array<{ identityId: string; peerId: string; error: string }>;
-  reason?: string;
-  [key: string]: unknown;
-};
 
 export type OpenworkConnectInvite = {
   url: string;
@@ -761,6 +985,7 @@ export function writeOpenworkServerSettings(next: OpenworkServerSettings): Openw
 
 export function hydrateOpenworkServerSettingsFromEnv() {
   if (typeof window === "undefined") return;
+  if (isOpenworkGatewayRuntime()) return;
 
   const envUrl = typeof import.meta.env?.VITE_OPENWORK_URL === "string"
     ? import.meta.env.VITE_OPENWORK_URL.trim()
@@ -774,8 +999,11 @@ export function hydrateOpenworkServerSettingsFromEnv() {
   const envHostToken = typeof import.meta.env?.VITE_OPENWORK_HOST_TOKEN === "string"
     ? import.meta.env.VITE_OPENWORK_HOST_TOKEN.trim()
     : "";
+  const bootstrapToken = typeof window.__OPENWORK_BOOTSTRAP__?.token === "string"
+    ? window.__OPENWORK_BOOTSTRAP__.token.trim()
+    : "";
 
-  if (!envUrl && !envPort && !envToken && !envHostToken) return;
+  if (!envUrl && !envPort && !envToken && !envHostToken && !bootstrapToken) return;
 
   try {
     const current = readOpenworkServerSettings();
@@ -795,7 +1023,10 @@ export function hydrateOpenworkServerSettingsFromEnv() {
       }
     }
 
-    if (!current.token && envToken) {
+    if (bootstrapToken && current.token !== bootstrapToken) {
+      next.token = bootstrapToken;
+      changed = true;
+    } else if (!current.token && envToken) {
       next.token = envToken;
       changed = true;
     }
@@ -889,6 +1120,7 @@ const resolveFetch = (url?: string) => {
 };
 
 const DEFAULT_OPENWORK_SERVER_TIMEOUT_MS = 10_000;
+const ENGINE_RELOAD_TIMEOUT_MS = 60_000;
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -959,6 +1191,47 @@ async function requestJson<T>(
   }
 
   return json as T;
+}
+
+async function requestAgentContextDiagnosticsJson(
+  baseUrl: string,
+  path: string,
+  options: {
+    token?: string;
+    hostToken?: string;
+    body: AgentContextDiagnosticsRequest;
+    timeoutMs: number;
+  },
+): Promise<unknown> {
+  const url = `${baseUrl}${path}`;
+  const result = await requestAgentContextDiagnosticsPayload({
+    url,
+    init: {
+      method: "POST",
+      headers: buildHeaders(options.token, options.hostToken),
+      body: JSON.stringify(options.body),
+    },
+    timeoutMs: options.timeoutMs,
+    fetchImpl: (input, init, deadlineAtMs) => isDesktopRuntime()
+      ? desktopFetchAgentContextDiagnostics(input, init, deadlineAtMs)
+      : globalThis.fetch(input, init),
+  });
+
+  if (!result.response.ok) {
+    const payload = result.payload;
+    const code = payload && typeof payload === "object" && "code" in payload && typeof payload.code === "string"
+      ? payload.code
+      : "request_failed";
+    const message = payload && typeof payload === "object" && "message" in payload && typeof payload.message === "string"
+      ? payload.message
+      : result.response.statusText;
+    const details = payload && typeof payload === "object" && "details" in payload
+      ? payload.details
+      : undefined;
+    throw new OpenworkServerError(result.response.status, code, message, details);
+  }
+
+  return result.payload;
 }
 
 async function requestMultipartRaw(
@@ -1035,7 +1308,11 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
     deleteSession: 12_000,
     sessionRead: 12_000,
     status: 6_000,
+    diagnostics: AGENT_CONTEXT_DIAGNOSTICS_REQUEST_TIMEOUT_MS,
     config: 10_000,
+    cloudMcpHealth: 12_000,
+    cloudMcpProbeHealth: 30_000,
+    cloudMcpReconcile: 60_000,
     workspaceExport: 30_000,
     workspaceImport: 30_000,
     binary: 60_000,
@@ -1050,13 +1327,7 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
       requestJson<OpenworkRuntimeSnapshot>(baseUrl, "/runtime/versions", { token, hostToken, timeoutMs: timeouts.status }),
     status: () => requestJson<OpenworkServerDiagnostics>(baseUrl, "/status", { token, hostToken, timeoutMs: timeouts.status }),
     capabilities: () => requestJson<OpenworkServerCapabilities>(baseUrl, "/capabilities", { token, hostToken, timeoutMs: timeouts.capabilities }),
-    googleWorkspaceStatus: () => requestJson<GoogleWorkspaceAuthStatus>(baseUrl, "/experimental/google-workspace/status", { token, hostToken, timeoutMs: timeouts.status }),
-    googleWorkspaceConnectStart: (options?: { gmailRead?: boolean; features?: string[] }) => requestJson<GoogleWorkspaceConnectStart>(baseUrl, "/experimental/google-workspace/connect/start", { token, hostToken, method: "POST", body: { gmailRead: options?.gmailRead === true, features: options?.features ?? [] }, timeoutMs: timeouts.status }),
-    googleWorkspaceConnectStatus: (flowId: string) => requestJson<GoogleWorkspaceConnectStatus>(baseUrl, `/experimental/google-workspace/connect/status/${encodeURIComponent(flowId)}`, { token, hostToken, timeoutMs: timeouts.status }),
-    googleWorkspaceDisconnect: (accountId?: string | null) => requestJson<GoogleWorkspaceAuthStatus>(baseUrl, "/experimental/google-workspace/disconnect", { token, hostToken, method: "POST", body: accountId ? { accountId } : {}, timeoutMs: timeouts.status }),
-    googleWorkspaceSetActiveAccount: (accountId: string) => requestJson<GoogleWorkspaceAuthStatus>(baseUrl, "/experimental/google-workspace/active-account", { token, hostToken, method: "POST", body: { accountId }, timeoutMs: timeouts.status }),
-    googleWorkspaceTestConnection: () => requestJson<GoogleWorkspaceAuthStatus>(baseUrl, "/experimental/google-workspace/test", { token, hostToken, method: "POST", timeoutMs: 60_000 }),
-    googleWorkspaceRunScopeSmokeTest: () => requestJson<GoogleWorkspaceAuthStatus>(baseUrl, "/experimental/google-workspace/smoke-test", { token, hostToken, method: "POST", timeoutMs: 120_000 }),
+    setConnectState: (connectEnabled: boolean) => requestJson<OpenworkConnectState>(baseUrl, "/experimental/connect/state", { token, hostToken, method: "PUT", body: { connectEnabled }, timeoutMs: timeouts.config }),
     callExtensionAction: (payload: OpenworkExtensionActionCall) =>
       requestJson<OpenworkExtensionActionResult>(baseUrl, "/experimental/extensions/call", {
         token,
@@ -1174,10 +1445,10 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${encodeURIComponent(workspaceId)}/session-groups/${encodeURIComponent(groupId)}`,
         { token, hostToken, method: "PATCH", body: { label }, timeoutMs: timeouts.config },
       ),
-    removeSessionGroup: (workspaceId: string, groupId: string) =>
+    removeSessionGroup: (workspaceId: string, groupId: string, destinationGroupId: string | null = null) =>
       requestJson<{ state: OpenworkSessionGroupState; updatedAt: number }>(
         baseUrl,
-        `/workspace/${encodeURIComponent(workspaceId)}/session-groups/${encodeURIComponent(groupId)}`,
+        `/workspace/${encodeURIComponent(workspaceId)}/session-groups/${encodeURIComponent(groupId)}${destinationGroupId ? `?destinationGroupId=${encodeURIComponent(destinationGroupId)}` : ""}`,
         { token, hostToken, method: "DELETE", timeoutMs: timeouts.config },
       ),
     listSessionGroupEvents: (workspaceId: string, options?: { since?: number }) => {
@@ -1295,6 +1566,18 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
           timeoutMs: timeouts.config,
         },
       ),
+    setRuntimeDisabledProviders: (workspaceId: string, providers: string[]) =>
+      requestJson<OpenworkRuntimeDisabledProvidersResult>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/runtime-config/disabled-providers`,
+        {
+          token,
+          hostToken,
+          method: "POST",
+          body: { providers },
+          timeoutMs: timeouts.config,
+        },
+      ),
     getRuntimeConfigStatus: (workspaceId: string) =>
       requestJson<OpenworkRuntimeConfigStatus>(
         baseUrl,
@@ -1386,6 +1669,7 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         token,
         hostToken,
         method: "POST",
+        timeoutMs: ENGINE_RELOAD_TIMEOUT_MS,
       }),
     listPlugins: (workspaceId: string, options?: { includeGlobal?: boolean }) => {
       const query = options?.includeGlobal ? "?includeGlobal=true" : "";
@@ -1415,38 +1699,6 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         { token, hostToken },
       );
     },
-    listHubSkills: (options?: { repo?: OpenworkHubRepo }) => {
-      const params = new URLSearchParams();
-      const owner = options?.repo?.owner?.trim();
-      const repo = options?.repo?.repo?.trim();
-      const ref = options?.repo?.ref?.trim();
-      if (owner) params.set("owner", owner);
-      if (repo) params.set("repo", repo);
-      if (ref) params.set("ref", ref);
-      const query = params.size ? `?${params.toString()}` : "";
-      return requestJson<{ items: OpenworkHubSkillItem[] }>(baseUrl, `/hub/skills${query}`, {
-        token,
-        hostToken,
-      });
-    },
-    installHubSkill: (
-      workspaceId: string,
-      name: string,
-      options?: { overwrite?: boolean; repo?: { owner?: string; repo?: string; ref?: string } },
-    ) =>
-      requestJson<{ ok: boolean; name: string; path: string; action: "added" | "updated"; written: number; skipped: number }>(
-        baseUrl,
-        `/workspace/${workspaceId}/skills/hub/${encodeURIComponent(name)}`,
-        {
-          token,
-          hostToken,
-          method: "POST",
-          body: {
-            ...(options?.overwrite ? { overwrite: true } : {}),
-            ...(options?.repo ? { repo: options.repo } : {}),
-          },
-        },
-      ),
     getSkill: (workspaceId: string, name: string, options?: { includeGlobal?: boolean }) => {
       const query = options?.includeGlobal ? "?includeGlobal=true" : "";
       return requestJson<OpenworkSkillContent>(
@@ -1478,6 +1730,70 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         `/workspace/${workspaceId}/mcp`,
         { token, hostToken },
       ),
+    getOpenworkCloudMcpHealth: (
+      workspaceId: string,
+      providerModel?: OpenworkCloudMcpProviderModelContext,
+      options?: { probe?: boolean },
+    ) => {
+      const query = new URLSearchParams();
+      if (providerModel?.provider.trim() && providerModel.model.trim()) {
+        query.set("provider", providerModel.provider.trim());
+        query.set("model", providerModel.model.trim());
+      }
+      // probe=1 verifies the Cloud endpoint directly from the OpenWork server
+      // (initialize + tools/list), independent of the engine's own connection.
+      if (options?.probe) query.set("probe", "1");
+      const suffix = query.size ? `?${query.toString()}` : "";
+      return requestJson<OpenworkCloudMcpHealth>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/mcp/openwork-cloud/health${suffix}`,
+        { token, hostToken, timeoutMs: options?.probe ? timeouts.cloudMcpProbeHealth : timeouts.cloudMcpHealth },
+      );
+    },
+    reconcileOpenworkCloudMcp: (workspaceId: string, payload: OpenworkCloudMcpReconcilePayload) =>
+      requestJson<OpenworkCloudMcpHealth>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/mcp/openwork-cloud/reconcile`,
+        {
+          token,
+          hostToken,
+          method: "POST",
+          body: payload,
+          timeoutMs: timeouts.cloudMcpReconcile,
+        },
+      ),
+    refreshOpenworkCloudMcpEngine: (
+      workspaceId: string,
+      payload?: { provider?: string; model?: string; trigger?: string },
+    ) =>
+      requestJson<OpenworkCloudMcpEngineRefreshResult>(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/mcp/openwork-cloud/engine-refresh`,
+        {
+          token,
+          hostToken,
+          method: "POST",
+          body: payload ?? {},
+          timeoutMs: timeouts.cloudMcpReconcile,
+        },
+      ),
+    runAgentContextDiagnostics: async (
+      workspaceId: string,
+      input: AgentContextDiagnosticsRequest,
+    ): Promise<AgentContextDiagnosticsReport> => {
+      const body = agentContextDiagnosticsRequestSchema.parse(input);
+      const payload = await requestAgentContextDiagnosticsJson(
+        baseUrl,
+        `/workspace/${encodeURIComponent(workspaceId)}/diagnostics/agent-context`,
+        {
+          token,
+          hostToken,
+          body,
+          timeoutMs: timeouts.diagnostics,
+        },
+      );
+      return agentContextDiagnosticsReportSchema.parse(payload);
+    },
     addMcp: (workspaceId: string, payload: { name: string; config: Record<string, unknown> }) =>
       requestJson<{ items: OpenworkMcpItem[] }>(baseUrl, `/workspace/${workspaceId}/mcp`, {
         token,

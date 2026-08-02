@@ -1,22 +1,31 @@
 import "./load-env.js"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { swaggerUI } from "@hono/swagger-ui"
+import { sql } from "@openwork-ee/den-db/drizzle"
 import { cors } from "hono/cors"
 import { Hono } from "hono"
-import { logger } from "hono/logger"
 import type { RequestIdVariables } from "hono/request-id"
 import { requestId } from "hono/request-id"
 import { describeRoute, openAPIRouteHandler, resolver } from "hono-openapi"
 import { z } from "zod"
+import { db } from "./db.js"
 import { env } from "./env.js"
 import { publicRoute } from "./middleware/index.js"
 import { registerAdminMcpRoutes } from "./mcp/admin.js"
+import { registerAgentMcpRoutes } from "./mcp/agent.js"
 import { registerMcpRoutes } from "./mcp/index.js"
 import type { MemberTeamsContext, OrganizationContextVariables, UserOrganizationsContext } from "./middleware/index.js"
 import { buildOperationId, emptyResponse, htmlResponse, jsonResponse } from "./openapi.js"
+import { appLogger } from "./observability/logger.js"
+import { createRequestAccessLogMiddleware, createTelemetryErrorSanitizerMiddleware, registerAppErrorHandler, registerObservabilityMiddleware } from "./observability/hono.js"
 import { registerAdminRoutes } from "./routes/admin/index.js"
 import { registerAuthRoutes } from "./routes/auth/index.js"
+import { registerBootstrapRoutes } from "./routes/bootstrap/index.js"
+import { registerCloudRoutes } from "./routes/cloud/index.js"
+import { registerDeprecatedSkillHubRoutes } from "./routes/deprecated-skill-hubs.js"
+import { registerDevRoutes } from "./routes/dev/index.js"
 import { registerMcpTokenRoutes } from "./routes/mcp/index.js"
+import { registerMemoryRoutes } from "./routes/memory/index.js"
 import { registerMeRoutes } from "./routes/me/index.js"
 import { registerOrgRoutes } from "./routes/org/index.js"
 import { registerTelemetryRoutes } from "./routes/telemetry/index.js"
@@ -25,13 +34,23 @@ import { registerWebhookRoutes } from "./routes/webhooks/index.js"
 import { registerWorkerRoutes } from "./routes/workers/index.js"
 import type { AuthContextVariables } from "./session.js"
 import { sessionMiddleware } from "./session.js"
+import { isOperationalErrorPath, normalizeOperationalErrorResponse, operationalErrorResponse } from "./operational-errors.js"
 
 type AppVariables = RequestIdVariables & AuthContextVariables & Partial<UserOrganizationsContext> & Partial<OrganizationContextVariables> & Partial<MemberTeamsContext>
 
 const healthResponseSchema = z.object({
   ok: z.literal(true),
   service: z.literal("den-api"),
+  version: z.string(),
 }).meta({ ref: "DenApiHealthResponse" })
+
+const readinessResponseSchema = z.object({
+  ok: z.boolean(),
+  service: z.literal("den-api"),
+  checks: z.object({
+    database: z.enum(["ok", "error"]),
+  }),
+}).meta({ ref: "DenApiReadinessResponse" })
 
 const openApiDocumentSchema = z.object({
   openapi: z.string(),
@@ -45,16 +64,7 @@ const openApiDocumentSchema = z.object({
 
 const app = new Hono<{ Variables: AppVariables }>()
 
-const requestLogger = logger()
-
-app.use("*", async (c, next) => {
-  if (c.req.path === "/health") {
-    await next()
-    return
-  }
-
-  return requestLogger(c, next)
-})
+registerObservabilityMiddleware(app)
 app.use("*", requestId({
   headerName: "",
   generator: () => createDenTypeId("request"),
@@ -63,6 +73,37 @@ app.use("*", async (c, next) => {
   await next()
   c.header("X-Request-Id", c.get("requestId"))
 })
+app.use("*", createTelemetryErrorSanitizerMiddleware())
+app.use("*", async (c, next) => {
+  await next()
+  c.res = await normalizeOperationalErrorResponse(c.req.path, c.res, c.get("requestId"))
+})
+app.use("*", createRequestAccessLogMiddleware())
+registerAppErrorHandler(app, (error, c, requestId) => {
+  if (!isOperationalErrorPath(c.req.path)) {
+    return undefined
+  }
+  return operationalErrorResponse(error, c, requestId)
+})
+
+// The handoff exchange is called from Cloud instance pages, whose Daytona
+// preview origins rotate on every re-sign and can never be statically
+// allowlisted. Reflecting the origin here is safe because this route is
+// authenticated solely by the one-time, 5-minute grant in the request body
+// and never consults cookies or sessions - a hostile page gains nothing
+// without a valid grant. Registered before the global CORS middleware so it
+// answers the preflight for exactly this path; every other route keeps the
+// strict allowlist below.
+app.use(
+  "/v1/auth/desktop-handoff/exchange",
+  cors({
+    origin: (origin) => origin,
+    credentials: true,
+    allowHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    allowMethods: ["POST", "OPTIONS"],
+    maxAge: 600,
+  }),
+)
 
 if (env.corsOrigins.length > 0) {
   app.use(
@@ -86,14 +127,18 @@ app.get(
     tags: ["System"],
     hide: true,
     summary: "Redirect API root",
-    description: "Redirects the API root to the OpenWork marketing site instead of serving API content.",
+    description: "Redirects the API root when DEN_MARKETING_URL is configured; otherwise returns a lightweight service payload.",
     responses: {
-      302: emptyResponse("Redirect to the OpenWork marketing site."),
+      200: jsonResponse("API root service payload.", healthResponseSchema),
+      302: emptyResponse("Redirect to the configured marketing site."),
     },
   }),
   publicRoute,
   (c) => {
-    return c.redirect("https://openworklabs.com", 302)
+    if (env.marketingUrl) {
+      return c.redirect(env.marketingUrl, 302)
+    }
+    return c.json({ ok: true, service: "den-api" })
   },
 )
 
@@ -116,19 +161,48 @@ app.get(
   }),
   publicRoute,
   (c) => {
-    return c.json({ ok: true, service: "den-api" })
+    return c.json({ ok: true, service: "den-api", version: env.serviceVersion })
+  },
+)
+
+app.get(
+  "/ready",
+  describeRoute({
+    tags: ["System"],
+    summary: "Check den-api readiness",
+    description: "Verifies den-api can reach its database dependency.",
+    responses: {
+      200: jsonResponse("den-api is ready to serve traffic.", readinessResponseSchema),
+      503: jsonResponse("den-api is not ready to serve traffic.", readinessResponseSchema),
+    },
+  }),
+  publicRoute,
+  async (c) => {
+    try {
+      await db.execute(sql`select 1`)
+      return c.json({ ok: true, service: "den-api", checks: { database: "ok" } })
+    } catch (error) {
+      appLogger.error("readiness database check failed", { component: "readiness", error })
+      return c.json({ ok: false, service: "den-api", checks: { database: "error" } }, 503)
+    }
   },
 )
 
 registerAdminRoutes(app)
 registerAuthRoutes(app)
+registerBootstrapRoutes(app)
+registerCloudRoutes(app)
+registerDeprecatedSkillHubRoutes(app)
+registerDevRoutes(app)
 registerMeRoutes(app)
+registerMemoryRoutes(app)
 registerOrgRoutes(app)
 registerVersionRoutes(app)
 registerWebhookRoutes(app)
 registerWorkerRoutes(app)
 registerMcpTokenRoutes(app)
 registerMcpRoutes(app)
+registerAgentMcpRoutes(app)
 registerAdminMcpRoutes(app)
 registerTelemetryRoutes(app)
 
@@ -160,9 +234,7 @@ app.get(
           "Swagger tip: use the security schemes in the Authorize dialog to set either `bearerAuth` or `denApiKey` before trying protected endpoints.",
         ].join("\n"),
       },
-      servers: [
-        { url: "https://api.openworklabs.com" },
-      ],
+      servers: env.apiPublicUrl ? [{ url: env.apiPublicUrl }] : [],
       tags: [
         { name: "System", description: "Service health and operational routes." },
         { name: "Organizations", description: "Top-level organization creation and context routes." },
@@ -175,14 +247,13 @@ app.get(
         { name: "Teams", description: "Organization team management routes." },
         { name: "Templates", description: "Organization shared template routes." },
         { name: "LLM Providers", description: "Organization LLM provider catalog, configuration, and access routes." },
-        { name: "Skills", description: "Organization skill authoring and sharing routes." },
-        { name: "Skill Hubs", description: "Organization skill hub management and access routes." },
         { name: "Workers", description: "Worker lifecycle, billing, and runtime routes." },
         { name: "Worker Runtime", description: "Worker runtime inspection and upgrade routes." },
         { name: "Worker Activity", description: "Worker heartbeat and activity reporting routes." },
         { name: "Telemetry", description: "Telemetry event ingestion and adoption analytics." },
         { name: "Admin", description: "Administrative reporting routes." },
         { name: "Users", description: "Current user and membership routes." },
+        { name: "Bootstrap", description: "Agent-first provisional workspace setup routes." },
       ],
       components: {
         securitySchemes: {

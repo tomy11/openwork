@@ -5,18 +5,19 @@ export function buildDenFeedbackUrl(options?: {
   orgSlug?: string | null;
   topic?: string;
 }) {
-  const url = new URL(OPENWORK_FEEDBACK_URL);
-  url.searchParams.set("source", "openwork-web-app");
-  url.searchParams.set("deployment", "web");
-  url.searchParams.set("entrypoint", options?.pathname ?? "dashboard");
+  const params = new URLSearchParams({
+    source: "openwork-web-app",
+    deployment: "web",
+    entrypoint: options?.pathname ?? "dashboard"
+  });
 
   if (options?.orgSlug) {
-    url.searchParams.set("org", options.orgSlug);
+    params.set("org", options.orgSlug);
   }
 
   if (options?.topic) {
-    url.searchParams.set("topic", options.topic);
+    params.set("topic", options.topic);
   }
 
-  return url.toString();
+  return `${OPENWORK_FEEDBACK_URL}?${params.toString()}`;
 }

@@ -16,12 +16,10 @@ From the connection drawer you can choose `Open in desktop`, `Open in web`, or c
 
 ## Open it from the desktop app
 
-You can open Cloud-hosted workspaces from either place:
-
-1. `Add workspace -> Shared workspaces`
-2. `Settings -> Cloud -> Cloud workers`
-
-Choose the right org, wait for the workspace to be `Ready`, then click `Connect` or `Open`.
+From the connection drawer, click `Connect` and copy the `Connection URL` plus
+`Owner token` / `Client token`. In the desktop app, choose `Add workspace ->
+Connect custom remote`, paste the connection URL and token, then click
+`Connect remote`.
 
 ## When to use this flow
 
@@ -32,4 +30,4 @@ Use a shared workspace when your team needs a hosted OpenWork runtime, a stable 
 - This area is currently marked `Alpha` in the Cloud dashboard.
 - A workspace must be `Ready` before the desktop app can open it.
 - OpenWork Cloud plan limits apply to hosted workspaces.
-- If you prefer to self-host, the desktop [Get Started](/start-here/get-started) guide still works with `openwork-orchestrator`.
+- If you prefer to self-host a runtime instead of using Cloud, run `openwork-server` and connect the desktop app to that server URL.

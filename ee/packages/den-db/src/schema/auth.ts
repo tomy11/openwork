@@ -16,7 +16,7 @@ export const AuthUserTable = mysqlTable(
       .notNull()
       .default(sql`CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)`),
   },
-  (table) => [uniqueIndex("user_email").on(table.email)],
+  (table) => [uniqueIndex("user_email").on(table.email), index("user_created_at_id").on(table.createdAt, table.id)],
 )
 
 export const AuthSessionTable = mysqlTable(
@@ -204,6 +204,7 @@ export const OAuthAccessTokenTable = mysqlTable(
     scopes: text("scopes").notNull(),
   },
   (table) => [
+    index("oauth_access_token_token").on(sql`${table.token}(191)`),
     index("oauth_access_token_client_id").on(table.clientId),
     index("oauth_access_token_session_id").on(table.sessionId),
     index("oauth_access_token_user_id").on(table.userId),
@@ -239,6 +240,7 @@ export const ScimProviderTable = mysqlTable(
     providerId: varchar("provider_id", { length: 255 }).notNull(),
     scimToken: encryptedTextColumn("scim_token").notNull(),
     organizationId: denTypeIdColumn("organization", "organization_id").notNull(),
+    groupMappingMode: varchar("group_mapping_mode", { length: 32 }).notNull().default("metadata_only"),
     createdAt: timestamp("created_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()

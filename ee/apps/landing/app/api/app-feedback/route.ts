@@ -8,8 +8,6 @@ type FeedbackContext = {
   appVersion?: string;
   openworkServerVersion?: string;
   opencodeVersion?: string;
-  orchestratorVersion?: string;
-  opencodeRouterVersion?: string;
   osName?: string;
   osVersion?: string;
   platform?: string;
@@ -21,6 +19,7 @@ type FeedbackPayload = {
   message?: string;
   website?: string;
   startedAt?: number | string;
+  mode?: string;
   context?: FeedbackContext;
 };
 
@@ -38,8 +37,6 @@ function sanitizeContext(input: FeedbackContext | undefined) {
     appVersion: sanitizeValue(input?.appVersion),
     openworkServerVersion: sanitizeValue(input?.openworkServerVersion),
     opencodeVersion: sanitizeValue(input?.opencodeVersion),
-    orchestratorVersion: sanitizeValue(input?.orchestratorVersion),
-    opencodeRouterVersion: sanitizeValue(input?.opencodeRouterVersion),
     osName: sanitizeValue(input?.osName),
     osVersion: sanitizeValue(input?.osVersion),
     platform: sanitizeValue(input?.platform),
@@ -55,8 +52,6 @@ function formatDiagnosticsSummary(context: ReturnType<typeof sanitizeContext>) {
     ["App version", context.appVersion],
     ["OpenWork server", context.openworkServerVersion],
     ["OpenCode", context.opencodeVersion],
-    ["Orchestrator", context.orchestratorVersion],
-    ["Router", context.opencodeRouterVersion],
     ["OS", osLabel],
     ["Platform", context.platform],
   ].filter(([, value]) => value);
@@ -113,6 +108,7 @@ export async function POST(request: Request) {
   const message = sanitizeValue(payload.message, 5000);
   const name = sanitizeValue(payload.name, 120);
   const email = sanitizeValue(payload.email, 240);
+  const mode = sanitizeValue(payload.mode, 40) === "contact" ? "contact" : "feedback";
 
   if (!name) {
     return jsonResponse(request,
@@ -143,14 +139,13 @@ export async function POST(request: Request) {
     name,
     email,
     message,
+    mode,
     source: context.source || "openwork-app",
     entrypoint: context.entrypoint || "unknown",
     deployment: context.deployment || "desktop",
     appVersion: context.appVersion || "unknown",
     openworkServerVersion: context.openworkServerVersion || "unknown",
     opencodeVersion: context.opencodeVersion || "unknown",
-    orchestratorVersion: context.orchestratorVersion || "unknown",
-    opencodeRouterVersion: context.opencodeRouterVersion || "unknown",
     osName: context.osName || "unknown",
     osVersion: context.osVersion || "",
     platform: context.platform || "unknown",

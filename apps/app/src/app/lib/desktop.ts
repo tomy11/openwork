@@ -11,24 +11,37 @@ export type {
   OpencodeCommandDraft,
   WorkspaceOpenworkConfig,
   AppBuildInfo,
+  DesktopDistributionInfo,
+  BrandIconApplyResult,
+  BrandIconState,
   DesktopBootstrapConfig,
-  OrchestratorDetachedHost,
-  SandboxDoctorResult,
+  EvalRelaunchResult,
   OpenworkDockerCleanupResult,
-  SandboxDebugProbeResult,
   ExecResult,
   LocalSkillCard,
   LocalSkillContent,
+  NukeManifestPreview,
+  NukeOptions,
+  NukeReceipt,
+  NukeReceiptError,
   OpencodeConfigFile,
   UpdaterEnvironment,
   CacheResetResult,
 } from "./desktop-types";
 
 import type {
+  BrandIconApplyResult,
+  BrandIconState,
+  DesktopBootstrapConfig,
+  DesktopDistributionInfo,
   DesktopCommandArgs,
   DesktopCommandInvokers,
   DesktopCommandName,
   DesktopCommandResult,
+  EvalRelaunchResult,
+  NukeManifestPreview,
+  NukeOptions,
+  NukeReceipt,
   WorkspaceList,
 } from "./desktop-types";
 import type { BrowserPanelTab } from "./desktop-types";
@@ -54,7 +67,7 @@ declare global {
         ...args: DesktopCommandArgs<C>
       ) => Promise<DesktopCommandResult<C>>;
       shell?: {
-        openExternal?: (url: string) => Promise<void>;
+        openExternal?: (url: string) => Promise<{ ok: boolean; error?: string } | void>;
         relaunch?: () => Promise<void>;
       };
       system?: {
@@ -85,6 +98,17 @@ declare global {
         readSnapshot?: () => Promise<unknown>;
         ackSnapshot?: () => Promise<{ ok: boolean; moved: boolean }>;
       };
+      brandIcon?: {
+        apply?: (url: string | null) => Promise<BrandIconApplyResult>;
+        getState?: () => Promise<BrandIconState>;
+      };
+      dev?: {
+        evalRelaunch?: () => Promise<EvalRelaunchResult>;
+      };
+      nuke?: {
+        preview?: (options?: NukeOptions) => Promise<NukeManifestPreview>;
+        execute?: (options?: NukeOptions) => Promise<NukeReceipt>;
+      };
       updater?: {
         getChannel?: () => Promise<{
           channel: "stable" | "alpha";
@@ -96,7 +120,7 @@ declare global {
           feedUrl: string;
           currentVersion: string;
         }>;
-        check?: (channel?: "stable" | "alpha") => Promise<{
+        check?: (channel?: "stable" | "alpha", targetVersion?: string) => Promise<{
           available: boolean;
           currentVersion?: string;
           latestVersion?: string | null;
@@ -148,6 +172,8 @@ declare global {
         onExit?: (callback: (payload: { terminalId: string; exitCode: number | null; signal?: number }) => void) => () => void;
       };
       meta?: {
+        desktopBootstrap?: DesktopBootstrapConfig | null;
+        distribution?: DesktopDistributionInfo;
         initialDeepLinks?: string[];
         platform?: "darwin" | "linux" | "windows";
         version?: string;
@@ -231,7 +257,11 @@ export const desktopBridge = new Proxy(electronBridge, {
 }) as unknown as DesktopBridge;
 
 // ---------------------------------------------------------------------------
-// desktopFetch — proxies non-loopback requests through Electron main process
+// desktopFetch — proxies non-loopback requests through the Electron main
+// process. Loopback hosts (the local opencode/openwork server) use the
+// renderer's own fetch, which works against same-machine services. Cross-origin
+// requests that need CORS headers the target does not send (e.g. the Den API on
+// a different control plane) should instead use `desktopFetchViaMain` directly.
 // ---------------------------------------------------------------------------
 
 function isLoopbackUrl(input: RequestInfo | URL): boolean {
@@ -244,11 +274,16 @@ function isLoopbackUrl(input: RequestInfo | URL): boolean {
   }
 }
 
-export const desktopFetch: typeof globalThis.fetch = async (input, init) => {
-  if (isLoopbackUrl(input)) {
-    return globalThis.fetch(input, init);
-  }
+type DesktopFetchMainOptions = {
+  timeoutMs?: number;
+  agentContextDiagnosticsDeadlineAtMs?: number;
+};
 
+async function desktopFetchThroughMain(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  options: DesktopFetchMainOptions = {},
+): Promise<Response> {
   // Extract method/headers/body from either a Request object or the (input, init)
   // pair. The OpenCode SDK calls fetch(request) (no init), so reading these only
   // from `init` would silently drop the Authorization header and the POST body
@@ -277,7 +312,16 @@ export const desktopFetch: typeof globalThis.fetch = async (input, init) => {
     body = typeof init?.body === "string" ? init.body : undefined;
   }
 
-  const result = await invokeElectronHelper("__fetch", url, { method, headers, body });
+  const diagnosticsDeadlineAtMs = options.agentContextDiagnosticsDeadlineAtMs;
+  const result = await invokeElectronHelper("__fetch", url, {
+    method,
+    headers,
+    body,
+    timeoutMs: options.timeoutMs,
+    agentContextDiagnostics: diagnosticsDeadlineAtMs === undefined
+      ? undefined
+      : { deadlineAtMs: diagnosticsDeadlineAtMs },
+  });
 
   // Response constructor rejects bodies for null-body status codes, so we
   // must pass null instead of an empty string for those.
@@ -289,40 +333,29 @@ export const desktopFetch: typeof globalThis.fetch = async (input, init) => {
     statusText: result.statusText,
     headers: result.headers,
   });
+}
+
+export const desktopFetch: typeof globalThis.fetch = async (input, init) => {
+  if (isLoopbackUrl(input)) {
+    return globalThis.fetch(input, init);
+  }
+  return desktopFetchThroughMain(input, init);
 };
 
 export async function desktopFetchViaMain(input: RequestInfo | URL, init?: RequestInit, timeoutMs?: number): Promise<Response> {
-  let url: string;
-  let method: string | undefined;
-  let headers: Record<string, string> | undefined;
-  let body: string | undefined;
+  return desktopFetchThroughMain(input, init, { timeoutMs });
+}
 
-  if (typeof Request !== "undefined" && input instanceof Request) {
-    url = input.url;
-    method = init?.method ?? input.method;
-    const headersSource = init?.headers ? new Headers(init.headers) : input.headers;
-    headers = Object.fromEntries(headersSource.entries());
-    if (typeof init?.body === "string") {
-      body = init.body;
-    } else if (input.body) {
-      body = await input.clone().text();
-    }
-  } else {
-    url = typeof input === "string" ? input : input.toString();
-    method = init?.method;
-    headers = init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : undefined;
-    body = typeof init?.body === "string" ? init.body : undefined;
+export async function desktopFetchAgentContextDiagnostics(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  deadlineAtMs: number,
+): Promise<Response> {
+  if (isLoopbackUrl(input)) {
+    return globalThis.fetch(input, init);
   }
-
-  const result = await invokeElectronHelper("__fetch", url, { method, headers, body, timeoutMs });
-
-  const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
-  const responseBody = NULL_BODY_STATUSES.has(result.status) ? null : result.body;
-
-  return new Response(responseBody, {
-    status: result.status,
-    statusText: result.statusText,
-    headers: result.headers,
+  return desktopFetchThroughMain(input, init, {
+    agentContextDiagnosticsDeadlineAtMs: deadlineAtMs,
   });
 }
 
@@ -333,7 +366,10 @@ export async function desktopFetchViaMain(input: RequestInfo | URL, init?: Reque
 export async function openDesktopUrl(url: string): Promise<void> {
   const openExternal = window.__OPENWORK_ELECTRON__?.shell?.openExternal;
   if (openExternal) {
-    await openExternal(url);
+    const result = await openExternal(url);
+    if (result && result.ok === false) {
+      throw new Error(result.error ?? "Failed to open browser");
+    }
     return;
   }
   if (typeof window !== "undefined") {
@@ -349,11 +385,38 @@ export async function openDesktopPath(target: string): Promise<void> {
 }
 
 export async function revealDesktopItemInDir(target: string): Promise<void> {
-  await invokeElectronHelper("__revealItemInDir", target);
+  const result = await invokeElectronHelper("__revealItemInDir", target);
+  if (typeof result === "string" && result.trim()) {
+    throw new Error(result);
+  }
 }
 
 export async function getDesktopFileIcon(target: string, size?: "small" | "normal" | "large"): Promise<string | null> {
   return invokeElectronHelper("__getFileIcon", target, size);
+}
+
+export async function applyBrandAppName(appName: string | null): Promise<string> {
+  const result = await invokeElectronHelper("__applyBrandAppName", appName);
+  return result.appName;
+}
+
+export async function applyBrandIcon(url: string | null): Promise<BrandIconApplyResult> {
+  const apply = typeof window !== "undefined" ? window.__OPENWORK_ELECTRON__?.brandIcon?.apply : undefined;
+  if (!apply) return { ok: false, reason: "bridge-unavailable" };
+  return apply(url);
+}
+
+export async function getBrandIconState(): Promise<BrandIconState | null> {
+  const getState = typeof window !== "undefined" ? window.__OPENWORK_ELECTRON__?.brandIcon?.getState : undefined;
+  return getState ? getState() : null;
+}
+
+export async function evalRelaunchDesktopApp(): Promise<EvalRelaunchResult> {
+  const relaunch = typeof window !== "undefined" ? window.__OPENWORK_ELECTRON__?.dev?.evalRelaunch : undefined;
+  if (!relaunch) {
+    throw new Error("Electron eval relaunch helper is unavailable.");
+  }
+  return relaunch();
 }
 
 export type DesktopApplication = {
@@ -408,6 +471,25 @@ export async function subscribeDesktopDeepLinks(
   };
 }
 
+export function readInitialDesktopBootstrapConfig(): DesktopBootstrapConfig | null | undefined {
+  if (typeof window === "undefined") return undefined;
+  return window.__OPENWORK_ELECTRON__?.meta?.desktopBootstrap;
+}
+
+export function readDesktopDistributionInfo(): DesktopDistributionInfo {
+  const distribution = typeof window === "undefined"
+    ? undefined
+    : window.__OPENWORK_ELECTRON__?.meta?.distribution;
+  return distribution ?? {
+    flavor: "public",
+    appName: "OpenWork",
+    appIdentifier: "com.differentai.openwork",
+    protocolScheme: "openwork",
+    requireSignin: false,
+    requireActivation: false,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Re-export bridge methods as named functions (preserves existing import API)
 // ---------------------------------------------------------------------------
@@ -434,13 +516,14 @@ const {
   engineRestart,
   appBuildInfo,
   getDesktopBootstrapConfig,
+  debugDesktopBootstrapConfig,
+  clearDesktopBootstrapConfig,
   setDesktopBootstrapConfig,
+  connectLinkVerify,
+  connectLinkAccept,
+  nukeOpenworkAndOpencodeConfigPreview,
   nukeOpenworkAndOpencodeConfigAndExit,
-  orchestratorStartDetached,
-  sandboxDoctor,
-  sandboxStop,
   sandboxCleanupOpenworkContainers,
-  sandboxDebugProbe,
   openworkServerInfo,
   openworkServerRestart,
   runtimeBootstrap,
@@ -450,6 +533,7 @@ const {
   pickFile,
   saveFile,
   engineInstall,
+  desktopNotificationShow,
   importSkill,
   installSkillTemplate,
   listLocalSkills,
@@ -487,13 +571,14 @@ export {
   engineRestart,
   appBuildInfo,
   getDesktopBootstrapConfig,
+  debugDesktopBootstrapConfig,
+  clearDesktopBootstrapConfig,
   setDesktopBootstrapConfig,
+  connectLinkVerify,
+  connectLinkAccept,
+  nukeOpenworkAndOpencodeConfigPreview,
   nukeOpenworkAndOpencodeConfigAndExit,
-  orchestratorStartDetached,
-  sandboxDoctor,
-  sandboxStop,
   sandboxCleanupOpenworkContainers,
-  sandboxDebugProbe,
   openworkServerInfo,
   openworkServerRestart,
   runtimeBootstrap,
@@ -503,6 +588,7 @@ export {
   pickFile,
   saveFile,
   engineInstall,
+  desktopNotificationShow,
   importSkill,
   installSkillTemplate,
   listLocalSkills,

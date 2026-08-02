@@ -8,10 +8,10 @@ import {
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import {
   desktopPolicyDefinitions,
-  desktopPolicyValueSchema,
-  normalizeDefaultDesktopPolicyValue,
-  normalizeDesktopPolicyValue,
-  type DesktopPolicyValue,
+  desktopPolicyDocumentWriteSchema,
+  normalizeDefaultDesktopPolicyDocument,
+  normalizeDesktopPolicyDocument,
+  resolveDesktopPolicyDocumentWrite,
 } from "@openwork/types/den/desktop-policies"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
@@ -21,20 +21,24 @@ import { checkEntitlement } from "../../entitlements.js"
 import { jsonValidator, orgRoleRoute, paramValidator } from "../../middleware/index.js"
 import { denTypeIdSchema, emptyResponse, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { ensureOrganizationAdmin, idParamSchema, orgAccessFailureStatus } from "./shared.js"
+import { ensureOrganizationSuperAdmin, idParamSchema, orgAccessFailureStatus } from "./shared.js"
 
 type DesktopPolicyId = typeof DesktopPolicyTable.$inferSelect.id
 type MemberId = typeof MemberTable.$inferSelect.id
 type TeamId = typeof TeamTable.$inferSelect.id
 
 const desktopPolicyParamsSchema = idParamSchema("desktopPolicyId", "desktopPolicy")
+const desktopPolicyAssignmentRoleSchema = z.enum(["owner", "admin", "member"])
+type DesktopPolicyAssignmentRole = z.infer<typeof desktopPolicyAssignmentRoleSchema>
 
 const desktopPolicyWriteSchema = z.object({
   policyName: z.string().trim().min(1).max(255),
-  policy: desktopPolicyValueSchema,
+  policy: desktopPolicyDocumentWriteSchema,
+  priority: z.number().int().min(0).max(1_000_000).optional(),
   isEnabled: z.boolean().optional(),
   memberIds: z.array(denTypeIdSchema("member")).max(500).optional().default([]),
   teamIds: z.array(denTypeIdSchema("team")).max(500).optional().default([]),
+  roles: z.array(desktopPolicyAssignmentRoleSchema).max(10).optional().default([]),
 })
 
 const desktopPolicyListResponseSchema = z.object({
@@ -56,6 +60,15 @@ function parseMemberId(value: string) {
 
 function parseTeamId(value: string) {
   return normalizeDenTypeId("team", value)
+}
+
+function normalizeAssignmentRole(value: string | null): DesktopPolicyAssignmentRole | null {
+  if (value === "owner" || value === "admin" || value === "member") return value
+  return null
+}
+
+function resolveRoles(values: DesktopPolicyAssignmentRole[]) {
+  return [...new Set(values)]
 }
 
 async function resolveMemberIds(input: {
@@ -112,33 +125,42 @@ async function loadDesktopPolicies(organizationId: typeof DesktopPolicyTable.$in
       desktopPolicyId: DesktopPolicyMemberTable.desktopPolicyId,
       orgMemberId: DesktopPolicyMemberTable.orgMemberId,
       teamId: DesktopPolicyMemberTable.teamId,
+      role: DesktopPolicyMemberTable.role,
       createdAt: DesktopPolicyMemberTable.createdAt,
     })
     .from(DesktopPolicyMemberTable)
     .where(inArray(DesktopPolicyMemberTable.desktopPolicyId, policyIds))
 
-  return policies.map((policy) => ({
-    id: policy.id,
-    organizationId: policy.organizationId,
-    policyName: policy.policyName,
-    isDefault: policy.isDefault === true,
-    isEnabled: policy.isEnabled === true,
-    policy: policy.isDefault === true
-      ? normalizeDefaultDesktopPolicyValue(policy.policy)
-      : normalizeDesktopPolicyValue(policy.policy),
-    createdByOrgMemberId: policy.createdByOrgMemberId,
-    createdAt: policy.createdAt,
-    updatedAt: policy.updatedAt,
-    deletedAt: policy.deletedAt,
-    assignments: assignments
-      .filter((assignment) => assignment.desktopPolicyId === policy.id)
-      .map((assignment) => ({
-        id: assignment.id,
-        orgMemberId: assignment.orgMemberId,
-        teamId: assignment.teamId,
-        createdAt: assignment.createdAt,
+  return policies.map((policy) => {
+    const policyAssignments = assignments.filter((assignment) => assignment.desktopPolicyId === policy.id)
+    return {
+      id: policy.id,
+      organizationId: policy.organizationId,
+      policyName: policy.policyName,
+      isDefault: policy.isDefault === true,
+      isEnabled: policy.isEnabled === true,
+      priority: policy.priority,
+      policy: policy.isDefault === true
+        ? normalizeDefaultDesktopPolicyDocument(policy.policy)
+        : normalizeDesktopPolicyDocument(policy.policy),
+      createdByOrgMemberId: policy.createdByOrgMemberId,
+      createdAt: policy.createdAt,
+      updatedAt: policy.updatedAt,
+      deletedAt: policy.deletedAt,
+      roles: resolveRoles(policyAssignments.flatMap((assignment) => {
+        const role = normalizeAssignmentRole(assignment.role)
+        return role ? [role] : []
       })),
-  }))
+      assignments: policyAssignments
+        .map((assignment) => ({
+          id: assignment.id,
+          orgMemberId: assignment.orgMemberId,
+          teamId: assignment.teamId,
+          role: normalizeAssignmentRole(assignment.role),
+          createdAt: assignment.createdAt,
+        })),
+    }
+  })
 }
 
 export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
@@ -156,11 +178,6 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
     orgRoleRoute(["admin"]),
     async (c) => {
       const payload = c.get("organizationContext")
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can manage desktop policies.")
-      if (!permission.ok) {
-        return c.json(permission.response, orgAccessFailureStatus(permission.response))
-      }
-
       const desktopPolicies = await loadDesktopPolicies(payload.organization.id)
       return c.json({ definitions: desktopPolicyDefinitions, desktopPolicies })
     },
@@ -176,15 +193,15 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
         400: jsonResponse("The desktop policy request was invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to create desktop policies.", unauthorizedSchema),
         402: jsonResponse("Desktop policy management requires an Enterprise plan.", enterprisePlanRequiredSchema),
-        403: jsonResponse("Only workspace owners and admins can create desktop policies.", forbiddenSchema),
+        403: jsonResponse("Only workspace owners and super-admins can create desktop policies.", forbiddenSchema),
         404: jsonResponse("A referenced member or team was not found.", notFoundSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgRoleRoute(["super-admin"]),
     jsonValidator(desktopPolicyWriteSchema),
     async (c) => {
       const payload = c.get("organizationContext")
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can manage desktop policies.")
+      const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can manage desktop policies.")
       if (!permission.ok) {
         return c.json(permission.response, orgAccessFailureStatus(permission.response))
       }
@@ -198,6 +215,7 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
       try {
         const memberIds = await resolveMemberIds({ organizationId: payload.organization.id, values: input.memberIds })
         const teamIds = await resolveTeamIds({ organizationId: payload.organization.id, values: input.teamIds })
+        const roles = resolveRoles(input.roles)
         const desktopPolicyId = createDenTypeId("desktopPolicy")
         const now = new Date()
 
@@ -208,7 +226,8 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
             policyName: input.policyName.trim(),
             isDefault: null,
             isEnabled: input.isEnabled ?? true,
-            policy: normalizeDesktopPolicyValue(input.policy),
+            priority: input.priority ?? 0,
+            policy: resolveDesktopPolicyDocumentWrite({ value: input.policy }),
             createdByOrgMemberId: payload.currentMember.id,
             createdAt: now,
             updatedAt: now,
@@ -221,6 +240,7 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
               desktopPolicyId,
               orgMemberId,
               teamId: null,
+              role: null,
               createdAt: now,
             })),
             ...teamIds.map((teamId) => ({
@@ -229,6 +249,16 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
               desktopPolicyId,
               orgMemberId: null,
               teamId,
+              role: null,
+              createdAt: now,
+            })),
+            ...roles.map((role) => ({
+              id: createDenTypeId("desktopPolicyMember"),
+              organizationId: payload.organization.id,
+              desktopPolicyId,
+              orgMemberId: null,
+              teamId: null,
+              role,
               createdAt: now,
             })),
           ]
@@ -259,16 +289,16 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
         400: jsonResponse("The desktop policy request was invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to update desktop policies.", unauthorizedSchema),
         402: jsonResponse("Desktop policy management requires an Enterprise plan.", enterprisePlanRequiredSchema),
-        403: jsonResponse("Only workspace owners and admins can update desktop policies.", forbiddenSchema),
+        403: jsonResponse("Only workspace owners and super-admins can update desktop policies.", forbiddenSchema),
         404: jsonResponse("The policy or a referenced resource was not found.", notFoundSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgRoleRoute(["super-admin"]),
     paramValidator(desktopPolicyParamsSchema),
     jsonValidator(desktopPolicyWriteSchema),
     async (c) => {
       const payload = c.get("organizationContext")
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can manage desktop policies.")
+      const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can manage desktop policies.")
       if (!permission.ok) {
         return c.json(permission.response, orgAccessFailureStatus(permission.response))
       }
@@ -305,6 +335,7 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
       try {
         const memberIds = await resolveMemberIds({ organizationId: payload.organization.id, values: input.memberIds })
         const teamIds = await resolveTeamIds({ organizationId: payload.organization.id, values: input.teamIds })
+        const roles = resolveRoles(input.roles)
         const updatedAt = new Date()
 
         await db.transaction(async (tx) => {
@@ -313,9 +344,19 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
             .set({
               policyName: existing.isDefault === true ? existing.policyName : input.policyName.trim(),
               isEnabled: existing.isDefault === true ? true : input.isEnabled ?? existing.isEnabled,
+              priority: existing.isDefault === true ? 0 : input.priority ?? existing.priority,
               policy: existing.isDefault === true
-                ? normalizeDefaultDesktopPolicyValue(input.policy)
-                : normalizeDesktopPolicyValue(input.policy),
+                ? resolveDesktopPolicyDocumentWrite({
+                    value: input.policy,
+                    existingPolicy: existing.policy,
+                    isDefault: true,
+                    preserveExistingOnboardingPrompts: true,
+                  })
+                : resolveDesktopPolicyDocumentWrite({
+                    value: input.policy,
+                    existingPolicy: existing.policy,
+                    preserveExistingOnboardingPrompts: true,
+                  }),
               updatedAt,
             })
             .where(eq(DesktopPolicyTable.id, existing.id))
@@ -329,6 +370,7 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
                 desktopPolicyId: existing.id,
                 orgMemberId,
                 teamId: null,
+                role: null,
                 createdAt: updatedAt,
               })),
               ...teamIds.map((teamId) => ({
@@ -337,6 +379,16 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
                 desktopPolicyId: existing.id,
                 orgMemberId: null,
                 teamId,
+                role: null,
+                createdAt: updatedAt,
+              })),
+              ...roles.map((role) => ({
+                id: createDenTypeId("desktopPolicyMember"),
+                organizationId: payload.organization.id,
+                desktopPolicyId: existing.id,
+                orgMemberId: null,
+                teamId: null,
+                role,
                 createdAt: updatedAt,
               })),
             ]
@@ -365,15 +417,15 @@ export function registerOrgDesktopPolicyRoutes<T extends { Variables: OrgRouteVa
       responses: {
         204: emptyResponse("Desktop policy deleted successfully."),
         401: jsonResponse("The caller must be signed in to delete desktop policies.", unauthorizedSchema),
-        403: jsonResponse("Only workspace owners and admins can delete desktop policies.", forbiddenSchema),
+        403: jsonResponse("Only workspace owners and super-admins can delete desktop policies.", forbiddenSchema),
         404: jsonResponse("The policy was not found.", notFoundSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgRoleRoute(["super-admin"]),
     paramValidator(desktopPolicyParamsSchema),
     async (c) => {
       const payload = c.get("organizationContext")
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can manage desktop policies.")
+      const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can manage desktop policies.")
       if (!permission.ok) {
         return c.json(permission.response, orgAccessFailureStatus(permission.response))
       }

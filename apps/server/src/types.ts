@@ -108,13 +108,6 @@ export interface Capabilities {
   serverVersion: string;
   opencodeVersion: string;
   skills: { read: boolean; write: boolean; source: "openwork" | "opencode" };
-  hub: {
-    skills: {
-      read: boolean;
-      install: boolean;
-      repo: { owner: string; name: string; ref: string };
-    };
-  };
   plugins: { read: boolean; write: boolean };
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
@@ -179,6 +172,12 @@ export interface McpItem {
   config: Record<string, unknown>;
   source: "config.project" | "config.global" | "config.remote";
   disabledByTools?: boolean;
+  toolDenies?: Array<{
+    source: "config.project" | "config.global";
+    style: "tools.deny" | "tools" | "permission" | "permissions";
+    pattern: string;
+    matched: string;
+  }>;
 }
 
 export interface SkillItem {
@@ -187,18 +186,6 @@ export interface SkillItem {
   description: string;
   scope: "project" | "global";
   trigger?: string;
-}
-
-export interface HubSkillItem {
-  name: string;
-  description: string;
-  trigger?: string;
-  source: {
-    owner: string;
-    repo: string;
-    ref: string;
-    path: string;
-  };
 }
 
 export interface CommandItem {

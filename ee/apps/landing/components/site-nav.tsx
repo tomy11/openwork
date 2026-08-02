@@ -11,7 +11,7 @@ type Props = {
   downloadHref?: string;
   mobilePrimaryHref?: string;
   mobilePrimaryLabel?: string;
-  active?: "home" | "pricing" | "download" | "enterprise" | "cloud" | "docs";
+  active?: "home" | "pricing" | "download" | "enterprise" | "cloud" | "docs" | "roadmap";
 };
 
 export function SiteNav(props: Props) {
@@ -32,6 +32,7 @@ export function SiteNav(props: Props) {
   const mobilePrimaryExternal = /^https?:\/\//.test(mobilePrimaryHref);
   const navItems = [
     { href: "/docs", label: "Docs", key: "docs", newTab: true },
+    { href: "/roadmap", label: "Roadmap", key: "roadmap" },
     { href: "/pricing", label: "Pricing", key: "pricing" },
     { href: "/download", label: "Desktop", key: "download" },
     { href: "https://app.openworklabs.com", label: "Cloud", key: "cloud" },
@@ -92,14 +93,12 @@ export function SiteNav(props: Props) {
               </svg>
               {props.stars}
             </a>
-            <a
-              href={cloudSignupHref}
-              className="doc-button !hidden items-center gap-2 md:!inline-flex"
-              rel="noreferrer"
-              target="_blank"
+            <Link
+              href="/download"
+              className="hidden items-center gap-2 rounded-full bg-[#011627] px-5 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-[#102638] md:inline-flex"
             >
-              Get Started for free
-            </a>
+              Download
+            </Link>
             <button
               type="button"
               className="rounded-full p-2 text-[#011627] transition-colors hover:bg-white/70 md:hidden"
@@ -133,14 +132,15 @@ export function SiteNav(props: Props) {
             </div>
 
             <div className="mt-4 flex flex-col gap-3">
-              <a
+              <Link
                 href={mobilePrimaryHref}
                 className="doc-button text-sm"
                 rel={mobilePrimaryExternal ? "noreferrer" : undefined}
                 target={mobilePrimaryExternal ? "_blank" : undefined}
+                onClick={() => setMobileOpen(false)}
               >
                 {mobilePrimaryLabel}
-              </a>
+              </Link>
               <a
                 href={callHref}
                 className="secondary-button text-sm"

@@ -361,8 +361,10 @@ export function createClient(baseUrl: string, directory?: string, auth?: Opencod
 
   const fetchImpl = isDesktopRuntime()
     ? createDesktopFetch(auth)
-    : (input: RequestInfo | URL, init?: RequestInit) =>
-        fetchWithTimeout(globalThis.fetch, input, init, DEFAULT_OPENCODE_REQUEST_TIMEOUT_MS);
+    : (input: RequestInfo | URL, init?: RequestInit) => {
+        const timeoutMs = requestIsStreaming(input, init) ? 0 : DEFAULT_OPENCODE_REQUEST_TIMEOUT_MS;
+        return fetchWithTimeout(globalThis.fetch, input, init, timeoutMs);
+      };
   const client = createOpencodeClient({
     baseUrl,
     directory,
@@ -455,7 +457,7 @@ export function createClient(baseUrl: string, directory?: string, auth?: Opencod
 
   const promptAsyncOriginal = sessionOverrides.promptAsync.bind(session);
   sessionOverrides.promptAsync = (parameters: PromptAsyncParameters, options?: { throwOnError?: boolean }) => {
-    if (!("reasoning_effort" in parameters)) {
+    if (!openworkMount && !("reasoning_effort" in parameters)) {
       return promptAsyncOriginal(parameters, options);
     }
     const { sessionID, directory: requestDirectory, ...body } = parameters;
@@ -468,7 +470,7 @@ export function createClient(baseUrl: string, directory?: string, auth?: Opencod
 
   const commandOriginal = sessionOverrides.command.bind(session);
   sessionOverrides.command = (parameters: CommandParameters, options?: { throwOnError?: boolean }) => {
-    if (!("reasoning_effort" in parameters)) {
+    if (!openworkMount && !("reasoning_effort" in parameters)) {
       return commandOriginal(parameters, options);
     }
     const { sessionID, directory: requestDirectory, ...body } = parameters;

@@ -1,15 +1,16 @@
-import { existsSync } from "node:fs";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile, rm, stat } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
+import { resolveGlobalOpencodeConfigPath } from "@openwork/paths";
 import type { ApprovalRequest, Capabilities, ServerConfig, WorkspaceInfo, Actor, ReloadReason, ReloadTrigger, TokenScope } from "./types.js";
+import { agentContextDiagnosticsRequestSchema } from "./agent-context-diagnostics-schema.js";
 import { ApprovalService } from "./approvals.js";
 import { addPlugin, listPlugins, normalizePluginSpec, removePlugin } from "./plugins.js";
 import { sanitizePortableOpencodeConfig } from "./portable-opencode.js";
 import { addMcp, listMcp, removeMcp, setMcpEnabled } from "./mcp.js";
+import { exportExtensions } from "./extensions-export.js";
 import { deleteSkill, listSkills, upsertSkill } from "./skills.js";
-import { installHubSkill, listHubSkills } from "./skill-hub.js";
 import { deleteCommand, listCommands, repairCommands, upsertCommand } from "./commands.js";
 import { ApiError, formatError } from "./errors.js";
 import { readJsoncFile, updateJsoncTopLevel, writeJsoncFile } from "./jsonc.js";
@@ -19,13 +20,15 @@ import { computeReloadFingerprint } from "./reload-fingerprint.js";
 import { startReloadWatchers } from "./reload-watcher.js";
 import { opencodeConfigPath, openworkConfigPath, projectCommandsDir, projectSkillsDir } from "./workspace-files.js";
 import { ensureDir, exists, hashToken, shortId } from "./utils.js";
-import { ensureWorkspaceFiles, readRawOpencodeConfig } from "./workspace-init.js";
+import { defaultWorkspaceOpenworkConfig, ensureWorkspaceFiles, readRawOpencodeConfig } from "./workspace-init.js";
 import { sanitizeCommandName, validateMcpName } from "./validators.js";
 import { TokenService } from "./tokens.js";
+import { resetManagedProviderAuthCache, syncManagedProviderAuth } from "./managed-provider-auth.js";
 import { EnvService } from "./env-file.js";
 import {
   normalizeResourceSnapshot,
   readDesktopCloudSyncState,
+  readWorkspaceCloudImports,
   syncDesktopCloudResources,
 } from "./desktop-cloud-sync.js";
 import { installCloudPlugin, readCloudPluginResolved, readInstalledCloudPlugins, removeCloudPlugin } from "./cloud-plugins.js";
@@ -54,25 +57,45 @@ import {
   type WorkspaceExportSensitiveMode,
 } from "./workspace-export-safety.js";
 import { serve, type ServeResult } from "./serve-node.js";
+import { serveStaticUi } from "./static-ui.js";
+import { externalFetch, loopbackFetch } from "./server-fetch.js";
 import { registerCoreRoutes } from "./routes/core.js";
 import { registerFileRoutes } from "./routes/files.js";
 import { registerOperationRoutes } from "./routes/operations.js";
 import { addRoute, matchRoute, type AuthMode, type RequestContext, type Route } from "./routes/registry.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerWorkspaceRoutes } from "./routes/workspaces.js";
+import { registerCloudMcpRoutes } from "./routes/cloud-mcp.js";
+import {
+  markOpenworkCloudMcpStale,
+  reconcilePersistedOpenworkCloudMcp,
+  type CloudMcpHealth,
+} from "./cloud-mcp-health.js";
+import { runAgentContextDiagnostics } from "./agent-context-diagnostics.js";
+import { createAgentDiagnosticsEngineFetch } from "./agent-context-engine-inspection.js";
+import { sanitizeDiagnosticString } from "./diagnostic-sanitizer.js";
 import {
   mergeOpencodeConfigs,
+  mergeRuntimeProviderUpdate,
+  readGlobalRuntimeOpencodeConfig,
   readRuntimeOpencodeConfig,
+  runtimeDisabledProviderList,
   runtimeMcpMap,
+  runtimeProviderMap,
   type RuntimeOpencodeConfig,
+  writeGlobalRuntimeOpencodeConfig,
   writeRuntimeOpencodeConfig,
 } from "./runtime-opencode-config-store.js";
 import {
+  hasOpenworkWorkspaceConfig,
   mergeOpenworkWorkspaceConfigs,
   readOpenworkWorkspaceConfig,
+  seedOpenworkWorkspaceConfigIfEmpty,
   writeOpenworkWorkspaceConfig,
 } from "./openwork-workspace-config-store.js";
-import { buildOpenworkRuntimeConfigObject } from "./openwork-runtime-config.js";
+import { buildOpenworkRuntimeConfigObject, openworkRuntimeConfigFilePath, writeOpenworkRuntimeConfigFile } from "./openwork-runtime-config.js";
+import { readLegacyConfigSweepState } from "./legacy-config-sweep.js";
+import { findManagedEngineWorkspace } from "./workspaces.js";
 import pkg from "../package.json" with { type: "json" };
 import constants from "../../../constants.json" with { type: "json" };
 
@@ -88,6 +111,68 @@ const OPENCODE_VERSION = constants.opencodeVersion.trim().replace(/^v/, "");
 const OPENWORK_VOICE_REALTIME_MODEL = "gpt-realtime-2";
 const OPENWORK_VOICE_TRANSCRIPTION_MODEL = "gpt-4o-transcribe";
 let desktopCloudSyncQueue: Promise<void> = Promise.resolve();
+const agentDiagnosticsLastRunByServer = new WeakMap<ServerConfig, Map<string, number>>();
+const agentDiagnosticsInFlightByServer = new WeakMap<ServerConfig, Set<string>>();
+const AGENT_DIAGNOSTICS_RATE_LIMIT_CAPACITY = 1_000;
+const AGENT_DIAGNOSTICS_MAX_IN_FLIGHT_PER_SERVER = 16;
+const AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES = 256 * 1024;
+const AGENT_DIAGNOSTICS_DEFAULT_BODY_DEADLINE_MS = 2_000;
+const AGENT_DIAGNOSTICS_ERROR_FLUSH_MS = 25;
+
+function agentDiagnosticsActorWorkspaceKey(actor: Actor | undefined, workspaceId: string): string {
+  const actorKey = actor?.tokenHash ?? actor?.clientId ?? actor?.type ?? "unknown";
+  return hashToken(actorKey + "\0" + workspaceId);
+}
+
+function requireAgentDiagnosticsRateLimit(config: ServerConfig, actor: Actor | undefined, workspaceId: string): void {
+  const now = Date.now();
+  const configured = Number(process.env.OPENWORK_AGENT_DIAGNOSTICS_COOLDOWN_MS ?? "3000");
+  const cooldownMs = Number.isFinite(configured) && configured >= 0 ? configured : 3_000;
+  const key = agentDiagnosticsActorWorkspaceKey(actor, workspaceId);
+  const agentDiagnosticsLastRun = agentDiagnosticsLastRunByServer.get(config) ?? new Map<string, number>();
+  agentDiagnosticsLastRunByServer.set(config, agentDiagnosticsLastRun);
+  const previous = agentDiagnosticsLastRun.get(key);
+  if (previous !== undefined && now - previous < cooldownMs) {
+    throw new ApiError(429, "agent_diagnostics_rate_limited", "Agent diagnostics were run too recently");
+  }
+  for (const [candidate, at] of agentDiagnosticsLastRun) {
+    if (now - at > Math.max(cooldownMs, 60_000)) agentDiagnosticsLastRun.delete(candidate);
+  }
+  if (agentDiagnosticsLastRun.size >= AGENT_DIAGNOSTICS_RATE_LIMIT_CAPACITY) {
+    const oldest = agentDiagnosticsLastRun.keys().next().value;
+    if (oldest) agentDiagnosticsLastRun.delete(oldest);
+  }
+  agentDiagnosticsLastRun.set(key, now);
+}
+
+function reserveAgentDiagnosticsRun(
+  config: ServerConfig,
+  actor: Actor | undefined,
+  workspaceId: string,
+): () => void {
+  const key = agentDiagnosticsActorWorkspaceKey(actor, workspaceId);
+  const inFlight = agentDiagnosticsInFlightByServer.get(config) ?? new Set<string>();
+  agentDiagnosticsInFlightByServer.set(config, inFlight);
+  // Preserve the existing cooldown response for ordinary repeated attempts.
+  // A zero/expired cooldown still cannot bypass the in-flight reservation.
+  requireAgentDiagnosticsRateLimit(config, actor, workspaceId);
+  if (inFlight.has(key)) {
+    throw new ApiError(429, "agent_diagnostics_in_progress", "Agent diagnostics are already in progress");
+  }
+  if (inFlight.size >= AGENT_DIAGNOSTICS_MAX_IN_FLIGHT_PER_SERVER) {
+    throw new ApiError(429, "agent_diagnostics_busy", "Agent diagnostics are temporarily busy");
+  }
+
+  // The cooldown charge and reservation are synchronous, so no second request
+  // for this actor/workspace can slip in between them.
+  inFlight.add(key);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    inFlight.delete(key);
+  };
+}
 
 const OPENWORK_VOICE_REALTIME_TOOLS = [
   {
@@ -129,7 +214,7 @@ function readStringField(value: unknown, key: string): string {
 }
 
 const LEGACY_RUNTIME_CONFIG_KEYS = ["plugin", "mcp", "permission", "provider"] as const;
-const USER_OPENCODE_RUNTIME_CONFIG_KEYS = ["default_agent", "plugin", "disabled_providers", "provider"] as const;
+const USER_OPENCODE_RUNTIME_CONFIG_KEYS = ["default_agent", "plugin", "mcp", "disabled_providers", "provider"] as const;
 
 type LegacyRuntimeConfigKey = typeof LEGACY_RUNTIME_CONFIG_KEYS[number];
 type UserOpencodeRuntimeConfigKey = typeof USER_OPENCODE_RUNTIME_CONFIG_KEYS[number];
@@ -181,6 +266,12 @@ function userRuntimeConfigFromOpencodeConfig(opencode: Record<string, unknown>):
   const keys: UserOpencodeRuntimeConfigKey[] = [];
   const defaultAgent = opencode.default_agent === "openwork" ? "openwork" : undefined;
   const plugin = Array.isArray(opencode.plugin) ? opencode.plugin.filter((item) => typeof item === "string") : undefined;
+  const mcp: Record<string, Record<string, unknown>> = {};
+  if (isRecord(opencode.mcp)) {
+    for (const [name, value] of Object.entries(opencode.mcp)) {
+      if (isRecord(value)) mcp[name] = value;
+    }
+  }
   const disabledProviders = Array.isArray(opencode.disabled_providers)
     ? opencode.disabled_providers.filter((item) => typeof item === "string")
     : undefined;
@@ -188,6 +279,7 @@ function userRuntimeConfigFromOpencodeConfig(opencode: Record<string, unknown>):
 
   if (defaultAgent) keys.push("default_agent");
   if (Array.isArray(opencode.plugin)) keys.push("plugin");
+  if (Object.keys(mcp).length) keys.push("mcp");
   if (Array.isArray(opencode.disabled_providers)) keys.push("disabled_providers");
   if (isRecord(opencode.provider)) keys.push("provider");
 
@@ -196,6 +288,7 @@ function userRuntimeConfigFromOpencodeConfig(opencode: Record<string, unknown>):
     config: {
       ...(defaultAgent ? { default_agent: defaultAgent } : {}),
       ...(plugin?.length ? { plugin } : {}),
+      ...(Object.keys(mcp).length ? { mcp } : {}),
       ...(disabledProviders?.length ? { disabled_providers: disabledProviders } : {}),
       ...(provider && Object.keys(provider).length ? { provider } : {}),
     },
@@ -220,6 +313,94 @@ function runtimeConfigKeys(config: RuntimeOpencodeConfig): string[] {
   }
   if (isRecord(config.provider) && Object.keys(config.provider).length) keys.push("provider");
   return keys;
+}
+
+function parseDisabledProvidersPayload(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new ApiError(400, "invalid_payload", "providers must be an array of non-empty strings");
+  }
+  const providers: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      throw new ApiError(400, "invalid_payload", "providers must be an array of non-empty strings");
+    }
+    const provider = entry.trim();
+    if (!providers.includes(provider)) providers.push(provider);
+  }
+  return providers;
+}
+
+function parseRuntimeProviderPatchPayload(body: Record<string, unknown>): Record<string, unknown> {
+  const provider = body.provider;
+  if (!isRecord(provider)) {
+    throw new ApiError(400, "invalid_payload", "provider must be an object");
+  }
+  for (const [providerId, value] of Object.entries(provider)) {
+    if (!providerId.trim()) {
+      throw new ApiError(400, "invalid_payload", "provider keys must be non-empty strings");
+    }
+    if (value !== null && !isRecord(value)) {
+      throw new ApiError(400, "invalid_payload", "provider values must be objects or null");
+    }
+  }
+  return provider;
+}
+
+function resolveEngineRuntimeWorkspace(config: ServerConfig): WorkspaceInfo {
+  const workspace = findManagedEngineWorkspace(config.workspaces) ?? config.workspaces[0];
+  if (!workspace) {
+    throw new ApiError(400, "workspace_missing", "At least one workspace is required for engine runtime config");
+  }
+  return workspace;
+}
+
+function redactBearerTokens(value: string): string {
+  return value.replace(/Bearer\s+\S+/g, "Bearer [redacted]");
+}
+
+function redactManagedRuntimeValue(value: unknown, path: string[], insideMcpHeaders: boolean): unknown {
+  if (typeof value === "string") return insideMcpHeaders ? "[redacted]" : redactBearerTokens(value);
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => redactManagedRuntimeValue(entry, [...path, String(index)], insideMcpHeaders));
+  }
+  if (!isRecord(value)) return value;
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => {
+      const childInsideMcpHeaders = insideMcpHeaders || (path.length === 2 && path[0] === "mcp" && key === "headers");
+      return [key, redactManagedRuntimeValue(child, [...path, key], childInsideMcpHeaders)];
+    }),
+  );
+}
+
+function redactManagedRuntimeConfigContent(content: string): string {
+  try {
+    const parsed: unknown = JSON.parse(content);
+    return JSON.stringify(redactManagedRuntimeValue(parsed, [], false), null, 2);
+  } catch {
+    return redactBearerTokens(content);
+  }
+}
+
+async function readManagedRuntimeConfigDebug(config: ServerConfig): Promise<{
+  managedFilePath: string;
+  managedFileRebuiltAt: number | null;
+  managedFileContentRedacted: string | null;
+}> {
+  const managedFilePath = openworkRuntimeConfigFilePath(config);
+  try {
+    const [metadata, content] = await Promise.all([
+      stat(managedFilePath),
+      readFile(managedFilePath, "utf8"),
+    ]);
+    return {
+      managedFilePath,
+      managedFileRebuiltAt: metadata.mtimeMs,
+      managedFileContentRedacted: redactManagedRuntimeConfigContent(content),
+    };
+  } catch {
+    return { managedFilePath, managedFileRebuiltAt: null, managedFileContentRedacted: null };
+  }
 }
 
 function userOpencodeConfigKeys(config: Record<string, unknown>): string[] {
@@ -387,7 +568,7 @@ async function createOpenAiRealtimeVoiceSession(env: EnvService, input: unknown)
 }
 
 async function createManagedVoiceSession(config: { baseUrl: string; apiKey: string }, input: unknown) {
-  const response = await fetch(`${config.baseUrl}/voice/realtime/session`, {
+  const response = await externalFetch(`${config.baseUrl}/voice/realtime/session`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
@@ -431,7 +612,7 @@ async function createManagedVoiceSession(config: { baseUrl: string; apiKey: stri
 async function createDirectOpenAiVoiceSession(apiKey: string, input: unknown) {
   const model = readStringField(input, "model") || OPENWORK_VOICE_REALTIME_MODEL;
   const sessionContext = readStringField(input, "sessionContext").slice(0, 6_000);
-  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+  const response = await externalFetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -503,6 +684,16 @@ type LogAttributes = Record<string, unknown>;
 type ServerLogger = {
   log: (level: LogLevel, message: string, attributes?: LogAttributes) => void;
 };
+
+/** Adapt the server logger to the warn/error shape helpers expect. */
+function toManagedProviderAuthLogger(logger: ServerLogger) {
+  return {
+    warn: (message: string, attributes?: Record<string, unknown>) =>
+      logger.log("warn", message, attributes as LogAttributes | undefined),
+    error: (message: string, attributes?: Record<string, unknown>) =>
+      logger.log("error", message, attributes as LogAttributes | undefined),
+  };
+}
 
 const LOG_LEVEL_NUMBERS: Record<LogLevel, number> = {
   info: 9,
@@ -659,7 +850,16 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     watcherHandle.close();
     watcherHandle = startReloadWatchers({ config, reloadEvents, logger });
   };
-  const routes = createRoutes(config, approvals, tokens, env, restartReloadWatchers);
+  const engineMcpServerState = beginEngineMcpServerState(config);
+  const routes = createRoutes(
+    config,
+    approvals,
+    tokens,
+    env,
+    restartReloadWatchers,
+    engineMcpServerState,
+    logger,
+  );
 
   const serverOptions: {
     hostname: string;
@@ -763,6 +963,8 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
 
       const route = matchRoute(routes, request.method, url.pathname);
       if (!route) {
+        const staticUiResponse = await serveStaticUi(request, config);
+        if (staticUiResponse) return finalize(staticUiResponse);
         errorMessage = "not_found";
         return finalize(jsonResponse({ code: "not_found", message: "Not found" }, 404));
       }
@@ -796,19 +998,49 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
           ? error
           : new ApiError(500, "internal_error", "Unexpected server error");
         errorMessage = apiError.message;
-        return finalize(jsonResponse(formatError(apiError), apiError.status));
+        const response = jsonResponse(formatError(apiError), apiError.status);
+        const isAgentDiagnosticsRequest =
+          request.method === "POST" && /^\/workspace\/[^/]+\/diagnostics\/agent-context$/.test(url.pathname);
+        if (isAgentDiagnosticsRequest) {
+          // Every diagnostics error closes the connection because failures such
+          // as cooldown or in-flight rejection happen before body consumption.
+          // Abort after a short flush window so the stable JSON error reaches the
+          // client before unread bytes and drip streams are actively terminated.
+          response.headers.set("Connection", "close");
+          const requestBody = request.body;
+          if (requestBody) {
+            setTimeout(() => {
+              void requestBody.cancel(new Error("Agent diagnostics request was rejected")).catch(() => undefined);
+            }, AGENT_DIAGNOSTICS_ERROR_FLUSH_MS);
+          }
+        }
+        return finalize(response);
       }
     },
   };
 
-  const server = await serve({
-    ...serverOptions,
-    idleTimeout: 120,
-  });
+  let server: ServeResult;
+  try {
+    server = await serve({
+      ...serverOptions,
+      idleTimeout: 120,
+    });
+  } catch (error) {
+    invalidateEngineMcpServerState(config, engineMcpServerState);
+    throw error;
+  }
+
+  // Deliver server-managed provider credentials to the engine on startup. The
+  // engine process receives a fixed env allowlist, so credentials materialized
+  // into the env store only reach it through the engine's auth API. Fire and
+  // forget: a credential problem must never stop the server from serving.
+  resetManagedProviderAuthCache();
+  void syncManagedProviderAuth({ config, env, logger: toManagedProviderAuthLogger(logger) }).catch(() => undefined);
 
   return {
     ...server,
     stop: async () => {
+      invalidateEngineMcpServerState(config, engineMcpServerState);
       watcherHandle.close();
       reloadBaselineRefreshers.delete(config);
       await server.stop();
@@ -828,15 +1060,15 @@ function buildOpencodeDirectoryHeader(directory: string) {
   return /[^\x00-\x7F]/.test(directory) ? encodeURIComponent(directory) : directory;
 }
 
-function createOpencodeDirectoryFetch(directory: string): typeof fetch {
+function createOpencodeDirectoryFetch(directory: string, fetchImpl: typeof fetch = globalThis.fetch): typeof fetch {
   return Object.assign(
     (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       const request = input instanceof Request ? input : new Request(input, init);
       const headers = new Headers(init?.headers ?? request.headers);
       headers.set("x-opencode-directory", buildOpencodeDirectoryHeader(directory));
-      return fetch(new Request(request, { headers }));
+      return fetchImpl(new Request(request, { headers }));
     },
-    { preconnect: fetch.preconnect },
+    { preconnect: fetchImpl.preconnect },
   );
 }
 
@@ -844,15 +1076,22 @@ type OpencodeClientResult<T, E> =
   | { data: T | undefined; error: undefined; response: Response }
   | { data: undefined; error: E; response: Response };
 
-function createWorkspaceOpencodeClient(config: ServerConfig, workspace: WorkspaceInfo) {
+export function createWorkspaceOpencodeClient(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  options?: { boundedDiagnosticsReads?: boolean },
+) {
   const connection = resolveWorkspaceOpencodeConnection(config, workspace);
   const directory = resolveOpencodeDirectory(workspace);
-  const directoryFetch = directory ? createOpencodeDirectoryFetch(directory) : undefined;
+  const baseFetch = directory ? createOpencodeDirectoryFetch(directory) : globalThis.fetch;
+  const clientFetch = options?.boundedDiagnosticsReads
+    ? createAgentDiagnosticsEngineFetch(baseFetch)
+    : directory ? baseFetch : undefined;
 
   return createOpencodeClient({
     baseUrl: connection.baseUrl?.trim(),
     ...(directory ? { directory } : {}),
-    ...(directoryFetch ? { fetch: directoryFetch } : {}),
+    ...(clientFetch ? { fetch: clientFetch } : {}),
     ...(connection.authHeader ? { headers: { Authorization: connection.authHeader } } : {}),
   });
 }
@@ -910,8 +1149,9 @@ async function proxyOpencodeRequest(input: {
   const body = method === "GET" || method === "HEAD"
     ? undefined
     : await input.request.arrayBuffer().then((buf) => (buf.byteLength > 0 ? buf : undefined));
+  // Managed OpenCode proxy traffic is loopback/engine I/O; keep streaming on Node fetch.
   if (isSessionCommandProxyRequest(method, proxyPath)) {
-    void fetch(targetUrl, {
+    void loopbackFetch(targetUrl, {
       method,
       headers,
       body,
@@ -920,7 +1160,7 @@ async function proxyOpencodeRequest(input: {
     });
     return jsonResponse({ ok: true, accepted: true });
   }
-  const response = await fetch(targetUrl, {
+  const response = await loopbackFetch(targetUrl, {
     method,
     headers,
     body,
@@ -1036,13 +1276,6 @@ function buildCapabilities(config: ServerConfig): Capabilities {
     serverVersion: SERVER_VERSION,
     opencodeVersion: OPENCODE_VERSION,
     skills: { read: true, write: writeEnabled, source: "openwork" },
-    hub: {
-      skills: {
-        read: true,
-        install: writeEnabled,
-        repo: { owner: "different-ai", name: "openwork-hub", ref: "main" },
-      },
-    },
     plugins: { read: true, write: writeEnabled },
     mcp: { read: true, write: writeEnabled },
     commands: { read: true, write: writeEnabled },
@@ -1098,9 +1331,12 @@ function resolveInboxMaxBytes(): number {
   const raw = (process.env.OPENWORK_INBOX_MAX_BYTES ?? "").trim();
   const parsed = raw ? Number(raw) : NaN;
   if (Number.isFinite(parsed) && parsed > 0) {
-    return Math.min(Math.trunc(parsed), 250_000_000);
+    return Math.trunc(parsed);
   }
-  return 50_000_000;
+  // Generous default: the composer no longer caps attachment sizes, so large
+  // uploads should be bounded here (memory: formData buffers the body) and by
+  // downstream provider/tool limits rather than an arbitrary small cap.
+  return 250_000_000;
 }
 
 function resolveToyUiEnabled(): boolean {
@@ -1290,6 +1526,8 @@ function createRoutes(
   tokens: TokenService,
   env: EnvService,
   onWorkspacesChanged: () => void,
+  engineMcpServerState: EngineMcpServerState,
+  logger: ServerLogger,
 ): Route[] {
   const routes: Route[] = [];
   registerCoreRoutes({
@@ -1297,6 +1535,7 @@ function createRoutes(
     config,
     tokens,
     env,
+    managedProviderAuthLogger: toManagedProviderAuthLogger(logger),
     serverVersion: SERVER_VERSION,
     opencodeVersion: OPENCODE_VERSION,
     jsonResponse,
@@ -1307,6 +1546,9 @@ function createRoutes(
     buildCapabilities,
     fetchRuntimeControl,
     resolveWorkspace,
+    resolveOpencodeDirectory,
+    createWorkspaceOpencodeClient,
+    refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
     serializeWorkspace,
     resolveToyUiEnabled,
     resolveDevLogPath,
@@ -1324,7 +1566,8 @@ function createRoutes(
     ensureWritable,
     resolveWorkspace,
     serializeWorkspace,
-    reloadOpencodeEngine,
+    reloadOpencodeEngine: (routeConfig, workspace) =>
+      reloadOpencodeEngine(routeConfig, workspace, engineMcpServerState),
   });
 
   registerSessionRoutes({
@@ -1338,16 +1581,90 @@ function createRoutes(
     ensureWritable,
     requireClientScope,
     resolveWorkspace,
+    resolveWorkspaceWithoutBootstrap,
     createWorkspaceOpencodeClient,
     unwrapOpencodeResult,
   });
 
+  registerCloudMcpRoutes({
+    routes,
+    config,
+    jsonResponse,
+    readJsonBody,
+    ensureWritable,
+    requireClientScope,
+    resolveWorkspace,
+    resolveOpencodeDirectory,
+    createWorkspaceOpencodeClient,
+    refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
+    registerRuntimeMcp: (routeConfig, workspace, onlyNames, options) =>
+      syncRuntimeMcpToOpencodeEngine(
+        routeConfig,
+        workspace,
+        onlyNames,
+        options,
+        engineMcpServerState,
+      ),
+    serverMetadata: { serverVersion: SERVER_VERSION, expectedOpencodeVersion: OPENCODE_VERSION },
+  });
+
+  addRoute(routes, "POST", "/workspace/:id/diagnostics/agent-context", "client", async (ctx) => {
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspaceForInspection(config, ctx.params.id);
+    if (workspace.workspaceType === "remote") {
+      throw new ApiError(
+        400,
+        "agent_diagnostics_workspace_unsupported",
+        "Agent diagnostics must run on the OpenWork server that owns a local workspace",
+      );
+    }
+    // Reserve before consuming untrusted bytes and hold the reservation through
+    // report completion. The cooldown remains charged for invalid, oversized,
+    // timed-out, and otherwise unsuccessful attempts.
+    const releaseReservation = reserveAgentDiagnosticsRun(config, ctx.actor, workspace.id);
+    try {
+      const parsed = agentContextDiagnosticsRequestSchema.safeParse(await readAgentDiagnosticsJsonBody(ctx.request));
+      if (!parsed.success) {
+        throw new ApiError(400, "invalid_agent_diagnostics_request", "Agent diagnostics request is invalid");
+      }
+      const opencode = createWorkspaceOpencodeClient(config, workspace, { boundedDiagnosticsReads: true });
+      const diagnosticsSignal = AbortSignal.any([ctx.request.signal, AbortSignal.timeout(24_000)]);
+      const response = jsonResponse(await runAgentContextDiagnostics({
+        config,
+        workspace,
+        request: parsed.data,
+        inspectRegistration: (name, mcpConfig) =>
+          inspectEngineMcpRegistrationInState(
+            config,
+            engineMcpServerState,
+            workspace,
+            name,
+            mcpConfig,
+          ),
+        dependencies: {
+          signal: diagnosticsSignal,
+          inspectEffectiveEngine: async (signal) => {
+            const [configResult, agentResult] = await Promise.all([
+              opencode.config.get({}, { signal }),
+              opencode.app.agents({}, { signal }),
+            ]);
+            return {
+              config: unwrapOpencodeResult(configResult, "/config"),
+              agents: unwrapOpencodeResult(agentResult, "/agent"),
+            };
+          },
+        },
+      }));
+      response.headers.set("Cache-Control", "no-store");
+      return response;
+    } finally {
+      releaseReservation();
+    }
+  });
+
   addRoute(routes, "GET", "/workspace/:id/config", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
-    const openwork = mergeOpenworkWorkspaceConfigs(
-      await readOpenworkConfig(workspace.path),
-      await readOpenworkWorkspaceConfig(config, workspace.id),
-    );
+    const openwork = await readOpenworkConfigForWorkspace(config, workspace);
     const opencode = mergeOpencodeConfigs(
       await readOpencodeConfig(workspace.path),
       await readRuntimeOpencodeConfig(config, workspace.id),
@@ -1358,10 +1675,7 @@ function createRoutes(
 
   addRoute(routes, "GET", "/workspace/:id/desktop-cloud-sync", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
-    const openwork = mergeOpenworkWorkspaceConfigs(
-      await readOpenworkConfig(workspace.path),
-      await readOpenworkWorkspaceConfig(config, workspace.id),
-    );
+    const openwork = await readOpenworkConfigForWorkspace(config, workspace);
     return jsonResponse(readDesktopCloudSyncState(openwork));
   });
 
@@ -1376,13 +1690,20 @@ function createRoutes(
     }
 
     const result = await enqueueDesktopCloudSync(async () => {
-      const openwork = mergeOpenworkWorkspaceConfigs(
-        await readOpenworkConfig(workspace.path),
-        await readOpenworkWorkspaceConfig(config, workspace.id),
-      );
-      const cloudImports = await readInstalledCloudPlugins(config, workspace.id);
+      const openwork = await readOpenworkConfigForWorkspace(config, workspace);
+      const installed = await readInstalledCloudPlugins(config, workspace.id);
+      const cloudImports = {
+        ...installed,
+        providers: readWorkspaceCloudImports(openwork).providers,
+      };
       const next = syncDesktopCloudResources({ openwork: { ...openwork, cloudImports }, snapshot });
-      await writeOpenworkWorkspaceConfig(config, workspace.id, () => next.openwork);
+      // The plugin DB owns plugins/marketplaces, but provider import baselines live in
+      // the workspace config. Writing the merged cloudImports back erased providers
+      // and drove the provider-sync dispose/create loop.
+      await writeOpenworkWorkspaceConfig(config, workspace.id, (current) => ({
+        ...current,
+        desktopCloudSync: next.state,
+      }));
       await recordAudit(workspace.path, {
         id: shortId(),
         workspaceId: workspace.id,
@@ -1423,7 +1744,7 @@ function createRoutes(
       paths: [openworkConfigPath(workspace.path), join(workspace.path, ".opencode")],
     });
 
-    const imported = await installCloudPlugin({
+    const result = await installCloudPlugin({
       serverConfig: config,
       workspaceId: workspace.id,
       workspaceRoot: workspace.path,
@@ -1437,6 +1758,7 @@ function createRoutes(
         : null,
       resolved,
     });
+    const imported = result.item;
 
     await recordAudit(workspace.path, {
       id: shortId(),
@@ -1456,7 +1778,16 @@ function createRoutes(
       });
     }
 
-    return jsonResponse({ item: imported });
+    // Hot-register any bundled MCP servers with the running engine.
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      undefined,
+      undefined,
+      engineMcpServerState,
+    ).catch(() => undefined);
+
+    return jsonResponse({ item: imported, warnings: result.warnings });
   });
 
   // Claude Code plugin bundles (MCP + skills + commands + agents) installed
@@ -1485,13 +1816,14 @@ function createRoutes(
       paths: [openworkConfigPath(workspace.path), join(workspace.path, ".opencode")],
     });
 
-    const imported = await installCloudPlugin({
+    const result = await installCloudPlugin({
       serverConfig: config,
       workspaceId: workspace.id,
       workspaceRoot: workspace.path,
       marketplaceId: null,
       resolved: bundle.resolved,
     });
+    const imported = result.item;
 
     await recordAudit(workspace.path, {
       id: shortId(),
@@ -1512,9 +1844,15 @@ function createRoutes(
     }
 
     // Hot-register any bundled MCP servers with the running engine.
-    await syncRuntimeMcpToOpencodeEngine(config, workspace).catch(() => undefined);
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      undefined,
+      undefined,
+      engineMcpServerState,
+    ).catch(() => undefined);
 
-    return jsonResponse({ item: imported, preview: bundle.preview });
+    return jsonResponse({ item: imported, preview: bundle.preview, warnings: result.warnings });
   });
 
   addRoute(routes, "DELETE", "/workspace/:id/cloud-plugins/:pluginId", "client", async (ctx) => {
@@ -1555,7 +1893,7 @@ function createRoutes(
       });
     }
 
-    return jsonResponse({ item: removed });
+    return jsonResponse({ item: removed, warnings: [] });
   });
 
   addRoute(routes, "GET", "/workspace/:id/authorized-folders", "client", async (ctx) => {
@@ -1638,18 +1976,31 @@ function createRoutes(
       paths: [configPath],
     });
 
-    const openwork = await readOpenworkConfigForStatus(workspace.path);
-    const legacy = legacyRuntimeConfigFromOpenworkConfig(openwork.data);
+    // Resolve the effective openwork config (DB, migrating any legacy file
+    // contents in on read) so legacy runtime keys are detected wherever they
+    // currently live.
+    let openworkError: string | null = null;
+    let openworkData: Record<string, unknown> = {};
+    try {
+      openworkData = await readOpenworkConfigForWorkspace(config, workspace);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "invalid_json") {
+        openworkError = error.message;
+      } else {
+        throw error;
+      }
+    }
+    const legacy = legacyRuntimeConfigFromOpenworkConfig(openworkData);
     const user = userRuntimeConfigFromOpencodeConfig(await readOpencodeConfig(workspace.path));
     if (!legacy.keys.length && !user.keys.length) {
-      return jsonResponse({ migrated: false, keys: [], legacyKeys: [], userOpencodeKeys: [], updatedAt: null, legacyError: openwork.error });
+      return jsonResponse({ migrated: false, keys: [], legacyKeys: [], userOpencodeKeys: [], updatedAt: null, legacyError: openworkError });
     }
 
     await writeRuntimeOpencodeConfig(config, workspace.id, (current) => (
       mergeLegacyRuntimeConfig(mergeLegacyRuntimeConfig(current, legacy.config), user.config)
     ));
-    if (legacy.keys.length && !openwork.error) {
-      await writeOpenworkConfig(workspace.path, removeLegacyRuntimeConfig(openwork.data), false);
+    if (legacy.keys.length && !openworkError) {
+      await writeOpenworkConfigForWorkspace(config, workspace, removeLegacyRuntimeConfig(openworkData), false);
     }
     await removeUserRuntimeConfigFromOpencode(workspace.path, user.keys);
 
@@ -1666,27 +2017,93 @@ function createRoutes(
     });
     emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(configPath));
 
-    return jsonResponse({ migrated: true, keys, legacyKeys: legacy.keys, userOpencodeKeys: user.keys, updatedAt, legacyError: openwork.error });
+    return jsonResponse({ migrated: true, keys, legacyKeys: legacy.keys, userOpencodeKeys: user.keys, updatedAt, legacyError: openworkError });
+  });
+
+  addRoute(routes, "POST", "/workspace/:id/runtime-config/disabled-providers", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const providers = parseDisabledProvidersPayload(body.providers);
+    const result = await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
+      ...current,
+      disabled_providers: providers,
+    }));
+
+    if (result.changed) {
+      emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(openworkRuntimeConfigFilePath(config)));
+    }
+
+    return jsonResponse({
+      ok: true,
+      disabledProviders: runtimeDisabledProviderList(result.config),
+    });
+  });
+
+  addRoute(routes, "GET", "/runtime-config/providers", "host-token", async () => {
+    const runtime = await readGlobalRuntimeOpencodeConfig(config);
+    return jsonResponse({ provider: runtimeProviderMap(runtime) });
+  });
+
+  addRoute(routes, "PATCH", "/runtime-config/providers", "host-token", async (ctx) => {
+    ensureWritable(config);
+    const workspace = resolveEngineRuntimeWorkspace(config);
+    const body = await readJsonBody(ctx.request);
+    const providerPatch = parseRuntimeProviderPatchPayload(body);
+    const result = await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
+      ...current,
+      provider: mergeRuntimeProviderUpdate(current.provider, providerPatch),
+    }));
+
+    const fileResult = await writeOpenworkRuntimeConfigFile(config, workspace.id);
+    const shouldReload = result.changed || fileResult.changed;
+    if (shouldReload) {
+      await reloadOpencodeEngine(config, workspace, engineMcpServerState);
+    }
+    // The provider entry only names its credential env vars; the engine needs
+    // the value itself via its auth API.
+    await syncManagedProviderAuth({
+      config,
+      env,
+      logger: toManagedProviderAuthLogger(logger),
+    }).catch(() => undefined);
+
+    return jsonResponse({
+      ok: true,
+      changed: result.changed,
+      provider: runtimeProviderMap(result.config),
+      runtimeConfigPath: openworkRuntimeConfigFilePath(config),
+      reload: shouldReload ? "reloaded" : "skipped",
+    });
   });
 
   addRoute(routes, "GET", "/workspace/:id/runtime-config", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const runtime = await readRuntimeOpencodeConfig(config, workspace.id);
-    const openwork = await readOpenworkConfigForStatus(workspace.path);
-    const openworkConfig = openwork.data;
-    const legacy = legacyRuntimeConfigFromOpenworkConfig(openworkConfig);
+    // Report legacy runtime keys from the effective (DB-backed) openwork config
+    // so the status reflects post-migration state, while still surfacing parse
+    // errors from a malformed legacy file.
+    const fileStatus = await readOpenworkConfigForStatus(workspace.path);
+    const effectiveOpenwork = fileStatus.error ? {} : await readOpenworkConfigForWorkspace(config, workspace);
+    const legacy = legacyRuntimeConfigFromOpenworkConfig(effectiveOpenwork);
     const rawOpencode = await readRawOpencodeConfig(opencodeConfigPath(workspace.path));
     const persistedOpencode = await readOpencodeConfig(workspace.path);
     const globalOpencodePath = resolveOpencodeConfigFilePath("global", workspace.path);
     const rawGlobalOpencode = await readRawOpencodeConfig(globalOpencodePath);
-    const globalOpencode = (await readJsoncFile(globalOpencodePath, {} as Record<string, unknown>, { allowInvalid: true })).data;
+    const emptyGlobalOpencode: Record<string, unknown> = {};
+    const globalOpencode = (await readJsoncFile(globalOpencodePath, emptyGlobalOpencode, { allowInvalid: true })).data;
     const effectiveRuntime = await buildOpenworkRuntimeConfigObject(config, workspace.id);
     const user = userRuntimeConfigFromOpencodeConfig(persistedOpencode);
+    const managedFile = await readManagedRuntimeConfigDebug(config);
+    const sweep = await readLegacyConfigSweepState(config);
 
     return jsonResponse({
       runtime,
       runtimeKeys: runtimeConfigKeys(runtime),
       effectiveRuntime,
+      ...managedFile,
+      sweep,
       sources: {
         projectOpencode: {
           path: opencodeConfigPath(workspace.path),
@@ -1712,7 +2129,7 @@ function createRoutes(
       legacyOpenwork: {
         path: openworkConfigPath(workspace.path),
         keys: legacy.keys,
-        error: openwork.error,
+        error: fileStatus.error,
       },
       userOpencode: {
         path: opencodeConfigPath(workspace.path),
@@ -1796,6 +2213,7 @@ function createRoutes(
     const body = await readJsonBody(ctx.request);
     const opencode = body.opencode as Record<string, unknown> | undefined;
     const openwork = body.openwork as Record<string, unknown> | undefined;
+    let runtimeChanged = false;
 
     if (!opencode && !openwork) {
       throw new ApiError(400, "invalid_payload", "opencode or openwork updates required");
@@ -1814,13 +2232,13 @@ function createRoutes(
       const { permission, provider, ...topLevelUpdates } = nextOpencode;
       const logicalUpdates: Record<string, unknown> = { ...topLevelUpdates };
 
-      const providerUpdate = ensurePlainObject(provider);
+      // Per-provider merge: record values upsert, explicit `null` deletes
+      // (mergeRuntimeProviderUpdate) — so clients can remove runtime-managed
+      // providers (e.g. cloud imports) without read-modify-write races.
+      const providerUpdate = isRecord(provider) ? provider : {};
       if (Object.keys(providerUpdate).length) {
         const currentRuntime = await readRuntimeOpencodeConfig(config, workspace.id);
-        logicalUpdates.provider = {
-          ...(ensurePlainObject(currentRuntime.provider)),
-          ...providerUpdate,
-        };
+        logicalUpdates.provider = mergeRuntimeProviderUpdate(currentRuntime.provider, providerUpdate);
       }
 
       const permissionUpdate = ensurePlainObject(permission);
@@ -1845,10 +2263,11 @@ function createRoutes(
       }
 
       if (Object.keys(logicalUpdates).length || Object.prototype.hasOwnProperty.call(logicalUpdates, "permission")) {
-        await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
+        const result = await writeRuntimeOpencodeConfig(config, workspace.id, (current) => ({
           ...current,
           ...logicalUpdates,
         }));
+        runtimeChanged = result.changed;
       }
     }
     if (openwork) {
@@ -1868,7 +2287,9 @@ function createRoutes(
       timestamp: Date.now(),
     });
 
-    if (opencode) {
+    // A no-op provider patch (for example cloud sync reconciling an identical
+    // block) must not force an engine reload; that caused a dispose/create loop.
+    if (opencode && runtimeChanged) {
       emitReloadEvent(ctx.reloadEvents, workspace, "config", buildConfigTrigger(openworkConfigPath(workspace.path)));
     }
 
@@ -1882,7 +2303,8 @@ function createRoutes(
     readJsonBody,
     requireClientScope,
     resolveWorkspace,
-    reloadOpencodeEngine,
+    reloadOpencodeEngine: (routeConfig, workspace) =>
+      reloadOpencodeEngine(routeConfig, workspace, engineMcpServerState),
   });
 
   registerFileRoutes({
@@ -1974,69 +2396,11 @@ function createRoutes(
     return jsonResponse(result);
   });
 
-  addRoute(routes, "GET", "/hub/skills", "client", async (ctx) => {
-    const owner = ctx.url.searchParams.get("owner")?.trim();
-    const repo = ctx.url.searchParams.get("repo")?.trim();
-    const ref = ctx.url.searchParams.get("ref")?.trim();
-    const items = await listHubSkills({
-      owner: owner || "different-ai",
-      repo: repo || "openwork-hub",
-      ref: ref || "main",
-    });
-    return jsonResponse({ items });
-  });
-
   addRoute(routes, "GET", "/workspace/:id/skills", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const includeGlobal = ctx.url.searchParams.get("includeGlobal") === "true";
     const items = await listSkills(workspace.path, includeGlobal);
     return jsonResponse({ items });
-  });
-
-  addRoute(routes, "POST", "/workspace/:id/skills/hub/:name", "client", async (ctx) => {
-    ensureWritable(config);
-    requireClientScope(ctx, "collaborator");
-    const workspace = await resolveWorkspace(config, ctx.params.id);
-    const name = String(ctx.params.name ?? "").trim();
-    if (!name) {
-      throw new ApiError(400, "invalid_skill_name", "Skill name is required");
-    }
-    const body = await readJsonBody(ctx.request);
-    const overwrite = body?.overwrite === true;
-    const repoPayload = body?.repo && typeof body.repo === "object" ? (body.repo as Record<string, unknown>) : undefined;
-    const repo = repoPayload
-      ? {
-          owner: typeof repoPayload.owner === "string" ? repoPayload.owner : undefined,
-          repo: typeof repoPayload.repo === "string" ? repoPayload.repo : undefined,
-          ref: typeof repoPayload.ref === "string" ? repoPayload.ref : undefined,
-        }
-      : undefined;
-
-    await requireApproval(ctx, {
-      workspaceId: workspace.id,
-      action: "skills.install_hub",
-      summary: `Install hub skill ${name}`,
-      paths: [join(workspace.path, ".opencode", "skills", name)],
-    });
-
-    const result = await installHubSkill(workspace.path, { name, overwrite, repo });
-    await recordAudit(workspace.path, {
-      id: shortId(),
-      workspaceId: workspace.id,
-      actor: ctx.actor ?? { type: "remote" },
-      action: "skills.install_hub",
-      target: result.path,
-      summary: `Installed hub skill ${name}`,
-      timestamp: Date.now(),
-    });
-    emitReloadEvent(ctx.reloadEvents, workspace, "skills", {
-      type: "skill",
-      name,
-      action: result.action,
-      path: result.path,
-    });
-
-    return jsonResponse({ ok: true, ...result });
   });
 
   addRoute(routes, "GET", "/workspace/:id/skills/:name", "client", async (ctx) => {
@@ -2124,7 +2488,36 @@ function createRoutes(
   addRoute(routes, "GET", "/workspace/:id/mcp", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const items = await listMcp(config, workspace.id, workspace.path);
-    return jsonResponse({ items, engineSync: engineMcpSyncState(workspace.id) });
+    return jsonResponse({
+      items,
+      engineSync: engineMcpSyncStateInState(config, engineMcpServerState, workspace),
+    });
+  });
+
+  // Portable export of installed skills and MCP servers (including
+  // OpenWork-managed runtime MCPs that only live in the runtime DB), so
+  // agents can package them into marketplace plugins. Read-only; MCP
+  // secrets (headers/environment) are always redacted.
+  addRoute(routes, "POST", "/workspace/:id/extensions/export", "client", async (ctx) => {
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const skills = Array.isArray(body.skills)
+      ? body.skills.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    const mcps = Array.isArray(body.mcps)
+      ? body.mcps.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    if (skills.length === 0 && mcps.length === 0) {
+      throw new ApiError(400, "invalid_payload", "At least one skill or mcp name is required");
+    }
+    const result = await exportExtensions({
+      serverConfig: config,
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.path,
+      skills,
+      mcps,
+    });
+    return jsonResponse(result);
   });
 
   addRoute(routes, "POST", "/workspace/:id/mcp", "client", async (ctx) => {
@@ -2146,7 +2539,13 @@ function createRoutes(
     const result = await addMcp(config, workspace.id, name, configPayload);
     // Hot-add into the running engine so connect/auth works immediately,
     // without waiting for an engine instance rebuild.
-    await syncRuntimeMcpToOpencodeEngine(config, workspace, [name]).catch(() => undefined);
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      [name],
+      undefined,
+      engineMcpServerState,
+    ).catch(() => undefined);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -2187,6 +2586,7 @@ function createRoutes(
       timestamp: Date.now(),
     });
     if (removed) {
+      deleteEngineMcpRegistration(config, engineMcpServerState, workspace, name);
       await disconnectMcpFromOpencodeEngine(config, workspace, name).catch(() => undefined);
       emitReloadEvent(ctx.reloadEvents, workspace, "mcp", {
         type: "mcp",
@@ -2222,7 +2622,13 @@ function createRoutes(
     if (!updated) {
       throw new ApiError(404, "mcp_not_found", `MCP ${name} not found in workspace config`);
     }
-    await syncRuntimeMcpToOpencodeEngine(config, workspace, [name]).catch(() => undefined);
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      [name],
+      undefined,
+      engineMcpServerState,
+    ).catch(() => undefined);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -2382,7 +2788,7 @@ function createRoutes(
   addRoute(routes, "GET", "/workspace/:id/export", "client", async (ctx) => {
     const workspace = await resolveWorkspace(config, ctx.params.id);
     const sensitiveMode = parseWorkspaceExportSensitiveMode(ctx.url.searchParams.get("sensitive"));
-    const exportPayload = await exportWorkspace(workspace, { sensitiveMode });
+    const exportPayload = await exportWorkspace(config, workspace, { sensitiveMode });
     return jsonResponse(exportPayload);
   });
 
@@ -2446,7 +2852,7 @@ function createRoutes(
       );
     }
     const configFingerprintBefore = await computeReloadFingerprint(workspace.path, "config");
-    await importWorkspace(workspace, body, latestPreview);
+    await importWorkspace(config, workspace, body, latestPreview);
     await recordAudit(workspace.path, {
       id: shortId(),
       workspaceId: workspace.id,
@@ -2484,7 +2890,7 @@ function createRoutes(
   return routes;
 }
 
-async function resolveWorkspace(config: ServerConfig, id: string): Promise<WorkspaceInfo> {
+async function resolveWorkspaceForInspection(config: ServerConfig, id: string): Promise<WorkspaceInfo> {
   const workspaceId = id.trim();
   const aliasWorkspaceId = workspaceId.startsWith("rem_") ? workspaceId.slice("rem_".length) : "";
   const workspace =
@@ -2493,11 +2899,38 @@ async function resolveWorkspace(config: ServerConfig, id: string): Promise<Works
   if (!workspace) {
     throw new ApiError(404, "workspace_not_found", "Workspace not found");
   }
+  if (workspace.workspaceType === "remote") {
+    return { ...workspace };
+  }
   const resolvedWorkspace = resolve(workspace.path);
   const authorized = await isAuthorizedRoot(resolvedWorkspace, config.authorizedRoots);
   if (!authorized) {
     throw new ApiError(403, "workspace_unauthorized", "Workspace is not authorized");
   }
+  return { ...workspace, path: resolvedWorkspace };
+}
+
+async function resolveWorkspaceWithoutBootstrap(config: ServerConfig, id: string): Promise<WorkspaceInfo> {
+  const workspaceId = id.trim();
+  const aliasWorkspaceId = workspaceId.startsWith("rem_") ? workspaceId.slice("rem_".length) : "";
+  const configuredWorkspace =
+    config.workspaces.find((entry) => entry.id === workspaceId) ??
+    (aliasWorkspaceId ? config.workspaces.find((entry) => entry.id === aliasWorkspaceId) : undefined);
+  if (!configuredWorkspace) {
+    throw new ApiError(404, "workspace_not_found", "Workspace not found");
+  }
+  const resolvedWorkspace = resolve(configuredWorkspace.path);
+  const authorized = await isAuthorizedRoot(resolvedWorkspace, config.authorizedRoots);
+  if (!authorized) {
+    throw new ApiError(403, "workspace_unauthorized", "Workspace is not authorized");
+  }
+  const workspace = { ...configuredWorkspace, path: resolvedWorkspace };
+  return workspace;
+}
+
+async function resolveWorkspace(config: ServerConfig, id: string): Promise<WorkspaceInfo> {
+  const workspace = await resolveWorkspaceWithoutBootstrap(config, id);
+  const resolvedWorkspace = workspace.path;
   if (!config.readOnly) {
     const ensured = await ensureWorkspaceFiles(resolvedWorkspace, workspace.preset ?? "starter");
     const bootstrapReloadReasons = new Set<ReloadReason>(ensured.reloadReasons);
@@ -2509,7 +2942,7 @@ async function resolveWorkspace(config: ServerConfig, id: string): Promise<Works
       reloadOpencodeEngineAfterInternalBootstrap(config, { ...workspace, path: resolvedWorkspace });
     }
   }
-  return { ...workspace, path: resolvedWorkspace };
+  return workspace;
 }
 
 function reloadOpencodeEngineAfterInternalBootstrap(config: ServerConfig, workspace: WorkspaceInfo): void {
@@ -2554,6 +2987,110 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown>> 
   try {
     const json = await request.json();
     return json as Record<string, unknown>;
+  } catch {
+    throw new ApiError(400, "invalid_json", "Invalid JSON body");
+  }
+}
+
+async function readAgentDiagnosticsJsonBody(request: Request): Promise<unknown> {
+  const tooLarge = () => new ApiError(
+    413,
+    "agent_diagnostics_request_too_large",
+    "Agent diagnostics request body is too large",
+  );
+  const timedOut = () => new ApiError(
+    408,
+    "agent_diagnostics_request_timeout",
+    "Agent diagnostics request body timed out",
+  );
+  const configuredDeadlineMs = Number(process.env.OPENWORK_AGENT_DIAGNOSTICS_BODY_TIMEOUT_MS);
+  const deadlineMs = Number.isFinite(configuredDeadlineMs) && configuredDeadlineMs >= 50
+    ? Math.min(configuredDeadlineMs, 10_000)
+    : AGENT_DIAGNOSTICS_DEFAULT_BODY_DEADLINE_MS;
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null) {
+    const declaredBytes = Number(declaredLength);
+    if (Number.isFinite(declaredBytes) && declaredBytes > AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES) {
+      throw tooLarge();
+    }
+  }
+
+  const reader = request.body?.getReader();
+  if (!reader) {
+    throw new ApiError(400, "invalid_json", "Invalid JSON body");
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let deadlineExpired = false;
+  let activeRead: ReturnType<typeof reader.read> | undefined;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    deadlineTimer = setTimeout(() => {
+      deadlineExpired = true;
+      reject(timedOut());
+    }, deadlineMs);
+  });
+  try {
+    while (true) {
+      // Race every read against the same promise. Incoming drips do not reset
+      // the absolute request-body lifetime.
+      activeRead = reader.read();
+      const next = await Promise.race([activeRead, deadline]);
+      activeRead = undefined;
+      if (next.done) {
+        break;
+      }
+      size += next.value.byteLength;
+      if (size > AGENT_DIAGNOSTICS_MAX_REQUEST_BYTES) {
+        throw tooLarge();
+      }
+      chunks.push(next.value);
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "invalid_json", "Invalid JSON body");
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    if (deadlineExpired && activeRead) {
+      const pendingRead = activeRead;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        try {
+          reader.releaseLock();
+          released = true;
+        } catch {
+          // Cancellation owns the lock until the adapter finishes settling it.
+        }
+      };
+      // Returning the 408 with Connection: close lets the adapter flush the
+      // stable safe error before this active stream cancellation tears down the
+      // underlying request socket. The absolute deadline is not extended.
+      // Keep the reader locked until cancellation even if another drip settles
+      // the specific read that lost the deadline race. Otherwise that drip
+      // could leave the remainder of the body unbounded. Wait for both the
+      // cancellation and outstanding read before releasing the lock.
+      setTimeout(() => {
+        void (async () => {
+          await reader.cancel(new Error("Agent diagnostics request body timed out")).catch(() => undefined);
+          await pendingRead.catch(() => undefined);
+          release();
+        })();
+      }, AGENT_DIAGNOSTICS_ERROR_FLUSH_MS);
+    } else {
+      reader.releaseLock();
+    }
+  }
+
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return JSON.parse(text) as unknown;
   } catch {
     throw new ApiError(400, "invalid_json", "Invalid JSON body");
   }
@@ -2604,15 +3141,8 @@ function normalizeOpencodeScope(value: string | null | undefined): "project" | "
   return value?.trim().toLowerCase() === "global" ? "global" : "project";
 }
 
-function resolveOpencodeConfigFilePath(scope: "project" | "global", workspaceRoot: string): string {
-  if (scope === "global") {
-    const base = join(homedir(), ".config", "opencode");
-    const jsoncPath = join(base, "opencode.jsonc");
-    const jsonPath = join(base, "opencode.json");
-    if (existsSync(jsoncPath)) return jsoncPath;
-    if (existsSync(jsonPath)) return jsonPath;
-    return jsoncPath;
-  }
+export function resolveOpencodeConfigFilePath(scope: "project" | "global", workspaceRoot: string): string {
+  if (scope === "global") return resolveGlobalOpencodeConfigPath();
   return opencodeConfigPath(workspaceRoot);
 }
 
@@ -2628,7 +3158,7 @@ async function fetchRuntimeControl(path: string, init?: { method?: string; body?
   if (!control) {
     throw new ApiError(501, "runtime_upgrade_unavailable", "Worker runtime control is not configured on this host");
   }
-  const response = await fetch(`${control.baseUrl}${path}`, {
+  const response = await externalFetch(`${control.baseUrl}${path}`, {
     method: init?.method ?? "GET",
     headers: {
       "Content-Type": "application/json",
@@ -2674,6 +3204,54 @@ async function readOpenworkConfigForStatus(workspaceRoot: string): Promise<{
   }
 }
 
+/**
+ * Resolve the effective per-workspace openwork config from the runtime DB,
+ * migrating a legacy `.opencode/openwork.json` file into the DB on first read.
+ *
+ * The DB is the source of truth. The file is only consulted to seed the DB
+ * once (back-compat for workspaces created before the file->DB migration), and
+ * is never written afterwards. Returns the merged view ({...file, ...db}) so a
+ * partially-migrated install still surfaces every key.
+ */
+async function readOpenworkConfigForWorkspace(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+): Promise<Record<string, unknown>> {
+  const stored = await readOpenworkWorkspaceConfig(config, workspace.id);
+  if (Object.keys(stored).length > 0 || (await hasOpenworkWorkspaceConfig(config, workspace.id))) {
+    return stored;
+  }
+  const legacy = await readOpenworkConfigForStatus(workspace.path);
+  if (Object.keys(legacy.data).length === 0) {
+    if (workspace.workspaceType !== "remote" && workspace.path.trim()) {
+      return seedOpenworkWorkspaceConfigIfEmpty(
+        config,
+        workspace.id,
+        defaultWorkspaceOpenworkConfig(workspace.path, workspace.preset ?? "starter"),
+      );
+    }
+    return {};
+  }
+  // Migrate-on-read: copy the legacy file contents into the DB once.
+  await seedOpenworkWorkspaceConfigIfEmpty(config, workspace.id, legacy.data);
+  return mergeOpenworkWorkspaceConfigs(legacy.data, await readOpenworkWorkspaceConfig(config, workspace.id));
+}
+
+/**
+ * Persist a full openwork config document for a workspace to the runtime DB.
+ * Replaces the legacy file write path; the file is no longer written.
+ */
+async function writeOpenworkConfigForWorkspace(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  payload: Record<string, unknown>,
+  merge: boolean,
+): Promise<void> {
+  await writeOpenworkWorkspaceConfig(config, workspace.id, (current) =>
+    merge ? { ...current, ...payload } : payload,
+  );
+}
+
 function resolveOpencodeDirectory(workspace: WorkspaceInfo): string | null {
   const explicit = workspace.directory?.trim() ?? "";
   if (explicit) return normalizeOpencodeDirectory(explicit);
@@ -2716,7 +3294,13 @@ function parseOpencodeErrorBody(input: string): unknown {
   }
 }
 
-async function reloadOpencodeEngine(config: ServerConfig, workspace: WorkspaceInfo): Promise<void> {
+async function reloadOpencodeEngine(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  serverState?: EngineMcpServerState,
+): Promise<void> {
+  const activeState = activeEngineMcpServerState(config, serverState);
+  if (activeState) invalidateEngineMcpWorkspace(activeState, workspace.id);
   const connection = resolveWorkspaceOpencodeConnection(config, workspace);
   const baseUrl = connection.baseUrl?.trim() ?? "";
   if (!baseUrl) {
@@ -2729,7 +3313,18 @@ async function reloadOpencodeEngine(config: ServerConfig, workspace: WorkspaceIn
   const auth = connection.authHeader ?? null;
   if (auth) headers.Authorization = auth;
 
-  const response = await fetch(targetUrl, { method: "POST", headers });
+  let response: Response;
+  try {
+    // OpenCode reload targets the managed loopback engine; CA trust is irrelevant.
+    response = await loopbackFetch(targetUrl, { method: "POST", headers });
+  } catch (error) {
+    throw new ApiError(
+      503,
+      "opencode_engine_unreachable",
+      "OpenCode engine is not reachable; a full engine restart is required",
+      { baseUrl, cause: error instanceof Error ? error.message : String(error) },
+    );
+  }
   if (!response.ok) {
     const body = parseOpencodeErrorBody(await response.text());
     throw new ApiError(502, "opencode_reload_failed", "OpenCode reload failed", {
@@ -2738,11 +3333,44 @@ async function reloadOpencodeEngine(config: ServerConfig, workspace: WorkspaceIn
     });
   }
 
+  markOpenworkCloudMcpStale(workspace, directory);
   // Re-register runtime-DB MCPs: dispose rebuilds engine state from disk
   // configs (including the server-managed runtime config file for the
   // primary workspace), but other workspaces' runtime MCPs only reach the
   // engine through this dynamic push.
-  await syncRuntimeMcpToOpencodeEngine(config, workspace).catch(() => undefined);
+  try {
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      undefined,
+      undefined,
+      activeState ?? null,
+    );
+  } catch (error) {
+    logRuntimeMcpSyncError({ config, workspace, trigger: "engine_reload", error });
+  }
+  try {
+    const health = await reconcilePersistedOpenworkCloudMcp({
+      config,
+      workspace,
+      directory,
+      serverMetadata: { serverVersion: SERVER_VERSION, expectedOpencodeVersion: OPENCODE_VERSION },
+      createWorkspaceOpencodeClient,
+      refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
+      registerRuntimeMcp: (routeConfig, routeWorkspace, onlyNames, options) =>
+        syncRuntimeMcpToOpencodeEngine(
+          routeConfig,
+          routeWorkspace,
+          onlyNames,
+          options,
+          activeState ?? null,
+        ),
+      trigger: "engine_reload",
+    });
+    logPersistedCloudMcpReconcileResult({ config, workspace, trigger: "engine_reload", health });
+  } catch (error) {
+    logPersistedCloudMcpReconcileError({ config, workspace, trigger: "engine_reload", error });
+  }
 }
 
 // Push runtime-DB MCP entries into the running OpenCode engine via its dynamic
@@ -2754,16 +3382,41 @@ async function syncRuntimeMcpToOpencodeEngine(
   config: ServerConfig,
   workspace: WorkspaceInfo,
   onlyNames?: string[],
-): Promise<void> {
+  options?: { throwOnFailure?: boolean; deferred?: boolean },
+  serverState?: EngineMcpServerState | null,
+): Promise<EngineMcpSyncResult> {
+  const activeState = activeEngineMcpServerState(config, serverState);
   const connection = resolveWorkspaceOpencodeConnection(config, workspace);
   const baseUrl = connection.baseUrl?.trim() ?? "";
-  if (!baseUrl) return;
+  const connectionIdentity = engineMcpConnectionIdentity(config, workspace);
+  const registrationIdentity = engineMcpRegistrationIdentity(config, workspace);
+  if (activeState) reconcileEngineMcpWorkspaceIdentity(activeState, workspace.id, connectionIdentity);
+  if (activeState && !options?.deferred) cancelDeferredEngineMcpSync(activeState, workspace.id);
+  if (!baseUrl || !connectionIdentity) {
+    return { status: "skipped", syncedNames: [], failures: [] };
+  }
 
   const runtimeConfig = await readRuntimeOpencodeConfig(config, workspace.id);
   const entries = Object.entries(runtimeMcpMap(runtimeConfig)).filter(
     ([name]) => !onlyNames || onlyNames.includes(name),
   );
-  if (entries.length === 0) return;
+  if (entries.length === 0) {
+    if (!onlyNames) {
+      recordEngineMcpSyncResult(
+        config,
+        activeState ?? null,
+        workspace,
+        connectionIdentity,
+        registrationIdentity,
+        {
+          entries: [],
+          failures: [],
+          replace: true,
+        },
+      );
+    }
+    return { status: "skipped", syncedNames: [], failures: [] };
+  }
 
   const url = new URL(baseUrl);
   url.pathname = "/mcp";
@@ -2777,29 +3430,56 @@ async function syncRuntimeMcpToOpencodeEngine(
   // block re-registration of every entry after it (e.g. openwork-ui) on
   // each engine reload.
   const failures: EngineMcpSyncFailure[] = [];
+  const registrations: EngineMcpRegistrationResult[] = [];
   for (const [name, mcpConfig] of entries) {
-    const failure = await postMcpEntryWithRetry(url, headers, name, mcpConfig);
-    if (failure) failures.push(failure);
+    const registration = await postMcpEntryWithRetry(url, headers, name, mcpConfig);
+    registrations.push(registration);
+    if (registration.failure) failures.push(registration.failure);
   }
 
-  recordEngineMcpSyncResult(workspace.id, {
-    syncedNames: entries.map(([name]) => name),
-    failures,
-    // A full sync covered every runtime entry, so its result replaces any
-    // previously recorded failures (e.g. for since-removed MCPs).
-    replace: !onlyNames,
-  });
+  recordEngineMcpSyncResult(
+    config,
+    activeState ?? null,
+    workspace,
+    connectionIdentity,
+    registrationIdentity,
+    {
+      entries,
+      registrations,
+      failures,
+      // A full sync covered every runtime entry, so its result replaces any
+      // previously recorded failures (e.g. for since-removed MCPs).
+      replace: !onlyNames,
+    },
+  );
 
   if (failures.length > 0) {
+    if (activeState && !options?.deferred && hasRetryableMcpSyncFailure(failures)) {
+      scheduleDeferredEngineMcpSync({
+        config,
+        state: activeState,
+        workspace,
+        connectionIdentity,
+        onlyNames,
+      });
+    }
     const names = failures.map((failure) => failure.name).join(", ");
     createServerLogger(config).log("warn", `Engine MCP sync failed for workspace ${workspace.id}: ${names}`, {
       "workspace.id": workspace.id,
       "mcp.failed": names,
     });
-    throw new ApiError(502, "opencode_mcp_sync_failed", `Failed to register MCPs with the engine: ${names}`, {
-      failures,
-    });
+    if (options?.throwOnFailure !== false) {
+      throw new ApiError(502, "opencode_mcp_sync_failed", `Failed to register MCPs with the engine: ${names}`, {
+        failures,
+      });
+    }
   }
+
+  return {
+    status: failures.length > 0 ? "failed" : "ok",
+    syncedNames: entries.map(([name]) => name),
+    failures,
+  };
 }
 
 // POST one MCP entry to the engine, retrying once on 5xx/network errors
@@ -2810,25 +3490,182 @@ async function postMcpEntryWithRetry(
   headers: Record<string, string>,
   name: string,
   mcpConfig: Record<string, unknown>,
-): Promise<EngineMcpSyncFailure | null> {
+): Promise<EngineMcpRegistrationResult> {
   let failure: EngineMcpSyncFailure | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, engineMcpSyncRetryDelayMs()));
     try {
-      const response = await fetch(url, {
+      // Runtime MCP registration targets the managed loopback engine.
+      const response = await loopbackFetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify({ name, config: mcpConfig }),
         signal: AbortSignal.timeout(15_000),
       });
-      if (response.ok) return null;
-      failure = { name, status: response.status, body: parseOpencodeErrorBody(await response.text()) };
-      if (response.status < 500) return failure;
-    } catch (error) {
-      failure = { name, message: error instanceof Error ? error.message : String(error) };
+      if (response.ok) {
+        // OpenCode's dynamic registration endpoint historically treats every
+        // 2xx response as accepted delivery and Cloud readiness verifies the
+        // actual state by polling GET /mcp. Parse the response only as optional
+        // diagnostics evidence: an absent or malformed status must fail closed
+        // to `not-recorded` without turning accepted delivery into a failure.
+        const registration = await parseEngineMcpRegistrationStatus(response, name);
+        return {
+          name,
+          status: registration.status,
+          source: registration.status ? "engine_status" : null,
+          errorSummary: registration.errorSummary,
+          failure: null,
+        };
+      }
+      await response.body?.cancel().catch(() => undefined);
+      failure = {
+        name,
+        status: response.status,
+        registrationStatus: "failed",
+        message: "OpenCode rejected the MCP registration request",
+      };
+      if (response.status < 500) return { name, status: "failed", source: "transport_failure", errorSummary: null, failure };
+    } catch {
+      failure = {
+        name,
+        registrationStatus: "failed",
+        message: "OpenCode MCP registration request failed",
+      };
     }
   }
-  return failure;
+  return {
+    name,
+    status: "failed",
+    source: "transport_failure",
+    errorSummary: null,
+    failure: failure ?? {
+      name,
+      registrationStatus: "failed",
+      message: "OpenCode MCP registration request failed",
+    },
+  };
+}
+
+const ENGINE_MCP_REGISTRATION_RESPONSE_MAX_BYTES = 64 * 1024;
+
+export type EngineMcpRegistrationStatus =
+  | "connected"
+  | "disabled"
+  | "failed"
+  | "needs-auth"
+  | "needs-client-registration";
+export type EngineMcpRegistrationSource = "transport_failure" | "engine_status";
+
+export type EngineMcpRegistrationInspection = {
+  status: EngineMcpRegistrationStatus | "not-recorded";
+  source: EngineMcpRegistrationSource | null;
+  recordAgeMs: number | null;
+  errorSummary: string | null;
+};
+
+type EngineMcpRegistrationResult = {
+  name: string;
+  status: EngineMcpRegistrationStatus | null;
+  source: EngineMcpRegistrationSource | null;
+  errorSummary: string | null;
+  failure: EngineMcpSyncFailure | null;
+};
+
+type ParsedEngineMcpRegistrationStatus = {
+  status: EngineMcpRegistrationStatus | null;
+  errorSummary: string | null;
+};
+
+type EngineMcpDeferredSync = {
+  timer: ReturnType<typeof setTimeout>;
+  connectionIdentity: string;
+  generation: number;
+  onlyNames?: string[];
+};
+
+async function parseEngineMcpRegistrationStatus(
+  response: Response,
+  name: string,
+): Promise<ParsedEngineMcpRegistrationStatus> {
+  let text: string;
+  try {
+    text = await readBoundedEngineMcpRegistrationResponse(response);
+  } catch {
+    return { status: null, errorSummary: null };
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(text) as unknown;
+  } catch {
+    return { status: null, errorSummary: null };
+  }
+  if (!isRecord(body) || !Object.hasOwn(body, name)) return { status: null, errorSummary: null };
+  const entry = body[name];
+  if (!isRecord(entry)) return { status: null, errorSummary: null };
+  const status = normalizeEngineMcpRegistrationStatus(entry.status);
+  return {
+    status,
+    errorSummary: sanitizeEngineMcpRegistrationErrorSummary(entry.error, status),
+  };
+}
+
+function sanitizeEngineMcpRegistrationErrorSummary(
+  error: unknown,
+  status: EngineMcpRegistrationStatus | null,
+): string | null {
+  if (status !== "failed" && status !== "needs-client-registration") return null;
+  if (typeof error !== "string") return null;
+  const sanitized = sanitizeDiagnosticString(error).trim().slice(0, 400);
+  return sanitized || null;
+}
+
+function normalizeEngineMcpRegistrationStatus(status: unknown): EngineMcpRegistrationStatus | null {
+  switch (status) {
+    case "connected":
+    case "disabled":
+    case "failed":
+      return status;
+    case "needs_auth":
+      return "needs-auth";
+    case "needs_client_registration":
+      return "needs-client-registration";
+    default:
+      return null;
+  }
+}
+
+async function readBoundedEngineMcpRegistrationResponse(response: Response): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > ENGINE_MCP_REGISTRATION_RESPONSE_MAX_BYTES) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error("OpenCode MCP registration response exceeded the size limit");
+    }
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let bytesRead = 0;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytesRead += chunk.value.byteLength;
+      if (bytesRead > ENGINE_MCP_REGISTRATION_RESPONSE_MAX_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("OpenCode MCP registration response exceeded the size limit");
+      }
+      chunks.push(decoder.decode(chunk.value, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join("");
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 // Read lazily so tests can shrink the delay at runtime.
@@ -2837,34 +3674,613 @@ function engineMcpSyncRetryDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 750;
 }
 
-export type EngineMcpSyncFailure = { name: string; status?: number; body?: unknown; message?: string };
+function engineMcpDeferredSyncDelayMs(): number {
+  const parsed = Number(process.env.OPENWORK_MCP_SYNC_DEFERRED_DELAY_MS ?? "12000");
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 12_000;
+}
+
+function hasRetryableMcpSyncFailure(failures: EngineMcpSyncFailure[]): boolean {
+  return failures.some((failure) => failure.status === undefined || failure.status >= 500);
+}
+
+function cancelDeferredEngineMcpSync(state: EngineMcpServerState, workspaceId: string): void {
+  const previous = state.deferredSyncByWorkspace.get(workspaceId);
+  if (!previous) return;
+  clearTimeout(previous.timer);
+  state.deferredSyncByWorkspace.delete(workspaceId);
+}
+
+function scheduleDeferredEngineMcpSync(input: {
+  config: ServerConfig;
+  state: EngineMcpServerState;
+  workspace: WorkspaceInfo;
+  connectionIdentity: string;
+  onlyNames?: string[];
+}): void {
+  cancelDeferredEngineMcpSync(input.state, input.workspace.id);
+  const generation = input.state.generation;
+  const onlyNames = input.onlyNames ? [...input.onlyNames] : undefined;
+  const timer = setTimeout(() => {
+    const state = activeEngineMcpServerState(input.config, input.state);
+    if (!state || state.generation !== generation) return;
+    const current = state.deferredSyncByWorkspace.get(input.workspace.id);
+    if (!current || current.generation !== generation) return;
+    state.deferredSyncByWorkspace.delete(input.workspace.id);
+    if (engineMcpConnectionIdentity(input.config, input.workspace) !== input.connectionIdentity) return;
+    if (state.syncStateByWorkspace.get(input.workspace.id)?.status === "ok") return;
+    createServerLogger(input.config).log(
+      "info",
+      `Running deferred engine MCP sync for workspace ${input.workspace.id}.`,
+      { "workspace.id": input.workspace.id },
+    );
+    void syncRuntimeMcpToOpencodeEngine(
+      input.config,
+      input.workspace,
+      current.onlyNames,
+      { throwOnFailure: false, deferred: true },
+      state,
+    ).catch((error) => {
+      createServerLogger(input.config).log(
+        "warn",
+        `Deferred engine MCP sync failed for workspace ${input.workspace.id}.`,
+        {
+          "workspace.id": input.workspace.id,
+          "mcp.failure.code": "deferred_runtime_mcp_sync_failed",
+          "mcp.failure.message": error instanceof Error ? error.message : String(error),
+        },
+      );
+    });
+  }, engineMcpDeferredSyncDelayMs());
+  input.state.deferredSyncByWorkspace.set(input.workspace.id, {
+    timer,
+    connectionIdentity: input.connectionIdentity,
+    generation,
+    ...(onlyNames ? { onlyNames } : {}),
+  });
+}
+
+export type EngineMcpSyncFailure = {
+  name: string;
+  status?: number;
+  registrationStatus?: EngineMcpRegistrationStatus;
+  message?: string;
+};
+export type EngineMcpSyncResult = {
+  status: "ok" | "failed" | "skipped";
+  syncedNames: string[];
+  failures: EngineMcpSyncFailure[];
+};
 export type EngineMcpSyncState = { status: "ok" | "failed"; at: number; failures: EngineMcpSyncFailure[] };
 
-// Last engine sync outcome per workspace, surfaced on GET /workspace/:id/mcp
-// so the UI can explain why an enabled MCP shows as disconnected instead of
-// failing silently.
-const engineMcpSyncStateByWorkspace = new Map<string, EngineMcpSyncState>();
+type EngineMcpRegistrationRecord = {
+  fingerprint: string;
+  status: EngineMcpRegistrationStatus;
+  source: EngineMcpRegistrationSource;
+  errorSummary: string | null;
+  registrationIdentity: string;
+  generation: number;
+  recordedAt: number;
+};
+
+type TrustedOpencodeProcessIdentity = {
+  endpoint: string;
+  identityHash: string;
+  generation: number;
+  isAlive: () => boolean;
+};
+
+type EngineMcpServerState = {
+  generation: number;
+  syncStateByWorkspace: Map<string, EngineMcpSyncState>;
+  registrationByWorkspace: Map<string, Map<string, EngineMcpRegistrationRecord>>;
+  engineIdentityByWorkspace: Map<string, string>;
+  deferredSyncByWorkspace: Map<string, EngineMcpDeferredSync>;
+};
+
+const ENGINE_MCP_REGISTRATION_MAX_AGE_MS = 15 * 60_000;
+// Registration status is point-in-time evidence from a dynamic POST /mcp,
+// not a durable statement about a later engine process. Scope it to one
+// OpenWork server generation and expire it even when the endpoint is stable.
+const engineMcpServerStateByConfig = new WeakMap<ServerConfig, EngineMcpServerState>();
+const trustedOpencodeProcessByConfig = new WeakMap<ServerConfig, TrustedOpencodeProcessIdentity>();
+let nextEngineMcpServerGeneration = 0;
+let nextTrustedOpencodeProcessGeneration = 0;
+
+function normalizedOpencodeProcessEndpoint(baseUrl: string): string | null {
+  try {
+    const url = new URL(baseUrl);
+    url.pathname = "/global/health";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function clearEngineMcpServerEvidence(state: EngineMcpServerState): void {
+  for (const deferred of state.deferredSyncByWorkspace.values()) clearTimeout(deferred.timer);
+  state.syncStateByWorkspace.clear();
+  state.registrationByWorkspace.clear();
+  state.engineIdentityByWorkspace.clear();
+  state.deferredSyncByWorkspace.clear();
+}
+
+/**
+ * Bind diagnostics evidence to one OpenCode process generation owned by this
+ * OpenWork server. The opaque identity is hashed immediately and never
+ * reported. External engines without a trusted per-boot identity still hot
+ * sync normally, but their cached registration result cannot authorize a
+ * credentialed diagnostics probe.
+ */
+export function registerTrustedOpencodeProcess(
+  config: ServerConfig,
+  input: { baseUrl: string; identity: string; isAlive: () => boolean },
+): void {
+  const endpoint = normalizedOpencodeProcessEndpoint(input.baseUrl.trim());
+  const identity = input.identity.trim();
+  if (!endpoint || !identity) {
+    clearTrustedOpencodeProcess(config);
+    return;
+  }
+  const previous = trustedOpencodeProcessByConfig.get(config);
+  const identityHash = hashToken(identity);
+  const next: TrustedOpencodeProcessIdentity = {
+    endpoint,
+    identityHash,
+    generation: previous?.endpoint === endpoint && previous.identityHash === identityHash
+      ? previous.generation
+      : ++nextTrustedOpencodeProcessGeneration,
+    isAlive: input.isAlive,
+  };
+  if (previous?.endpoint !== next.endpoint || previous.identityHash !== next.identityHash) {
+    const state = engineMcpServerStateByConfig.get(config);
+    if (state) clearEngineMcpServerEvidence(state);
+  }
+  trustedOpencodeProcessByConfig.set(config, next);
+}
+
+export function clearTrustedOpencodeProcess(config: ServerConfig, expectedIdentity?: string): void {
+  const current = trustedOpencodeProcessByConfig.get(config);
+  if (!current) return;
+  if (expectedIdentity && current.identityHash !== hashToken(expectedIdentity.trim())) return;
+  trustedOpencodeProcessByConfig.delete(config);
+  const state = engineMcpServerStateByConfig.get(config);
+  if (state) clearEngineMcpServerEvidence(state);
+}
+
+function beginEngineMcpServerState(config: ServerConfig): EngineMcpServerState {
+  const previous = engineMcpServerStateByConfig.get(config);
+  if (previous) invalidateEngineMcpServerState(config, previous);
+  const state: EngineMcpServerState = {
+    generation: ++nextEngineMcpServerGeneration,
+    syncStateByWorkspace: new Map(),
+    registrationByWorkspace: new Map(),
+    engineIdentityByWorkspace: new Map(),
+    deferredSyncByWorkspace: new Map(),
+  };
+  engineMcpServerStateByConfig.set(config, state);
+  return state;
+}
+
+function activeEngineMcpServerState(
+  config: ServerConfig,
+  candidate?: EngineMcpServerState | null,
+): EngineMcpServerState | undefined {
+  if (candidate === null) return undefined;
+  const active = engineMcpServerStateByConfig.get(config);
+  if (!active || (candidate && active !== candidate)) return undefined;
+  return candidate ?? active;
+}
+
+function invalidateEngineMcpServerState(config: ServerConfig, state: EngineMcpServerState): void {
+  clearEngineMcpServerEvidence(state);
+  if (engineMcpServerStateByConfig.get(config) === state) {
+    engineMcpServerStateByConfig.delete(config);
+  }
+}
+
+function invalidateEngineMcpWorkspace(state: EngineMcpServerState, workspaceId: string): void {
+  const deferred = state.deferredSyncByWorkspace.get(workspaceId);
+  if (deferred) clearTimeout(deferred.timer);
+  state.syncStateByWorkspace.delete(workspaceId);
+  state.registrationByWorkspace.delete(workspaceId);
+  state.engineIdentityByWorkspace.delete(workspaceId);
+  state.deferredSyncByWorkspace.delete(workspaceId);
+}
+
+function reconcileEngineMcpWorkspaceIdentity(
+  state: EngineMcpServerState,
+  workspaceId: string,
+  engineIdentity: string | null,
+): void {
+  const previous = state.engineIdentityByWorkspace.get(workspaceId);
+  if (!engineIdentity) {
+    invalidateEngineMcpWorkspace(state, workspaceId);
+    return;
+  }
+  if (previous && previous !== engineIdentity) {
+    invalidateEngineMcpWorkspace(state, workspaceId);
+  }
+  state.engineIdentityByWorkspace.set(workspaceId, engineIdentity);
+}
+
+function engineMcpRegistrationMaxAgeMs(): number {
+  const configured = Number(process.env.OPENWORK_MCP_REGISTRATION_MAX_AGE_MS);
+  if (!Number.isFinite(configured) || configured < 1) return ENGINE_MCP_REGISTRATION_MAX_AGE_MS;
+  return Math.min(ENGINE_MCP_REGISTRATION_MAX_AGE_MS, Math.round(configured));
+}
+
+const MCP_REGISTRATION_FINGERPRINT_MAX_DEPTH = 32;
+const MCP_REGISTRATION_FINGERPRINT_MAX_NODES = 10_000;
+
+function hasBoundedMcpRegistrationStructure(value: unknown): boolean {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const visited = new Set<object>();
+  let nodes = 0;
+  try {
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current) break;
+      nodes += 1;
+      if (nodes > MCP_REGISTRATION_FINGERPRINT_MAX_NODES) return false;
+      if (current.depth > MCP_REGISTRATION_FINGERPRINT_MAX_DEPTH) return false;
+      if (typeof current.value !== "object" || current.value === null) continue;
+      if (visited.has(current.value)) return false;
+      visited.add(current.value);
+      const children = Array.isArray(current.value)
+        ? current.value
+        : Object.values(current.value);
+      for (const child of children) {
+        stack.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function serializeStableMcpRegistrationValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(serializeStableMcpRegistrationValue).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${serializeStableMcpRegistrationValue(child)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function stableMcpRegistrationValue(value: unknown): string | null {
+  if (!hasBoundedMcpRegistrationStructure(value)) return null;
+  try {
+    return serializeStableMcpRegistrationValue(value);
+  } catch {
+    return null;
+  }
+}
+
+function mcpRegistrationFingerprint(config: Record<string, unknown>): string | null {
+  const stableValue = stableMcpRegistrationValue(config);
+  return stableValue === null ? null : hashToken(stableValue);
+}
+
+function engineMcpConnectionIdentity(config: ServerConfig, workspace: WorkspaceInfo): string | null {
+  const connection = resolveWorkspaceOpencodeConnection(config, workspace);
+  const baseUrl = connection.baseUrl?.trim() ?? "";
+  if (!baseUrl) return null;
+  try {
+    const url = new URL(baseUrl);
+    url.pathname = "/mcp";
+    url.search = "";
+    url.hash = "";
+    const directory = resolveOpencodeDirectory(workspace);
+    if (directory) url.searchParams.set("directory", directory);
+    const stableIdentity = stableMcpRegistrationValue({
+      endpoint: url.toString(),
+      authorization: connection.authHeader ?? null,
+    });
+    return stableIdentity === null ? null : hashToken(stableIdentity);
+  } catch {
+    return null;
+  }
+}
+
+function trustedOpencodeProcessIdentity(config: ServerConfig, workspace: WorkspaceInfo): string | null {
+  const trusted = trustedOpencodeProcessByConfig.get(config);
+  if (!trusted) return null;
+
+  let isAlive = false;
+  try {
+    isAlive = trusted.isAlive();
+  } catch {
+    isAlive = false;
+  }
+  if (!isAlive) {
+    clearTrustedOpencodeProcess(config);
+    return null;
+  }
+
+  const connection = resolveWorkspaceOpencodeConnection(config, workspace);
+  const endpoint = normalizedOpencodeProcessEndpoint(connection.baseUrl?.trim() ?? "");
+  if (!endpoint || endpoint !== trusted.endpoint) return null;
+
+  const stableIdentity = stableMcpRegistrationValue({
+    generation: trusted.generation,
+    identityHash: trusted.identityHash,
+  });
+  return stableIdentity === null ? null : hashToken(stableIdentity);
+}
+
+function engineMcpRegistrationIdentity(config: ServerConfig, workspace: WorkspaceInfo): string | null {
+  const connectionIdentity = engineMcpConnectionIdentity(config, workspace);
+  const processIdentity = trustedOpencodeProcessIdentity(config, workspace);
+  if (!connectionIdentity || !processIdentity) return null;
+  const stableIdentity = stableMcpRegistrationValue({ connectionIdentity, processIdentity });
+  return stableIdentity === null ? null : hashToken(stableIdentity);
+}
 
 function recordEngineMcpSyncResult(
-  workspaceId: string,
-  result: { syncedNames: string[]; failures: EngineMcpSyncFailure[]; replace: boolean },
+  config: ServerConfig,
+  serverState: EngineMcpServerState | null,
+  workspace: WorkspaceInfo,
+  connectionIdentity: string,
+  registrationIdentity: string | null,
+  result: {
+    entries: Array<[string, Record<string, unknown>]>;
+    registrations?: EngineMcpRegistrationResult[];
+    failures: EngineMcpSyncFailure[];
+    replace: boolean;
+  },
 ): void {
-  const previous = engineMcpSyncStateByWorkspace.get(workspaceId);
+  const state = activeEngineMcpServerState(config, serverState);
+  if (!state) return;
+  const currentConnectionIdentity = engineMcpConnectionIdentity(config, workspace);
+  if (currentConnectionIdentity !== connectionIdentity) {
+    invalidateEngineMcpWorkspace(state, workspace.id);
+    return;
+  }
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, connectionIdentity);
+  const currentRegistrationIdentity = engineMcpRegistrationIdentity(config, workspace);
+  // The liveness check above can revoke trust and clear the state. Restore the
+  // transport identity before recording the non-sensitive sync outcome.
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, connectionIdentity);
+  const workspaceId = workspace.id;
+  const syncedNames = result.entries.map(([name]) => name);
+  const previous = state.syncStateByWorkspace.get(workspaceId);
   // Partial syncs (onlyNames) shouldn't clear recorded failures for entries
   // they didn't touch; merge by name instead.
   const remaining = result.replace
     ? []
-    : (previous?.failures ?? []).filter((failure) => !result.syncedNames.includes(failure.name));
+    : (previous?.failures ?? []).filter((failure) => !syncedNames.includes(failure.name));
   const merged = [...remaining, ...result.failures];
-  engineMcpSyncStateByWorkspace.set(workspaceId, {
+  const recordedAt = Date.now();
+  state.syncStateByWorkspace.set(workspaceId, {
     status: merged.length > 0 ? "failed" : "ok",
-    at: Date.now(),
+    at: recordedAt,
     failures: merged,
   });
+
+  if (!registrationIdentity || currentRegistrationIdentity !== registrationIdentity) {
+    state.registrationByWorkspace.delete(workspaceId);
+    return;
+  }
+
+  const registrations = result.replace
+    ? new Map<string, EngineMcpRegistrationRecord>()
+    : new Map(state.registrationByWorkspace.get(workspaceId) ?? []);
+  const registrationByName = new Map(result.registrations?.map((registration) => [registration.name, registration]));
+  for (const [name, mcpConfig] of result.entries) {
+    const fingerprint = mcpRegistrationFingerprint(mcpConfig);
+    const registration = registrationByName.get(name);
+    if (fingerprint === null || !registration?.status || !registration.source) {
+      registrations.delete(name);
+      continue;
+    }
+    registrations.set(name, {
+      fingerprint,
+      status: registration.status,
+      source: registration.source,
+      errorSummary: registration.errorSummary,
+      registrationIdentity,
+      generation: state.generation,
+      recordedAt,
+    });
+  }
+  state.registrationByWorkspace.set(workspaceId, registrations);
 }
 
-export function engineMcpSyncState(workspaceId: string): EngineMcpSyncState | null {
-  return engineMcpSyncStateByWorkspace.get(workspaceId) ?? null;
+function engineMcpSyncStateInState(
+  config: ServerConfig,
+  serverState: EngineMcpServerState,
+  workspace: WorkspaceInfo,
+): EngineMcpSyncState | null {
+  const state = activeEngineMcpServerState(config, serverState);
+  if (!state) return null;
+  const engineIdentity = engineMcpConnectionIdentity(config, workspace);
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, engineIdentity);
+  if (!engineIdentity) return null;
+  return state.syncStateByWorkspace.get(workspace.id) ?? null;
+}
+
+function inspectEngineMcpRegistrationInState(
+  config: ServerConfig,
+  serverState: EngineMcpServerState,
+  workspace: WorkspaceInfo,
+  name: string,
+  mcpConfig: Record<string, unknown>,
+): EngineMcpRegistrationInspection {
+  const state = activeEngineMcpServerState(config, serverState);
+  if (!state) return notRecordedEngineMcpRegistration();
+  const connectionIdentity = engineMcpConnectionIdentity(config, workspace);
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, connectionIdentity);
+  if (!connectionIdentity) return notRecordedEngineMcpRegistration();
+  const registrationIdentity = engineMcpRegistrationIdentity(config, workspace);
+  if (!registrationIdentity) {
+    state.registrationByWorkspace.delete(workspace.id);
+    return notRecordedEngineMcpRegistration();
+  }
+  const registrations = state.registrationByWorkspace.get(workspace.id);
+  const registration = registrations?.get(name);
+  if (!registration) return notRecordedEngineMcpRegistration();
+  const currentFingerprint = mcpRegistrationFingerprint(mcpConfig);
+  const ageMs = Date.now() - registration.recordedAt;
+  if (
+    registration.generation !== state.generation
+    || registration.registrationIdentity !== registrationIdentity
+    || !Number.isFinite(ageMs)
+    || ageMs < 0
+    || ageMs > engineMcpRegistrationMaxAgeMs()
+    || currentFingerprint === null
+    || registration.fingerprint !== currentFingerprint
+  ) {
+    registrations?.delete(name);
+    return notRecordedEngineMcpRegistration();
+  }
+  return {
+    status: registration.status,
+    source: registration.source,
+    recordAgeMs: Math.round(ageMs),
+    errorSummary: registration.errorSummary,
+  };
+}
+
+function notRecordedEngineMcpRegistration(): EngineMcpRegistrationInspection {
+  return { status: "not-recorded", source: null, recordAgeMs: null, errorSummary: null };
+}
+
+export function inspectEngineMcpRegistration(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  name: string,
+  mcpConfig: Record<string, unknown>,
+): EngineMcpRegistrationStatus | "not-recorded" {
+  return inspectEngineMcpRegistrationDetails(config, workspace, name, mcpConfig).status;
+}
+
+export function inspectEngineMcpRegistrationDetails(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  name: string,
+  mcpConfig: Record<string, unknown>,
+): EngineMcpRegistrationInspection {
+  const state = activeEngineMcpServerState(config);
+  if (!state) return notRecordedEngineMcpRegistration();
+  return inspectEngineMcpRegistrationInState(config, state, workspace, name, mcpConfig);
+}
+
+export function refreshEngineMcpRegistrationFromLiveStatus(
+  config: ServerConfig,
+  workspace: WorkspaceInfo,
+  name: string,
+  mcpConfig: Record<string, unknown>,
+  liveStatus: unknown,
+  liveError: unknown = null,
+): boolean {
+  const status = normalizeEngineMcpRegistrationStatus(liveStatus);
+  if (!status) return false;
+  const state = activeEngineMcpServerState(config);
+  if (!state) return false;
+  const connectionIdentity = engineMcpConnectionIdentity(config, workspace);
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, connectionIdentity);
+  if (!connectionIdentity) return false;
+  const registrationIdentity = engineMcpRegistrationIdentity(config, workspace);
+  if (!registrationIdentity) {
+    state.registrationByWorkspace.delete(workspace.id);
+    return false;
+  }
+  const fingerprint = mcpRegistrationFingerprint(mcpConfig);
+  if (fingerprint === null) {
+    state.registrationByWorkspace.get(workspace.id)?.delete(name);
+    return false;
+  }
+  const registrations = new Map(state.registrationByWorkspace.get(workspace.id) ?? []);
+  registrations.set(name, {
+    fingerprint,
+    status,
+    source: "engine_status",
+    errorSummary: sanitizeEngineMcpRegistrationErrorSummary(liveError, status),
+    registrationIdentity,
+    generation: state.generation,
+    recordedAt: Date.now(),
+  });
+  state.registrationByWorkspace.set(workspace.id, registrations);
+  return true;
+}
+
+function deleteEngineMcpRegistration(
+  config: ServerConfig,
+  serverState: EngineMcpServerState,
+  workspace: WorkspaceInfo,
+  name: string,
+): void {
+  const state = activeEngineMcpServerState(config, serverState);
+  if (!state) return;
+  reconcileEngineMcpWorkspaceIdentity(state, workspace.id, engineMcpConnectionIdentity(config, workspace));
+  state.registrationByWorkspace.get(workspace.id)?.delete(name);
+}
+
+function logPersistedCloudMcpReconcileResult(input: {
+  config: ServerConfig;
+  workspace: WorkspaceInfo;
+  trigger: "startup" | "engine_reload";
+  health: CloudMcpHealth;
+}): void {
+  if (!input.health.desired.present || input.health.usable) return;
+  const failure = input.health.firstFailure;
+  createServerLogger(input.config).log(
+    "warn",
+    `Cloud MCP ${input.trigger} reconciliation left connected service tools unavailable for workspace ${input.workspace.id}.`,
+    {
+      "workspace.id": input.workspace.id,
+      "mcp.name": "openwork-cloud",
+      "mcp.trigger": input.trigger,
+      "mcp.failure.code": failure?.code ?? "unknown",
+      "mcp.failure.stage": failure?.stage ?? "unknown",
+      "mcp.failure.retryable": failure?.retryable ?? null,
+      "mcp.failure.message": failure?.message ?? "Cloud MCP health remained unusable after reconciliation.",
+    },
+  );
+}
+
+function logRuntimeMcpSyncError(input: {
+  config: ServerConfig;
+  workspace: WorkspaceInfo;
+  trigger: "startup" | "engine_reload";
+  error: unknown;
+}): void {
+  createServerLogger(input.config).log(
+    "error",
+    `Runtime MCP ${input.trigger} sync crashed for workspace ${input.workspace.id}.`,
+    {
+      "workspace.id": input.workspace.id,
+      "mcp.trigger": input.trigger,
+      "mcp.failure.code": "runtime_mcp_sync_exception",
+      "mcp.failure.message": input.error instanceof Error ? input.error.message : String(input.error),
+    },
+  );
+}
+
+function logPersistedCloudMcpReconcileError(input: {
+  config: ServerConfig;
+  workspace: WorkspaceInfo;
+  trigger: "startup" | "engine_reload";
+  error: unknown;
+}): void {
+  createServerLogger(input.config).log(
+    "error",
+    `Cloud MCP ${input.trigger} reconciliation crashed for workspace ${input.workspace.id}.`,
+    {
+      "workspace.id": input.workspace.id,
+      "mcp.name": "openwork-cloud",
+      "mcp.trigger": input.trigger,
+      "mcp.failure.code": "cloud_mcp_reconcile_exception",
+      "mcp.failure.message": input.error instanceof Error ? input.error.message : String(input.error),
+    },
+  );
 }
 
 // Re-push every workspace's runtime-DB MCPs into the engine. Used at startup:
@@ -2872,8 +4288,41 @@ export function engineMcpSyncState(workspaceId: string): EngineMcpSyncState | nu
 // only, so other workspaces' runtime MCPs are invisible to the engine until
 // something re-syncs them. Best-effort.
 export async function syncAllWorkspacesRuntimeMcpToEngine(config: ServerConfig): Promise<void> {
+  const serverState = activeEngineMcpServerState(config) ?? null;
   for (const workspace of config.workspaces) {
-    await syncRuntimeMcpToOpencodeEngine(config, workspace).catch(() => undefined);
+    try {
+      await syncRuntimeMcpToOpencodeEngine(
+        config,
+        workspace,
+        undefined,
+        undefined,
+        serverState,
+      );
+    } catch (error) {
+      logRuntimeMcpSyncError({ config, workspace, trigger: "startup", error });
+    }
+    try {
+      const health = await reconcilePersistedOpenworkCloudMcp({
+        config,
+        workspace,
+        directory: resolveOpencodeDirectory(workspace),
+        serverMetadata: { serverVersion: SERVER_VERSION, expectedOpencodeVersion: OPENCODE_VERSION },
+        createWorkspaceOpencodeClient,
+        refreshRegistrationFromLiveStatus: refreshEngineMcpRegistrationFromLiveStatus,
+        registerRuntimeMcp: (routeConfig, routeWorkspace, onlyNames, options) =>
+          syncRuntimeMcpToOpencodeEngine(
+            routeConfig,
+            routeWorkspace,
+            onlyNames,
+            options,
+            serverState,
+          ),
+        trigger: "startup",
+      });
+      logPersistedCloudMcpReconcileResult({ config, workspace, trigger: "startup", health });
+    } catch (error) {
+      logPersistedCloudMcpReconcileError({ config, workspace, trigger: "startup", error });
+    }
   }
 }
 
@@ -2897,7 +4346,8 @@ async function disconnectMcpFromOpencodeEngine(
   const headers: Record<string, string> = {};
   if (connection.authHeader) headers.Authorization = connection.authHeader;
 
-  const response = await fetch(url, { method: "POST", headers, signal: AbortSignal.timeout(15_000) });
+  // MCP disconnect targets the managed loopback engine.
+  const response = await loopbackFetch(url, { method: "POST", headers, signal: AbortSignal.timeout(15_000) });
   if (!response.ok) {
     const body = parseOpencodeErrorBody(await response.text());
     throw new ApiError(502, "opencode_mcp_disconnect_failed", `Failed to disconnect MCP ${name} from the engine`, {
@@ -2905,13 +4355,6 @@ async function disconnectMcpFromOpencodeEngine(
       body,
     });
   }
-}
-
-async function writeOpenworkConfig(workspaceRoot: string, payload: Record<string, unknown>, merge: boolean): Promise<void> {
-  const path = openworkConfigPath(workspaceRoot);
-  const next = merge ? { ...(await readOpenworkConfig(workspaceRoot)), ...payload } : payload;
-  await ensureDir(join(workspaceRoot, ".opencode"));
-  await writeFile(path, JSON.stringify(next, null, 2) + "\n", "utf8");
 }
 
 async function requireApproval(
@@ -2929,13 +4372,14 @@ async function requireApproval(
 }
 
 async function exportWorkspace(
+  config: ServerConfig,
   workspace: WorkspaceInfo,
   options?: { sensitiveMode?: WorkspaceExportSensitiveMode },
 ) {
   const sensitiveMode = options?.sensitiveMode ?? "auto";
   const rawOpencode = await readOpencodeConfig(workspace.path);
   let opencode = sanitizePortableOpencodeConfig(rawOpencode);
-  const openwork = sanitizeOpenworkTemplateConfig(await readOpenworkConfig(workspace.path));
+  const openwork = sanitizeOpenworkTemplateConfig(await readOpenworkConfigForWorkspace(config, workspace));
   const skills = await listSkills(workspace.path, false);
   const commands = await listCommands(workspace.path, "workspace");
   let files = await listPortableFiles(workspace.path);
@@ -3005,7 +4449,7 @@ function workspaceImportRelativePath(workspace: WorkspaceInfo, path: string): st
   return relative(workspace.path, path).replaceAll("\\", "/");
 }
 
-async function importWorkspace(workspace: WorkspaceInfo, payload: Record<string, unknown>, preview: WorkspaceImportPlan): Promise<void> {
+async function importWorkspace(config: ServerConfig, workspace: WorkspaceInfo, payload: Record<string, unknown>, preview: WorkspaceImportPlan): Promise<void> {
   const input = normalizeWorkspaceImportPayload(workspace.path, payload);
   const changed = new Set(
     preview.changes
@@ -3030,9 +4474,9 @@ async function importWorkspace(workspace: WorkspaceInfo, payload: Record<string,
     changedPath("openwork", workspaceImportRelativePath(workspace, openworkConfigPath(workspace.path)))
   ) {
     if (input.modes.openwork === "replace") {
-      await writeOpenworkConfig(workspace.path, input.openwork, false);
+      await writeOpenworkConfigForWorkspace(config, workspace, input.openwork, false);
     } else {
-      await writeOpenworkConfig(workspace.path, input.openwork, true);
+      await writeOpenworkConfigForWorkspace(config, workspace, input.openwork, true);
     }
   }
 
@@ -3089,7 +4533,7 @@ async function materializeBlueprintSessions(config: ServerConfig, workspace: Wor
   existing: Array<{ templateId: string; sessionId: string }>;
   openSessionId: string | null;
 }> {
-  const openwork = await readOpenworkConfig(workspace.path);
+  const openwork = await readOpenworkConfigForWorkspace(config, workspace);
   const templates = normalizeBlueprintSessionTemplates(openwork);
   if (!templates.length) {
     return { ok: true, created: [], existing: [], openSessionId: null };
@@ -3127,7 +4571,7 @@ async function materializeBlueprintSessions(config: ServerConfig, workspace: Wor
     created.map(({ templateId, sessionId }) => ({ templateId, sessionId })),
     now,
   );
-  await writeOpenworkConfig(workspace.path, nextOpenwork, false);
+  await writeOpenworkConfigForWorkspace(config, workspace, nextOpenwork, false);
 
   const preferredTemplate = templates.find((template) => template.openOnFirstLoad) ?? templates[0] ?? null;
   const openSessionId = preferredTemplate

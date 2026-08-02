@@ -1,6 +1,9 @@
 minimumReleaseAge: 4320
 minimumReleaseAgeExclude:
   - "@opencode-ai/sdk"
+  - "acorn"
+  - "enhanced-resolve"
+  - "postcss"
 
 packages:
   - "apps/*"
@@ -9,8 +12,8 @@ packages:
   - "ee/packages/*"
 
 catalog:
-  react: 19.2.4
-  react-dom: 19.2.4
+  react: 19.2.8
+  react-dom: 19.2.8
 
 catalogs:
   react18:
@@ -18,12 +21,20 @@ catalogs:
     react-dom: 18.2.0
 linkWorkspacePackages: true
 preferWorkspacePackages: true
+overrides:
+  baseline-browser-mapping: 2.11.5
 allowBuilds:
+  "@sentry/cli": true
   "@whiskeysockets/baileys": true
   better-sqlite3: true
   electron: true
+  electron-winstaller: true
   esbuild: true
   msw: false
   node-pty: true
   protobufjs: true
   sharp: true
+patchedDependencies:
+  '@better-auth/drizzle-adapter@1.6.11': patches/@better-auth__drizzle-adapter@1.6.11.patch
+  '@better-auth/oauth-provider@1.6.11': patches/@better-auth__oauth-provider@1.6.11.patch
+  '@modelcontextprotocol/sdk': patches/@modelcontextprotocol__sdk.patch

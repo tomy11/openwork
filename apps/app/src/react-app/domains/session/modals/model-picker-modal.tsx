@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { ArrowRight, Check, ChevronDown, ChevronRight, Search, Sparkles, Star, X } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, ChevronRight, RefreshCw, Search, Sparkles, Star, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
 import {
@@ -19,6 +19,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { t } from "@/i18n";
+import { readDenSettings } from "@/app/lib/den";
 import { modelEquals, resolveProviderDisplayName } from "../../../../app/utils";
 import type { ModelOption, ModelRef } from "../../../../app/types";
 import { isRecommendedModel } from "../../../../app/defaults";
@@ -29,18 +31,29 @@ import {
   getOpenWorkModelsActionUrl,
   hasOpenWorkModelsProvider,
   hideOpenWorkModelsPromo,
+  useOpenWorkModelsPromoEligibility,
   isOpenWorkModelsPromoHidden,
   OPENWORK_MODELS_PROVIDER_ID,
   OPENWORK_MODELS_PROVIDER_NAME,
   openWorkModelsPromoChangedEvent,
 } from "../../cloud/openwork-models-promo";
 
+export const MODEL_PICKER_DEFAULT_SUBTITLE = "Select a model for this session.";
+export const MODEL_PICKER_UNAVAILABLE_SUBTITLE = "The model you were using is no longer available, please select a different model for this session.";
+
+export function resolveModelPickerSubtitle(subtitle: string | undefined) {
+  return subtitle ?? MODEL_PICKER_DEFAULT_SUBTITLE;
+}
+
 export type ModelPickerModalProps = {
   open: boolean;
   options: ModelOption[];
   disabledProviders?: string[];
+  organizationModelsEmpty?: boolean;
+  organizationModelsSettingsUrl?: string;
   query: string;
   setQuery: (value: string) => void;
+  subtitle?: string;
   target: "default" | "session";
   current: ModelRef;
   onSelect: (model: ModelRef) => void;
@@ -48,6 +61,11 @@ export type ModelPickerModalProps = {
   onToggleProvider?: (providerId: string, enabled: boolean) => void;
   onOpenSettings: () => void;
   onClose: (options?: { restorePromptFocus?: boolean }) => void;
+  /** Den entitlement present; used to avoid a false Subscribe CTA while models sync. */
+  openWorkModelsEntitled?: boolean;
+  onRefreshOpenWorkModels?: () => void | Promise<void>;
+  onRefreshOrganizationModels?: () => void | Promise<void>;
+  restrictToCloud?: boolean;
 };
 
 type ProviderGroup = {
@@ -61,13 +79,59 @@ type ProviderGroup = {
   other: ModelOption[];
 };
 
+export type ModelPickerEmptyState = {
+  messageKey: string;
+  showConnectProvider: boolean;
+  showRefreshOrganizationModels: boolean;
+  showOrganizationModelsSettings: boolean;
+};
+
+export function resolveModelPickerEmptyState(input: {
+  providerGroupCount: number;
+  query: string;
+  organizationModelsEmpty: boolean;
+  restrictToCloud: boolean;
+  organizationModelsSettingsUrl?: string;
+}): ModelPickerEmptyState | null {
+  if (input.providerGroupCount > 0) return null;
+  if (input.query.trim()) {
+    return {
+      messageKey: "models.no_models_match_search",
+      showConnectProvider: false,
+      showRefreshOrganizationModels: false,
+      showOrganizationModelsSettings: false,
+    };
+  }
+  if (input.organizationModelsEmpty) {
+    return {
+      messageKey: "models.organization_models_empty",
+      showConnectProvider: false,
+      showRefreshOrganizationModels: true,
+      showOrganizationModelsSettings: Boolean(input.organizationModelsSettingsUrl),
+    };
+  }
+  return {
+    messageKey: "models.no_models_available",
+    showConnectProvider: !input.restrictToCloud,
+    showRefreshOrganizationModels: false,
+    showOrganizationModelsSettings: false,
+  };
+}
+
 export function ModelPickerModal(props: ModelPickerModalProps) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [promoHidden, setPromoHidden] = useState(isOpenWorkModelsPromoHidden);
+  const [refreshingOrganizationModels, setRefreshingOrganizationModels] = useState(false);
   const denAuth = useDenAuth();
   const navigate = useNavigate();
   const platform = usePlatform();
+  const openWorkModelsPromoEligible = useOpenWorkModelsPromoEligibility();
+  const organizationModelsSettingsUrl = props.organizationModelsSettingsUrl;
+  const organizationProviderLabel = useMemo(
+    () => readDenSettings().activeOrgName?.trim() || t("settings.provider_source_organization"),
+    [denAuth.status],
+  );
 
   const disabledSet = useMemo(
     () => new Set(props.disabledProviders ?? []),
@@ -154,12 +218,33 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     }
   }, [props.query, providerGroups]);
 
-  // Expand current provider on open
+  // Expand current, organization-provided, and OpenWork groups once they appear
+  // (options often load async).
+  const autoExpandedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!props.open) return;
-    const current = providerGroups.find((g) => g.hasCurrent);
-    if (current) setExpandedProviders(new Set([current.id]));
-  }, [props.open]);
+    if (!props.open) {
+      autoExpandedRef.current = new Set();
+      return;
+    }
+    const toExpand: string[] = [];
+    const queueExpand = (id: string) => {
+      if (!autoExpandedRef.current.has(id) && !toExpand.includes(id)) toExpand.push(id);
+    };
+    const current = providerGroups.find((group) => group.hasCurrent);
+    if (current) queueExpand(current.id);
+    for (const group of providerGroups) {
+      if (group.isCloud) queueExpand(group.id);
+    }
+    const openwork = providerGroups.find((group) => group.id === OPENWORK_MODELS_PROVIDER_ID);
+    if (openwork) queueExpand(openwork.id);
+    if (toExpand.length === 0) return;
+    for (const id of toExpand) autoExpandedRef.current.add(id);
+    setExpandedProviders((prev) => {
+      const next = new Set(prev);
+      for (const id of toExpand) next.add(id);
+      return next;
+    });
+  }, [props.open, providerGroups]);
 
   const toggleProvider = useCallback((id: string) => {
     setExpandedProviders((prev) => {
@@ -169,9 +254,18 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     });
   }, []);
 
+  const openWorkModelsAvailable = useMemo(
+    () => hasOpenWorkModelsProvider(props.options.map((option) => option.providerID)),
+    [props.options],
+  );
+  const showOpenWorkModelsSyncing = Boolean(props.openWorkModelsEntitled) && !openWorkModelsAvailable;
   const showOpenWorkModelsPromo = useMemo(
-    () => !promoHidden && !hasOpenWorkModelsProvider(props.options.map((option) => option.providerID)),
-    [promoHidden, props.options],
+    () =>
+      openWorkModelsPromoEligible &&
+      !promoHidden &&
+      !openWorkModelsAvailable &&
+      !props.openWorkModelsEntitled,
+    [openWorkModelsPromoEligible, openWorkModelsAvailable, promoHidden, props.openWorkModelsEntitled],
   );
 
   const openOpenWorkModels = useCallback(() => {
@@ -194,6 +288,24 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     [props.onSelect],
   );
 
+  const handleRefreshOrganizationModels = useCallback(async () => {
+    if (!props.onRefreshOrganizationModels || refreshingOrganizationModels) return;
+    setRefreshingOrganizationModels(true);
+    try {
+      await props.onRefreshOrganizationModels();
+    } finally {
+      setRefreshingOrganizationModels(false);
+    }
+  }, [props.onRefreshOrganizationModels, refreshingOrganizationModels]);
+
+  const emptyState = resolveModelPickerEmptyState({
+    providerGroupCount: providerGroups.length,
+    query: props.query,
+    organizationModelsEmpty: Boolean(props.organizationModelsEmpty),
+    restrictToCloud: Boolean(props.restrictToCloud),
+    organizationModelsSettingsUrl,
+  });
+
   // Escape
   useEffect(() => {
     if (!props.open) return;
@@ -213,9 +325,9 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
     >
       <DialogContent className="flex max-h-[calc(100vh-2rem)] min-h-0 w-full max-w-lg flex-col overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Models</DialogTitle>
+          <DialogTitle>{t("models.title")}</DialogTitle>
           <DialogDescription>
-            Select a model for this session.
+            {resolveModelPickerSubtitle(props.subtitle)}
           </DialogDescription>
         </DialogHeader>
 
@@ -227,11 +339,36 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
               ref={searchInputRef}
               type="text"
               className="h-10 w-full rounded-xl border border-dls-border bg-dls-surface pl-9 pr-3 text-sm text-dls-text placeholder:text-dls-secondary focus:outline-none focus:ring-2 focus:ring-[rgba(var(--dls-accent-rgb),0.2)]"
-              placeholder="Search providers and models..."
+              placeholder={t("models.search_placeholder")}
               value={props.query}
               onChange={(e) => props.setQuery(e.target.value)}
             />
           </div>
+
+          {showOpenWorkModelsSyncing ? (
+            <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-amber-6/60 bg-amber-2/40">
+              <div className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2.5">
+                <ProviderIcon providerId={OPENWORK_MODELS_PROVIDER_ID} providerName={OPENWORK_MODELS_PROVIDER_NAME} size={18} className="shrink-0 text-amber-11" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 text-[13px] font-medium text-dls-text">
+                    <span>{OPENWORK_MODELS_PROVIDER_NAME}</span>
+                  </div>
+                  <div className="truncate text-[11px] text-dls-secondary">
+                    Included on your plan — finish syncing to choose a model.
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="shrink-0"
+                  onClick={() => void props.onRefreshOpenWorkModels?.()}
+                >
+                  <RefreshCw className="mr-1 size-3" />
+                  Refresh
+                </Button>
+              </div>
+            </div>
+          ) : null}
 
           {showOpenWorkModelsPromo ? (
             <div className="mb-3 flex shrink-0 items-center overflow-hidden rounded-2xl border border-blue-6/60 bg-blue-2/60 shadow-[0_12px_30px_-20px_rgba(var(--dls-accent-rgb),0.45)]">
@@ -268,14 +405,25 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
 
           {/* Content */}
           <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1 -mr-1">
-            {providerGroups.length === 0 ? (
+            {emptyState ? (
               <div className="space-y-3 rounded-2xl border border-dls-border bg-dls-hover/30 px-4 py-6 text-center">
                 <div className="text-sm text-dls-secondary">
-                  {props.query.trim() ? "No models match your search." : "No models available. Connect a provider to get started."}
+                  {t(emptyState.messageKey)}
                 </div>
-                {!props.query.trim() ? (
+                {emptyState.showRefreshOrganizationModels ? (
+                  <Button variant="outline" onClick={() => void handleRefreshOrganizationModels()} disabled={refreshingOrganizationModels}>
+                    <RefreshCw className={`mr-1 size-3 ${refreshingOrganizationModels ? "animate-spin" : ""}`} />
+                    {refreshingOrganizationModels ? t("models.refreshing_organization_models") : t("models.refresh_organization_models")}
+                  </Button>
+                ) : null}
+                {emptyState.showOrganizationModelsSettings && organizationModelsSettingsUrl ? (
+                  <Button variant="ghost" onClick={() => platform.openLink(organizationModelsSettingsUrl)}>
+                    {t("models.manage_organization_models")}
+                  </Button>
+                ) : null}
+                {emptyState.showConnectProvider ? (
                   <Button variant="outline" onClick={props.onOpenSettings}>
-                    Connect a provider
+                    {t("models.connect_provider")}
                   </Button>
                 ) : null}
               </div>
@@ -290,6 +438,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
                   onToggleExpand={() => toggleProvider(group.id)}
                   onToggleProvider={props.onToggleProvider}
                   onSelect={handleSelect}
+                  organizationProviderLabel={organizationProviderLabel}
                 />
               ))
             )}
@@ -299,7 +448,7 @@ export function ModelPickerModal(props: ModelPickerModalProps) {
         {/* Footer */}
         <DialogFooter className="shrink-0">
           <DialogClose render={<Button variant="outline" />}>
-            Done
+            {t("models.done")}
           </DialogClose>
         </DialogFooter>
       </DialogContent>
@@ -319,6 +468,7 @@ function ProviderAccordion({
   onToggleExpand,
   onToggleProvider,
   onSelect,
+  organizationProviderLabel,
 }: {
   group: ProviderGroup;
   expanded: boolean;
@@ -327,6 +477,7 @@ function ProviderAccordion({
   onToggleExpand: () => void;
   onToggleProvider?: (providerId: string, enabled: boolean) => void;
   onSelect: (opt: ModelOption) => void;
+  organizationProviderLabel: string;
 }) {
   const totalModels = group.recommended.length + group.other.length;
   const Chevron = expanded ? ChevronDown : ChevronRight;
@@ -344,16 +495,18 @@ function ProviderAccordion({
           <ProviderIcon providerId={group.id} size={18} className="shrink-0 text-dls-text" />
           <div className="min-w-0 flex-1">
             <span className="text-[13px] font-medium text-dls-text">{group.name}</span>
+            {" "}
             <span className="ml-2 text-[11px] text-dls-secondary">
               {totalModels} model{totalModels === 1 ? "" : "s"}
             </span>
           </div>
+          {" "}
           <span className="flex shrink-0 items-center gap-1.5">
             {group.isNew ? (
               <span className="rounded-md bg-blue-3 px-1.5 py-0.5 text-[10px] font-medium text-blue-11">New</span>
             ) : null}
             {group.isCloud ? (
-              <span className="rounded-md bg-blue-3/50 px-1.5 py-0.5 text-[10px] font-medium text-blue-11/70">Cloud</span>
+              <span className="rounded-md bg-blue-3/50 px-1.5 py-0.5 text-[10px] font-medium text-blue-11/70">{organizationProviderLabel}</span>
             ) : null}
             {group.hasCurrent ? (
               <span className="rounded-md bg-green-3 px-1.5 py-0.5 text-[10px] font-medium text-green-11">Current</span>

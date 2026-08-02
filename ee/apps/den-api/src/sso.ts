@@ -4,12 +4,15 @@ import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import { z } from "zod"
 import { auth } from "./auth.js"
 import { db } from "./db.js"
+import { isOrganizationSsoReady } from "./sso-readiness.js"
 import { env } from "./env.js"
+import { isMicrosoftEntraManagedDomain } from "./sso-entra-domain.js"
 import { SSO_IDENTITY_EXTRA_FIELDS } from "./sso-jit.js"
 import { ORGANIZATION_SAML_WANT_ASSERTIONS_SIGNED } from "./sso-saml-policy.js"
 
 type SsoConnection = typeof SsoConnectionTable.$inferSelect
 type OrganizationId = SsoConnection["organizationId"]
+type SsoTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 
 type SamlRegistrationInput = {
   kind: "saml"
@@ -67,6 +70,16 @@ export function getSsoMetadataUrl(providerId: string) {
 
 export function getSsoOidcRedirectUrl(providerId: string) {
   return `${env.betterAuthUrl}/api/auth/sso/callback/${encodeURIComponent(providerId)}`
+}
+
+function isDevLoopbackIssuer(issuer: string) {
+  if (!env.devMode) return false
+  try {
+    const url = new URL(issuer)
+    return url.hostname === "127.0.0.1" || url.hostname === "localhost"
+  } catch {
+    return false
+  }
 }
 
 function getOidcDiscoveryUrl(issuer: string) {
@@ -130,24 +143,26 @@ async function getSsoProviderByProviderId(providerId: string) {
 }
 
 async function registerBetterAuthSsoProvider(input: OrganizationSsoRegistrationInput, providerId: string) {
-  const common = {
-    providerId,
-    issuer: input.issuer,
-    domain: input.domain,
-    organizationId: input.organizationId,
-  }
-
   if (input.kind === "saml") {
+    const audience = input.audience || env.betterAuthUrl
     return auth.api.registerSSOProvider({
       body: {
-        ...common,
+        providerId,
+        issuer: audience,
+        domain: input.domain,
+        organizationId: input.organizationId,
         samlConfig: {
           entryPoint: input.entryPoint,
           cert: input.cert,
           callbackUrl: getSsoAcsUrl(providerId),
-          audience: input.audience || env.betterAuthUrl,
+          audience,
+          idpMetadata: {
+            entityID: input.issuer,
+          },
           wantAssertionsSigned: ORGANIZATION_SAML_WANT_ASSERTIONS_SIGNED,
-          spMetadata: {},
+          spMetadata: {
+            entityID: audience,
+          },
           mapping: {
             id: "nameID",
             email: "email",
@@ -163,7 +178,10 @@ async function registerBetterAuthSsoProvider(input: OrganizationSsoRegistrationI
   const oidcEndpoints = await resolveOidcEndpoints(input)
   return auth.api.registerSSOProvider({
     body: {
-      ...common,
+      providerId,
+      issuer: input.issuer,
+      domain: input.domain,
+      organizationId: input.organizationId,
       oidcConfig: {
         clientId: input.clientId,
         clientSecret: input.clientSecret,
@@ -194,6 +212,58 @@ export async function getOrganizationSsoConnection(organizationId: OrganizationI
   return rows[0] ?? null
 }
 
+async function cleanupExternalIdentitiesForDeletedSsoConnection(
+  tx: SsoTransaction,
+  connection: SsoConnection,
+) {
+  await tx
+    .update(ExternalIdentityTable)
+    .set({
+      source: "scim",
+      ssoProviderId: null,
+      remoteId: null,
+      attributesJson: null,
+      lastSsoLoginAt: null,
+    })
+    .where(and(
+      eq(ExternalIdentityTable.organizationId, connection.organizationId),
+      eq(ExternalIdentityTable.ssoProviderId, connection.providerId),
+      isNotNull(ExternalIdentityTable.scimProviderId),
+    ))
+
+  await tx
+    .update(ExternalIdentityTable)
+    .set({
+      active: false,
+      ssoProviderId: null,
+      remoteId: null,
+      attributesJson: null,
+      lastSsoLoginAt: null,
+    })
+    .where(and(
+      eq(ExternalIdentityTable.organizationId, connection.organizationId),
+      eq(ExternalIdentityTable.ssoProviderId, connection.providerId),
+      isNull(ExternalIdentityTable.scimProviderId),
+    ))
+
+  await tx
+    .delete(AuthAccountTable)
+    .where(eq(AuthAccountTable.providerId, connection.providerId))
+}
+
+async function cleanupLegacySsoProvider(
+  tx: SsoTransaction,
+  connection: SsoConnection,
+  canonicalProviderId: string,
+) {
+  if (connection.providerId === canonicalProviderId) {
+    return
+  }
+
+  await cleanupExternalIdentitiesForDeletedSsoConnection(tx, connection)
+  await tx.delete(SsoProviderTable).where(eq(SsoProviderTable.providerId, connection.providerId))
+}
+
 export async function deleteOrganizationSsoConnection(organizationId: OrganizationId) {
   const connection = await getOrganizationSsoConnection(organizationId)
   if (!connection) {
@@ -201,40 +271,7 @@ export async function deleteOrganizationSsoConnection(organizationId: Organizati
   }
 
   await db.transaction(async (tx) => {
-    await tx
-      .update(ExternalIdentityTable)
-      .set({
-        source: "scim",
-        ssoProviderId: null,
-        remoteId: null,
-        attributesJson: null,
-        lastSsoLoginAt: null,
-      })
-      .where(and(
-        eq(ExternalIdentityTable.organizationId, connection.organizationId),
-        eq(ExternalIdentityTable.ssoProviderId, connection.providerId),
-        isNotNull(ExternalIdentityTable.scimProviderId),
-      ))
-
-    await tx
-      .update(ExternalIdentityTable)
-      .set({
-        active: false,
-        ssoProviderId: null,
-        remoteId: null,
-        attributesJson: null,
-        lastSsoLoginAt: null,
-      })
-      .where(and(
-        eq(ExternalIdentityTable.organizationId, connection.organizationId),
-        eq(ExternalIdentityTable.ssoProviderId, connection.providerId),
-        isNull(ExternalIdentityTable.scimProviderId),
-      ))
-
-    await tx
-      .delete(AuthAccountTable)
-      .where(eq(AuthAccountTable.providerId, connection.providerId))
-
+    await cleanupExternalIdentitiesForDeletedSsoConnection(tx, connection)
     await tx.delete(SsoConnectionTable).where(eq(SsoConnectionTable.id, connection.id))
     await tx.delete(SsoProviderTable).where(eq(SsoProviderTable.providerId, connection.providerId))
   })
@@ -244,23 +281,38 @@ export async function deleteOrganizationSsoConnection(organizationId: Organizati
 export async function registerOrganizationSsoConnection(input: OrganizationSsoRegistrationInput) {
   const providerId = buildOrganizationSsoProviderId(input.organizationId)
   const existing = await getOrganizationSsoConnection(input.organizationId)
+  const domainVerified = isDevLoopbackIssuer(input.issuer) || isMicrosoftEntraManagedDomain({
+    domain: input.domain,
+    issuer: input.issuer,
+    entryPoint: input.kind === "saml" ? input.entryPoint : null,
+  })
 
   if (existing) {
     const existingProvider = await getSsoProviderByProviderId(providerId)
     if (!existingProvider) {
       await registerBetterAuthSsoProvider(input, providerId)
-      await db
-        .update(SsoConnectionTable)
-        .set({
-          kind: input.kind,
-          issuer: input.issuer,
-          domain: input.domain,
-          status: "enabled",
-          signInPath: getOrganizationSsoSignInPath(input.organizationSlug),
-          lastTestedAt: new Date(),
-          lastError: null,
-        })
-        .where(eq(SsoConnectionTable.id, existing.id))
+      if (domainVerified) {
+        await db
+          .update(SsoProviderTable)
+          .set({ domainVerified: true })
+          .where(eq(SsoProviderTable.providerId, providerId))
+      }
+      await db.transaction(async (tx) => {
+        await cleanupLegacySsoProvider(tx, existing, providerId)
+        await tx
+          .update(SsoConnectionTable)
+          .set({
+            providerId,
+            kind: input.kind,
+            issuer: input.issuer,
+            domain: input.domain,
+            status: "enabled",
+            signInPath: getOrganizationSsoSignInPath(input.organizationSlug),
+            lastTestedAt: new Date(),
+            lastError: null,
+          })
+          .where(eq(SsoConnectionTable.id, existing.id))
+      })
 
       const connection = await getOrganizationSsoConnection(input.organizationId)
       if (!connection) {
@@ -286,13 +338,15 @@ export async function registerOrganizationSsoConnection(input: OrganizationSsoRe
           domain: draftProvider.domain,
           oidcConfig: draftProvider.oidcConfig,
           samlConfig: draftProvider.samlConfig,
-          domainVerified: false,
+          domainVerified,
         })
         .where(eq(SsoProviderTable.providerId, providerId))
 
+      await cleanupLegacySsoProvider(tx, existing, providerId)
       await tx
         .update(SsoConnectionTable)
         .set({
+          providerId,
           kind: input.kind,
           issuer: input.issuer,
           domain: input.domain,
@@ -317,6 +371,12 @@ export async function registerOrganizationSsoConnection(input: OrganizationSsoRe
   }
 
   await registerBetterAuthSsoProvider(input, providerId)
+  if (domainVerified) {
+    await db
+      .update(SsoProviderTable)
+      .set({ domainVerified: true })
+      .where(eq(SsoProviderTable.providerId, providerId))
+  }
 
   await db.insert(SsoConnectionTable).values({
     id: createDenTypeId("ssoConnection"),
@@ -364,4 +424,14 @@ export async function getSsoProviderForConnection(connection: SsoConnection) {
     .limit(1)
 
   return rows[0] ?? null
+}
+
+export async function hasEnabledOrganizationSsoConnection(organizationId: OrganizationId) {
+  const connection = await getOrganizationSsoConnection(organizationId)
+  if (!connection) {
+    return false
+  }
+
+  const provider = await getSsoProviderForConnection(connection)
+  return isOrganizationSsoReady({ connection, providerExists: Boolean(provider) })
 }
