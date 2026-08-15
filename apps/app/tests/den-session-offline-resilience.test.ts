@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
 import {
+  clearDenSession,
   DenApiError,
+  ensureDenActiveOrganization,
   isDenSessionRevokedError,
   mergePassiveDenSettings,
   readDenSettings,
@@ -10,6 +12,8 @@ import {
 import { resolveDenAuthFailureStatus } from "../src/react-app/domains/cloud/den-auth-provider";
 
 const originalWindow = globalThis.window;
+const originalFetch = globalThis.fetch;
+const originalDev = process.env.DEV;
 
 function memoryStorage(): Storage {
   const map = new Map<string, string>();
@@ -39,6 +43,85 @@ afterEach(() => {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: originalWindow,
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: originalFetch,
+  });
+  if (originalDev === undefined) {
+    delete process.env.DEV;
+  } else {
+    process.env.DEV = originalDev;
+  }
+});
+
+function stubWindow() {
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: memoryStorage(),
+      dispatchEvent: () => true,
+    },
+  });
+}
+
+describe("active organization drop tripwire", () => {
+  test("warns with a recorded stack for an unflagged drop", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(window.__openworkOrgDropWarnings).toHaveLength(1);
+    expect(window.__openworkOrgDropWarnings?.[0]).toContain("activeOrgId dropped unexpectedly from org_stored");
+    expect(window.__openworkOrgDropWarnings?.[0]).toContain("\n");
+    warn.mockRestore();
+  });
+
+  test("stays silent for opted-out clears and sign-out", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings(
+      { baseUrl: "https://den.test", activeOrgId: null },
+      { persistBootstrap: false, intentionalActiveOrgClear: true },
+    );
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    clearDenSession();
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  test("stays silent when no organization was set", () => {
+    process.env.DEV = "true";
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  test("is inert outside development builds", () => {
+    delete process.env.DEV;
+    stubWindow();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: "org_stored" }, { persistBootstrap: false });
+    writeDenSettings({ baseUrl: "https://den.test", activeOrgId: null }, { persistBootstrap: false });
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(window.__openworkOrgDropWarnings).toBeUndefined();
+    warn.mockRestore();
   });
 });
 
@@ -150,9 +233,55 @@ describe("mergePassiveDenSettings", () => {
   });
 });
 
+describe("ensureDenActiveOrganization", () => {
+  test("preserves the selected organization when the server temporarily returns none", async () => {
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: memoryStorage(),
+        dispatchEvent: () => true,
+      },
+    });
+    writeDenSettings({
+      baseUrl: "https://den.test",
+      authToken: "tok_stored",
+      activeOrgId: "org_stored",
+      activeOrgSlug: "stored-org",
+      activeOrgName: "Stored Org",
+    });
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      value: (async () => new Response(JSON.stringify({
+        orgs: [],
+        activeOrgId: null,
+        activeOrgSlug: null,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) satisfies typeof fetch,
+    });
+
+    await expect(ensureDenActiveOrganization()).resolves.toBeNull();
+    expect(readDenSettings()).toMatchObject({
+      activeOrgId: "org_stored",
+      activeOrgSlug: "stored-org",
+      activeOrgName: "Stored Org",
+    });
+  });
+});
+
 describe("isDenSessionRevokedError", () => {
-  test("only treats Den-shaped 401s as revoked sessions", () => {
+  test("treats only explicit invalid/expired/revoked session codes as revoked", () => {
     expect(isDenSessionRevokedError(new DenApiError(401, "unauthorized", "Unauthorized"))).toBe(
+      true,
+    );
+    expect(
+      isDenSessionRevokedError(new DenApiError(401, "session_expired", "Session expired")),
+    ).toBe(true);
+    expect(
+      isDenSessionRevokedError(new DenApiError(401, "session_revoked", "Session revoked")),
+    ).toBe(true);
+    expect(isDenSessionRevokedError(new DenApiError(401, "invalid_token", "Invalid token"))).toBe(
       true,
     );
     expect(isDenSessionRevokedError(new DenApiError(401, "request_failed", "Proxy 401"))).toBe(
@@ -162,6 +291,25 @@ describe("isDenSessionRevokedError", () => {
       false,
     );
     expect(isDenSessionRevokedError(new Error("Request timed out."))).toBe(false);
+  });
+
+  test("keeps the session for structured 401s minted by infrastructure", () => {
+    // Deployment platforms, proxies, and misrouted edges answer with their
+    // own JSON 401 envelopes while the control plane is unreachable. None of
+    // them prove the stored session is invalid.
+    expect(
+      isDenSessionRevokedError(
+        new DenApiError(401, "base_url_not_present", "Base URL not present"),
+      ),
+    ).toBe(false);
+    expect(
+      isDenSessionRevokedError(
+        new DenApiError(401, "deployment_not_found", "Deployment not found"),
+      ),
+    ).toBe(false);
+    expect(
+      isDenSessionRevokedError(new DenApiError(401, "proxy_authentication", "Proxy auth")),
+    ).toBe(false);
   });
 });
 
@@ -173,6 +321,63 @@ describe("resolveDenAuthFailureStatus", () => {
     expect(resolveDenAuthFailureStatus(new DenApiError(401, "unauthorized", "Unauthorized"))).toBe(
       "signed_out",
     );
+    expect(
+      resolveDenAuthFailureStatus(new DenApiError(401, "session_expired", "Session expired")),
+    ).toBe("signed_out");
     expect(resolveDenAuthFailureStatus(new Error("Request timed out."))).toBe("unavailable");
+  });
+
+  test("reports transient structured 401s as unavailable, retaining the session", () => {
+    expect(
+      resolveDenAuthFailureStatus(
+        new DenApiError(401, "base_url_not_present", "Base URL not present"),
+      ),
+    ).toBe("unavailable");
+    expect(
+      resolveDenAuthFailureStatus(new DenApiError(401, "deployment_not_found", "Deployment not found")),
+    ).toBe("unavailable");
+  });
+});
+
+describe("explicit sign-out", () => {
+  test("clears the stored session and notifies listeners with signed_out", () => {
+    const dispatched: Event[] = [];
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: memoryStorage(),
+        dispatchEvent: (event: Event) => {
+          dispatched.push(event);
+          return true;
+        },
+      },
+    });
+
+    writeDenSettings(
+      {
+        baseUrl: "https://den.test",
+        authToken: "tok_stored",
+        activeOrgId: "org_stored",
+        activeOrgSlug: "stored-org",
+        activeOrgName: "Stored Org",
+      },
+      { persistBootstrap: false },
+    );
+    dispatched.length = 0;
+
+    clearDenSession();
+
+    expect(window.localStorage.getItem("openwork.den.authToken")).toBeNull();
+    expect(window.localStorage.getItem("openwork.den.activeOrgId")).toBeNull();
+    expect(window.localStorage.getItem("openwork.den.activeOrgSlug")).toBeNull();
+    expect(window.localStorage.getItem("openwork.den.activeOrgName")).toBeNull();
+
+    // The provider store listens for this signed_out notification to remove
+    // organization and imported Cloud providers; explicit logout must keep
+    // emitting it.
+    const sessionUpdated = dispatched.find(
+      (event) => event.type === "openwork-den-session-updated",
+    ) as CustomEvent<{ status?: string }> | undefined;
+    expect(sessionUpdated?.detail.status).toBe("signed_out");
   });
 });

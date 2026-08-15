@@ -76,6 +76,35 @@ import {
 type LaunchWorkerResult = "success" | "limit" | "error";
 type AuthNavigationResult = "dashboard" | "join-org" | null;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isSignupPasswordFeedback(payload: unknown) {
+  return isRecord(payload)
+    && (payload.error === "password_too_short" || payload.error === "password_too_weak" || payload.error === "password_compromised");
+}
+
+function readStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+}
+
+function getSignupPasswordFeedback(payload: unknown, fallback: string) {
+  if (!isRecord(payload)) {
+    return [fallback];
+  }
+
+  const feedback = isRecord(payload.feedback) ? payload.feedback : null;
+  const messages = [
+    typeof feedback?.warning === "string" ? feedback.warning.trim() : "",
+    ...readStringArray(feedback?.suggestions).map((suggestion) => suggestion.trim()),
+  ].filter((message) => message.length > 0);
+
+  return messages.length > 0 ? messages : [fallback];
+}
+
 type DenFlowContextValue = {
   authMode: AuthMode;
   setAuthMode: (mode: AuthMode) => void;
@@ -91,6 +120,7 @@ type DenFlowContextValue = {
   authBusy: boolean;
   authInfo: string;
   authError: string | null;
+  signupPasswordFeedback: string[];
   user: AuthUser | null;
   sessionHydrated: boolean;
   desktopAuthRequested: boolean;
@@ -201,12 +231,13 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   const [authMode, setAuthModeState] = useState<AuthMode>("sign-up");
   const [email, setEmail] = useState("");
   const [authName, setAuthName] = useState("");
-  const [password, setPassword] = useState("");
+  const [password, setPasswordState] = useState("");
   const [verificationCode, setVerificationCode] = useState("");
   const [verificationRequired, setVerificationRequired] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authInfo, setAuthInfo] = useState(getAuthInfoForMode("sign-up"));
   const [authError, setAuthError] = useState<string | null>(null);
+  const [signupPasswordFeedback, setSignupPasswordFeedback] = useState<string[]>([]);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(() => {
     if (typeof window === "undefined") {
@@ -374,6 +405,12 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     setVerificationCode("");
     setAuthInfo(getAuthInfoForMode(mode));
     setAuthError(null);
+    setSignupPasswordFeedback([]);
+  }
+
+  function setPassword(value: string) {
+    setPasswordState(value);
+    setSignupPasswordFeedback([]);
   }
 
   function openVerificationStep(targetEmail: string, message?: string) {
@@ -381,6 +418,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     setVerificationCode("");
     setAuthInfo(message ?? `Enter the 6-digit code we sent to ${targetEmail}.`);
     setAuthError(null);
+    setSignupPasswordFeedback([]);
   }
 
   function cancelVerification() {
@@ -388,6 +426,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     setVerificationCode("");
     setAuthInfo(getAuthInfoForMode(authMode));
     setAuthError(null);
+    setSignupPasswordFeedback([]);
   }
 
   async function redirectToRequiredSso(trimmedEmail: string) {
@@ -1139,6 +1178,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     setAuthBusy(true);
     setAuthError(null);
+    setSignupPasswordFeedback([]);
     const submitMode: AuthMode = isSingleOrgMode && !runtimeConfig.singleOrgAllowPublicSignup && authMode === "sign-up" ? "sign-in" : authMode;
     trackPosthogEvent("den_auth_submitted", {
       mode: submitMode,
@@ -1146,17 +1186,22 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     });
 
     try {
-      const endpoint = submitMode === "sign-up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email";
       const trimmedEmail = email.trim();
       if (trimmedEmail && await redirectToRequiredSso(trimmedEmail)) {
         return null;
       }
+      const pendingInvitationId = getPendingOrgInvitationId();
+      const endpoint = submitMode === "sign-up" && pendingInvitationId
+        ? `/api/auth/sign-up/email?invite=${encodeURIComponent(pendingInvitationId)}`
+        : submitMode === "sign-up"
+          ? "/api/auth/sign-up/email"
+          : "/api/auth/sign-in/email";
       const body =
         submitMode === "sign-up"
           ? {
               name: authName.trim() || DEFAULT_AUTH_NAME,
               email: trimmedEmail,
-              password
+              password,
             }
           : {
               email: trimmedEmail,
@@ -1172,7 +1217,13 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
         if (response.status === 403 && !isSingleOrgMode) {
           openVerificationStep(trimmedEmail, `Enter the 6-digit code we sent to ${trimmedEmail} to finish verifying your email.`);
         }
-        setAuthError(getErrorMessage(payload, `Authentication failed with ${response.status}.`));
+        const message = getErrorMessage(payload, `Authentication failed with ${response.status}.`);
+        if (submitMode === "sign-up" && isSignupPasswordFeedback(payload)) {
+          setSignupPasswordFeedback(getSignupPasswordFeedback(payload, message));
+          setAuthError(null);
+        } else {
+          setAuthError(message);
+        }
         trackPosthogEvent("den_auth_failed", {
           mode: submitMode,
           method: "email",
@@ -1197,6 +1248,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown network error";
       setAuthError(message);
+      setSignupPasswordFeedback([]);
       trackPosthogEvent("den_auth_failed", {
         mode: submitMode,
         method: "email",
@@ -1220,6 +1272,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     setAuthBusy(true);
     setAuthError(null);
+    setSignupPasswordFeedback([]);
     setAuthInfo(`Redirecting to ${getSocialProviderLabel(provider)}...`);
     trackPosthogEvent("den_auth_submitted", {
       mode: authMode,
@@ -2161,6 +2214,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     authBusy,
     authInfo,
     authError,
+    signupPasswordFeedback,
     user,
     sessionHydrated,
     desktopAuthRequested,

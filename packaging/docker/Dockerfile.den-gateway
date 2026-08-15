@@ -5,7 +5,7 @@ RUN corepack enable
 
 WORKDIR /app
 
-ARG DEN_GATEWAY_VERSION=dev
+ARG DEN_GATEWAY_VERSION=""
 ENV DEN_GATEWAY_VERSION=${DEN_GATEWAY_VERSION}
 ENV PORT=8788
 
@@ -16,6 +16,12 @@ ENV DEN_GATEWAY_WEB_ROOT=/opt/openwork/web
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml /app/
 COPY patches /app/patches
+
+# This image installs only the gateway runtime workspace. Some root patches apply
+# to packages that are intentionally not copied here, and pnpm rejects those as
+# unused unless this pruned install opts out of that check.
+RUN node -e "const fs = require('node:fs'); fs.appendFileSync('/app/pnpm-workspace.yaml', '\nallowUnusedPatches: true\n')"
+
 COPY packages/types/package.json /app/packages/types/package.json
 COPY packages/ui/package.json /app/packages/ui/package.json
 COPY packages/install-config/package.json /app/packages/install-config/package.json

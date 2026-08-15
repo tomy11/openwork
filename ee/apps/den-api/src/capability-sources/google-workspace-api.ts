@@ -1,3 +1,7 @@
+import { truncateText } from "./binary-content.js"
+
+export { truncateText } from "./binary-content.js"
+
 export type GoogleWorkspaceAttachment = {
   attachmentId: string
   filename: string
@@ -15,6 +19,7 @@ export type GoogleWorkspaceGmailMessage = {
   threadId: string
   from: string
   to: string
+  bcc: string
   subject: string
   date: string
   snippet: string
@@ -215,13 +220,6 @@ export function extractGmailThreadQuoteInput(json: unknown): { from: string; dat
   }
 }
 
-export function truncateText(text: string, maxCharacters: number): { text: string; truncated: boolean } {
-  if (text.length <= maxCharacters) {
-    return { text, truncated: false }
-  }
-  return { text: text.slice(0, maxCharacters), truncated: true }
-}
-
 export function buildDriveSearchQuery(text: string): string {
   const escaped = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'")
   return `trashed = false and (name contains '${escaped}' or fullText contains '${escaped}')`
@@ -259,6 +257,7 @@ export function extractGmailMessage(payloadJson: unknown): GoogleWorkspaceGmailM
     threadId: readString(message, "threadId"),
     from: headers.get("from") ?? "",
     to: headers.get("to") ?? "",
+    bcc: headers.get("bcc") ?? "",
     subject: headers.get("subject") ?? "",
     date: headers.get("date") ?? "",
     snippet,

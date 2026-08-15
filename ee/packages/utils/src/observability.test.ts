@@ -216,7 +216,7 @@ describe("observability env contract", () => {
     if (config.backend !== "sentry") {
       throw new Error("expected sentry backend")
     }
-    expect(config.sentry.tracesSampleRate).toBe(1)
+    expect(config.sentry.tracesSampleRate).toBe(0.01)
 
     expect(() => parseObservabilityEnv(
       { DEN_OBSERVABILITY_BACKEND: "sentry" },

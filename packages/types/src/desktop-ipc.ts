@@ -87,6 +87,7 @@ export type DesktopIntegrationResult = {
 
 export type OpenworkServerInfo = {
   running: boolean;
+  engineRollover: boolean;
   remoteAccessEnabled: boolean;
   host: string | null;
   port: number | null;
@@ -417,6 +418,11 @@ export type DesktopCommandMap = {
     args: [input: DesktopNotificationInput];
     result: DesktopNotificationResult;
   };
+  desktopSentrySetSession: {
+    args: [input: { userId: string; orgId: string }];
+    result: { enabled: boolean };
+  };
+  desktopSentryClearSession: { args: []; result: { enabled: boolean } };
   desktopIntegrationStatus: { args: []; result: DesktopIntegrationStatus };
   desktopIntegrationInstall: {
     args: [options?: { useExternalLauncher?: boolean }];
@@ -460,6 +466,10 @@ export type DesktopCommandMap = {
 
   // Openwork server sidecar
   openworkServerInfo: { args: []; result: OpenworkServerInfo };
+  automationRunnerConfigure: {
+    args: [configuration: { baseUrl: string; token: string; runnerId: string } | null];
+    result: { connected: boolean };
+  };
   openworkServerRestart: {
     args: [options?: Record<string, unknown>];
     result: OpenworkServerInfo;

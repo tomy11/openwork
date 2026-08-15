@@ -6,6 +6,7 @@ import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { OPENWORK_DOWNLOAD_URL } from "../../CONSTS.js"
+import { cache } from "../../cache.js"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
 import { authenticatedRoute, jsonValidator, orgMemberRoute, type OrganizationContextVariables, type UserOrganizationsContext } from "../../middleware/index.js"
@@ -289,6 +290,7 @@ export function registerMeRoutes<T extends { Variables: AuthContextVariables & P
         .update(AuthUserTable)
         .set({ name, updatedAt })
         .where(eq(AuthUserTable.id, normalizeDenTypeId("user", user.id)))
+      await cache.auth.deleteSessionsForUser(normalizeDenTypeId("user", user.id))
 
       return c.json({
         user: {

@@ -104,11 +104,11 @@ describe("Connect incident diagnostics intake and query", () => {
   })
 
   test("deduplicates event retries, expires seven-day history, and filters raw IDs by transient hashing", async () => {
-    const current = incident()
-    const old = incident("2026-07-16T09:59:59.000Z")
+    const now = Date.now()
+    const current = incident(new Date(now).toISOString())
+    const old = incident(new Date(now - (7 * 24 * 60 * 60 * 1_000) - 1_000).toISOString())
     expect((await POST(intakeRequest({ incidents: [current, current, old] }))).status).toBe(204)
 
-    const now = Date.parse("2026-07-24T10:00:00.000Z")
     const stored = await listConnectDiagnosticIncidents(now)
     expect(stored).toHaveLength(1)
     expect(JSON.stringify(stored)).not.toContain(organizationId)

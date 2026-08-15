@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { ChevronDown, Settings2 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import type { ModelOption, ModelRef } from "@/app/types";
 import { ProviderIcon } from "@/react-app/design-system/provider-icon";
@@ -34,6 +34,11 @@ import {
 import { getConnectedProviderItems, useProviderListQuery } from "@/react-app/infra/provider-list-query";
 import { filterEntitledModelOptions } from "@/react-app/domains/connections/provider-auth/provider-policy";
 import {
+  filterCloudManagedModelOptions,
+  mergeModelOptions,
+} from "@/react-app/domains/connections/provider-auth/assigned-model-options";
+import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
+import {
   Command,
   CommandCollection,
   CommandEmpty,
@@ -62,7 +67,11 @@ function getProviderDisplayName(providerId: string) {
     .join(" ");
 }
 
-function useModelOptions(open: boolean) {
+function useModelOptions(
+  open: boolean,
+  fallbackOptions: readonly ModelOption[],
+  cloudProvidersEnabled: boolean,
+) {
   const { client, opencodeBaseUrl, selectedWorkspaceRoot } = useWorkspace();
   const checkDesktopRestriction = useCheckDesktopRestriction();
 
@@ -111,11 +120,14 @@ function useModelOptions(open: boolean) {
         })),
       );
 
-    return filterEntitledModelOptions(options, {
+    return filterEntitledModelOptions(filterCloudManagedModelOptions(
+      mergeModelOptions(options, fallbackOptions),
+      cloudProvidersEnabled,
+    ), {
       restrictToCloud,
       checkRestriction: checkDesktopRestriction,
     });
-  }, [checkDesktopRestriction, data]);
+  }, [checkDesktopRestriction, cloudProvidersEnabled, data, fallbackOptions]);
 }
 
 type ModelSelectModelItem = {
@@ -196,6 +208,10 @@ interface ModelSelectProps {
   sessionId?: string;
   /** Den/import includes OpenWork Models — never show Subscribe while true. */
   openWorkModelsEntitled?: boolean;
+  /** The server is waiting to reload this workspace with OpenWork Models. */
+  openWorkModelsSyncing?: boolean;
+  /** Member-scoped models available before a workspace OpenCode client exists. */
+  fallbackOptions?: readonly ModelOption[];
 }
 
 export function ModelSelect({
@@ -207,12 +223,14 @@ export function ModelSelect({
   disabled = false,
   sessionId,
   openWorkModelsEntitled = false,
+  openWorkModelsSyncing = false,
+  fallbackOptions = [],
 }: ModelSelectProps) {
   const [search, setSearch] = React.useState("");
   const [promoHidden, setPromoHidden] = React.useState(isOpenWorkModelsPromoHidden);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
-  const modelOptions = useModelOptions(open);
   const denAuth = useDenAuth();
+  const modelOptions = useModelOptions(open, fallbackOptions, denAuth.isSignedIn);
   const navigate = useNavigate();
   const platform = usePlatform();
   const openWorkModelsPromoEligible = useOpenWorkModelsPromoEligibility();
@@ -257,7 +275,6 @@ export function ModelSelect({
     () => hasOpenWorkModelsProvider(modelOptions.map((option) => option.providerID)),
     [modelOptions],
   );
-  const showOpenWorkModelsSyncing = openWorkModelsEntitled && !openWorkModelsAvailable;
   const showOpenWorkModelsPromo = React.useMemo(
     () =>
       openWorkModelsPromoEligible &&
@@ -344,7 +361,9 @@ export function ModelSelect({
           }
         >
           <span className="max-w-48 truncate">
-            {hideValue ? "Select model" : (selectedOption?.title ?? value.modelID ?? "Select model")}
+            {hideValue || (!denAuth.isSignedIn && isCloudManagedProviderKey(value.providerID))
+              ? "Select model"
+              : (selectedOption?.title ?? value.modelID ?? "Select model")}
           </span>
           <ChevronDown className="h-3 w-3" />
         </TooltipTrigger>
@@ -365,7 +384,7 @@ export function ModelSelect({
             />
           </CommandHeader>
           <CommandEmpty>No models found.</CommandEmpty>
-          {showOpenWorkModelsSyncing ? (
+          {openWorkModelsSyncing ? (
             <div className="mx-1 mb-1 flex items-center gap-2 rounded-md border border-amber-6/60 bg-amber-2/40 px-2 py-1.5">
               <ProviderIcon
                 providerId={OPENWORK_MODELS_PROVIDER_ID}
@@ -378,7 +397,7 @@ export function ModelSelect({
                   {OPENWORK_MODELS_PROVIDER_NAME}
                 </span>
                 <span className="block truncate text-[11px] text-muted-foreground">
-                  Included — syncing into this workspace…
+                  Included — pending workspace reload…
                 </span>
               </span>
             </div>

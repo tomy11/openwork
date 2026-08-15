@@ -79,13 +79,13 @@ function jsonResponse(payload: unknown, status = 200) {
   });
 }
 
-function cloudProviderPayload() {
+function cloudProviderPayload(options: { conflict?: boolean } = {}) {
   return {
     id: "lpr_test",
-    source: "custom",
-    providerId: "openai",
-    name: "Team OpenAI",
-    providerConfig: { env: ["OPENAI_API_KEY"] },
+    source: options.conflict ? "openwork" : "custom",
+    providerId: options.conflict ? "openwork" : "openai",
+    name: options.conflict ? "OpenWork Models" : "Team OpenAI",
+    providerConfig: { env: [options.conflict ? "OPENWORK_API_KEY" : "OPENAI_API_KEY"] },
     hasApiKey: true,
     apiKey: "sk-test",
     models: [
@@ -107,7 +107,9 @@ function installCloudSession(storage: Storage) {
   storage.setItem("openwork.den.activeOrgId", "org_test");
 }
 
-function createProviderAuthTestStore() {
+function createProviderAuthTestStore(
+  configCapabilities: { read: boolean; write: boolean; providerSync?: boolean } = { read: true, write: true },
+) {
   const opencodeClient = createClient("https://engine.example", "/tmp/workspace_test", {
     token: "engine-token",
     mode: "openwork",
@@ -115,6 +117,7 @@ function createProviderAuthTestStore() {
   const openworkClient = createOpenworkServerClient({
     baseUrl: "https://server.example",
     token: "server-token",
+    hostToken: "host-token",
   });
   const workspace = {
     id: "workspace_test",
@@ -144,7 +147,11 @@ function createProviderAuthTestStore() {
       getSnapshot: () => ({
         openworkServerStatus: "connected",
         openworkServerClient: openworkClient,
-        openworkServerCapabilities: { config: { read: true, write: true } },
+        openworkServerAuth: { token: "server-token", hostToken: "host-token" },
+        openworkServerCapabilities: {
+          config: configCapabilities,
+          providerSync: configCapabilities.providerSync,
+        },
       }),
     },
     setProviders: (value) => {
@@ -170,7 +177,18 @@ function createProviderAuthTestStore() {
   };
 }
 
-function installProviderSyncFetch(requests: RecordedRequest[]) {
+function installProviderSyncFetch(
+  requests: RecordedRequest[],
+  options: {
+    conflict?: boolean;
+    runStatuses?: Array<{ status: "applied" | "noop" | "failed" | "no_session"; message?: string }>;
+    statusProviders?: Array<Record<string, unknown>>;
+    statusReloadPending?: boolean;
+    statusSkipped?: Array<Record<string, unknown>>;
+    onRun?: () => void;
+  } = {},
+) {
+  let runIndex = 0;
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     value: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -183,13 +201,32 @@ function installProviderSyncFetch(requests: RecordedRequest[]) {
       });
 
       if (url.origin === "https://den.example" && url.pathname === "/api/den/v1/llm-providers") {
-        return jsonResponse({ llmProviders: [cloudProviderPayload()] });
+        return jsonResponse({ llmProviders: [cloudProviderPayload(options)] });
       }
       if (url.origin === "https://den.example" && url.pathname === "/api/den/v1/llm-providers/lpr_test/connect") {
-        return jsonResponse({ llmProvider: cloudProviderPayload() });
+        return jsonResponse({ llmProvider: cloudProviderPayload(options) });
       }
       if (url.origin === "https://server.example" && url.pathname === "/workspace/ws_1/config" && method === "GET") {
         return jsonResponse({ opencode: {}, openwork: {} });
+      }
+      if (url.origin === "https://server.example" && url.pathname === "/den-session" && method === "PUT") {
+        return new Response(null, { status: 204 });
+      }
+      if (url.origin === "https://server.example" && url.pathname === "/cloud-provider-sync/run" && method === "POST") {
+        options.onRun?.();
+        const statuses = options.runStatuses ?? [{ status: "noop" }];
+        const result = statuses[Math.min(runIndex, statuses.length - 1)];
+        runIndex += 1;
+        return jsonResponse(result);
+      }
+      if (url.origin === "https://server.example" && url.pathname === "/cloud-provider-sync/status" && method === "GET") {
+        return jsonResponse({
+          hasSession: true,
+          lastRun: null,
+          providers: options.statusProviders ?? [],
+          reloadPending: options.statusReloadPending ?? false,
+          skippedProviders: options.statusSkipped ?? [],
+        });
       }
       if (url.origin === "https://server.example" && url.pathname === "/workspace/ws_1/config" && method === "PATCH") {
         return jsonResponse({ updatedAt: 1 });
@@ -198,7 +235,9 @@ function installProviderSyncFetch(requests: RecordedRequest[]) {
         return jsonResponse({ ok: true });
       }
       if (url.origin === "https://server.example" && url.pathname === "/workspace/ws_1/opencode-config") {
-        return jsonResponse(null);
+        return jsonResponse(options.conflict
+          ? { content: '{"provider":{"openwork":{"name":"Local OpenWork"}}}' }
+          : null);
       }
       if (url.origin === "https://server.example" && url.pathname === "/workspace/ws_1/engine/reload") {
         return jsonResponse({ ok: true, reloadedAt: 1 });
@@ -286,5 +325,216 @@ describe("cloud provider sync in gateway mode", () => {
     expect(store.getSnapshot().importedCloudProviders.lpr_test?.providerId).toBe("lpr_test");
     expect(store.getSnapshot().providerAuthError).toBeNull();
     expect(reloadCount()).toBe(0);
+  });
+
+  test("does not spin imports when workspace config is read-only", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests);
+    const { store } = createProviderAuthTestStore({ read: true, write: false });
+
+    await store.runCloudProviderSync("settings_cloud_opened");
+
+    expect(requests).toEqual([]);
+    expect(store.getSnapshot().lastSyncError).toEqual({});
+  });
+
+  test("records a hand-authored OpenWork collision once and skips later automatic retries", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { conflict: true });
+    const { store } = createProviderAuthTestStore();
+
+    await store.runCloudProviderSync("settings_cloud_opened");
+
+    expect(store.getSnapshot().lastSyncError.lpr_test).toMatchObject({
+      kind: "conflict",
+      message: expect.stringContaining("openwork already has a provider block"),
+    });
+    expect(store.getSnapshot().importedCloudProviders.lpr_test).toBeUndefined();
+    const firstConnectCount = requests.filter(
+      (request) => request.url === "https://den.example/api/den/v1/llm-providers/lpr_test/connect",
+    ).length;
+    expect(firstConnectCount).toBe(1);
+
+    await store.runCloudProviderSync("app_resume");
+
+    const secondConnectCount = requests.filter(
+      (request) => request.url === "https://den.example/api/den/v1/llm-providers/lpr_test/connect",
+    ).length;
+    expect(secondConnectCount).toBe(firstConnectCount);
+  });
+});
+
+describe("cloud provider sync in server-capability mode", () => {
+  beforeEach(() => {
+    process.env.VITE_OPENWORK_DEPLOYMENT = "web";
+    console.info = () => undefined;
+  });
+
+  afterEach(() => {
+    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: originalFetch });
+    console.info = originalConsoleInfo;
+    if (originalDeployment === undefined) delete process.env.VITE_OPENWORK_DEPLOYMENT;
+    else process.env.VITE_OPENWORK_DEPLOYMENT = originalDeployment;
+  });
+
+  test("posts run-now without fetching Den providers in the renderer", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { runStatuses: [{ status: "applied" }] });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toEqual({ outcome: "handled_server_side" });
+    expect(requests.filter((request) => new URL(request.url).pathname === "/cloud-provider-sync/run")).toHaveLength(1);
+    expect(requests.filter((request) => request.url.includes("/v1/llm-providers"))).toHaveLength(0);
+  });
+
+  test("resolves noop as handled server-side", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { runStatuses: [{ status: "noop" }] });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toEqual({ outcome: "handled_server_side" });
+  });
+
+  test("exposes server failure in settings", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { runStatuses: [{ status: "failed", message: "Provider import failed" }] });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toBeUndefined();
+    expect(store.getSnapshot().providerAuthError).toContain("Provider import failed");
+  });
+
+  test("does not show a sync failure when logout removes the session in flight", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, {
+      runStatuses: [{ status: "failed", message: "Cloud provider sync failed." }],
+      onRun: () => storage.clear(),
+    });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toBeUndefined();
+    expect(store.getSnapshot().providerAuthError).toBeNull();
+  });
+
+  test("does not start settings sync while signed out", async () => {
+    installWindow({ origin: "https://self-hosted.example" });
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { runStatuses: [{ status: "no_session" }] });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toBeUndefined();
+    expect(requests).toEqual([]);
+    expect(store.getSnapshot().providerAuthError).toBeNull();
+  });
+
+  test("pushes the resolved Den API session and retries once when missing", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, { runStatuses: [{ status: "no_session" }, { status: "noop" }] });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(await store.runCloudProviderSync("settings_cloud_opened")).toEqual({ outcome: "handled_server_side" });
+    const sessionRequests = requests.filter((request) => request.method === "PUT" && new URL(request.url).pathname === "/den-session");
+    expect(sessionRequests).toHaveLength(1);
+    expect(sessionRequests[0]?.body).toBe(JSON.stringify({
+      baseUrl: "https://den.example/api/den",
+      token: "den-token",
+      orgId: "org_test",
+    }));
+    expect(requests.filter((request) => request.method === "POST" && new URL(request.url).pathname === "/cloud-provider-sync/run")).toHaveLength(2);
+  });
+
+  test("re-derives imported rows and server sync facts after a server-handled sync", async () => {
+    // #3671, UI layer: the server applied the sync, but the store only read
+    // /cloud-provider-sync/status once at start() (usually before a session
+    // existed), so importedCloudProviders stayed empty and the Cloud
+    // Providers rows sat on "Syncing" forever. Every server-handled pass must
+    // re-derive the records and the reloadPending/skip facts.
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, {
+      runStatuses: [{ status: "applied" }],
+      statusProviders: [{
+        cloudProviderId: "lpr_test",
+        providerId: "lpr_test",
+        sourceProviderId: "openai",
+        name: "Team OpenAI",
+        source: "custom",
+        updatedAt: "2026-08-10T00:00:00.000Z",
+        modelIds: ["gpt-test"],
+        importedAt: 123,
+      }],
+      statusReloadPending: false,
+      statusSkipped: [{
+        cloudProviderId: "lpr_nocred",
+        providerId: "lpr_nocred",
+        name: "No Credential Provider",
+        reason: "missing_credentials",
+      }],
+    });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    expect(store.getSnapshot().importedCloudProviders).toEqual({});
+    expect(await store.runCloudProviderSync("sign_in")).toEqual({ outcome: "handled_server_side" });
+
+    expect(store.getSnapshot().importedCloudProviders.lpr_test?.providerId).toBe("lpr_test");
+    expect(store.getSnapshot().cloudProviderServerSync).toEqual({
+      reloadPending: false,
+      skippedProviders: {
+        lpr_nocred: {
+          cloudProviderId: "lpr_nocred",
+          providerId: "lpr_nocred",
+          name: "No Credential Provider",
+          reason: "missing_credentials",
+        },
+      },
+    });
+  });
+
+  test("maps imported provider status by cloud provider id", async () => {
+    const storage = installWindow({ origin: "https://self-hosted.example" });
+    installCloudSession(storage);
+    const requests: RecordedRequest[] = [];
+    installProviderSyncFetch(requests, {
+      statusProviders: [{
+        cloudProviderId: "cloud_1",
+        providerId: "lpr_cloud_1",
+        sourceProviderId: "openai",
+        name: "Team OpenAI",
+        source: "custom",
+        updatedAt: "2026-08-04T00:00:00.000Z",
+        modelIds: ["gpt-test"],
+        importedAt: 123,
+      }],
+    });
+    const { store } = createProviderAuthTestStore({ read: true, write: true, providerSync: true });
+
+    await store.refreshImportedCloudProviders();
+
+    expect(store.getSnapshot().importedCloudProviders.cloud_1).toEqual({
+      cloudProviderId: "cloud_1",
+      providerId: "lpr_cloud_1",
+      sourceProviderId: "openai",
+      name: "Team OpenAI",
+      source: "custom",
+      updatedAt: "2026-08-04T00:00:00.000Z",
+      modelIds: ["gpt-test"],
+      importedAt: 123,
+    });
   });
 });

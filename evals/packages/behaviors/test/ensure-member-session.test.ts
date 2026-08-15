@@ -53,7 +53,7 @@ async function withStubServer(
 const credentials = { email: "member@example.com", password: "password123" };
 
 function adminSession(den: { apiUrl: string; webUrl: string }): DenSession {
-  return { ...den, token: "admin-token", email: "admin@example.com" };
+  return { ...den, token: "admin-token", email: "admin@example.com", password: "admin-password" };
 }
 
 test("ensureMemberSession explains how to enable member bootstrap when signup is disabled", async () => {

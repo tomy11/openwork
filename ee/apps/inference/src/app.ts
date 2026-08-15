@@ -22,8 +22,20 @@ const shouldServeLocalModelCatalog = !isVercelRuntime && (process.env.NODE_ENV !
 
 const app = new Hono();
 
+function healthPath(path: string) {
+  return path === "/health" || path === "/ready";
+}
+
 if (isSentryEnabled) {
-  app.use("*", sentry(app));
+  const sentryMiddleware = sentry(app);
+  app.use("*", async (c, next) => {
+    if (healthPath(c.req.path)) {
+      await next();
+      return;
+    }
+
+    await sentryMiddleware(c, next);
+  });
 }
 
 const requestLogger = logger((message, ...rest) => {
@@ -35,7 +47,7 @@ const requestLogger = logger((message, ...rest) => {
 });
 
 app.use("*", async (c, next) => {
-  if (c.req.path === "/health" || c.req.path === "/ready") {
+  if (healthPath(c.req.path)) {
     await next();
     return;
   }

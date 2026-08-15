@@ -24,6 +24,9 @@ const READ_SHORTCUT_TARGETS = `(() => [...document.querySelectorAll('[data-sideb
 const READ_VISIBLE_SHORTCUT_BADGES =
   `(() => [...document.querySelectorAll('[data-session-shortcut-badge]')]
     .filter((entry) => entry.getClientRects().length > 0).length)()`;
+const READ_VISIBLE_SHORTCUT_SLOTS =
+  `(() => [...document.querySelectorAll('[data-session-action-slot="number-shortcut"]')]
+    .filter((entry) => entry.getClientRects().length > 0).length)()`;
 const vo = await loadVoiceoverParagraphs("sidebar-session-number-shortcuts");
 
 async function dispatchKey(ctx, payload) {
@@ -262,12 +265,21 @@ export default {
               timeoutMs: 10_000,
               label: "numbered badges to clear from unmodified pointer state",
             });
+            await ctx.waitFor(`${READ_VISIBLE_SHORTCUT_SLOTS} === 0`, {
+              timeoutMs: 10_000,
+              label: "empty shortcut slots to stop reserving sidebar width",
+            });
           },
           assert: async () => {
             const visibleBadges = await ctx.eval(READ_VISIBLE_SHORTCUT_BADGES);
             ctx.assert(
               visibleBadges === 0,
               `Expected no stale shortcut badges, found ${visibleBadges}.`,
+            );
+            const visibleSlots = await ctx.eval(READ_VISIBLE_SHORTCUT_SLOTS);
+            ctx.assert(
+              visibleSlots === 0,
+              `Expected hidden shortcuts to reserve no sidebar width, found ${visibleSlots} slots.`,
             );
           },
           screenshot: {

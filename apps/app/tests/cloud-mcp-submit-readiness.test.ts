@@ -6,8 +6,10 @@ import type {
 } from "../src/app/lib/openwork-server";
 import {
   createCloudMcpSubmissionCoordinator,
+  clearCloudMcpSubmissionFailure,
   decideCloudMcpSubmissionGate,
   ensureCloudMcpSubmissionReadiness,
+  IDLE_CLOUD_MCP_SUBMISSION_GATE_STATE,
   resolveCloudMcpSubmissionAuth,
   type CloudMcpSubmissionGateDecision,
   type CloudMcpSubmissionPreparationResult,
@@ -27,20 +29,25 @@ function failure(input?: Partial<OpenworkCloudMcpFailure>): OpenworkCloudMcpFail
 
 function health(input?: {
   usable?: boolean;
+  usableByCurrentModel?: boolean | null;
   firstFailure?: OpenworkCloudMcpFailure | null;
   projectionSource?: "experimental_tool" | "provider_capability";
+  projectionChecked?: boolean;
+  modelExists?: boolean;
+  toolCalling?: boolean | null;
 }): OpenworkCloudMcpHealth {
   const usable = input?.usable ?? true;
   const projectionSource = input?.projectionSource ?? "experimental_tool";
   const projected = usable
     ? ["openwork-cloud_search_capabilities", "openwork-cloud_execute_capability"]
     : [];
+  const projectionPresent = projectionSource === "experimental_tool" ? projected : [];
   const direct = usable ? ["search_capabilities", "execute_capability"] : [];
   return {
     schemaVersion: 1,
     phase: usable ? "ready" : "registration_failed",
     usable,
-    usableByCurrentModel: usable,
+    usableByCurrentModel: input?.usableByCurrentModel === undefined ? usable : input.usableByCurrentModel,
     connectCatalogEnabled: true,
     workspace: { id: "workspace_1", type: "local", directory: "/workspace", path: "/workspace" },
     desired: {
@@ -71,19 +78,19 @@ function health(input?: {
         missing: usable ? [] : ["search_capabilities", "execute_capability"],
       },
       providerProjection: {
-        checked: true,
+        checked: input?.projectionChecked ?? true,
         provider: PROVIDER_MODEL.provider,
         model: PROVIDER_MODEL.model,
         source: projectionSource,
         ...(projectionSource === "provider_capability"
           ? {
               limitation: "Only generic model tool-call capability is available.",
-              modelExists: true,
-              toolCalling: true,
+              modelExists: input?.modelExists ?? true,
+              toolCalling: input?.toolCalling === undefined ? true : input.toolCalling,
             }
           : {}),
-        present: projected,
-        missing: usable ? [] : ["openwork-cloud_search_capabilities", "openwork-cloud_execute_capability"],
+        present: projectionPresent,
+        missing: projectionPresent.length ? [] : ["openwork-cloud_search_capabilities", "openwork-cloud_execute_capability"],
       },
     },
     pluginCanaries: { expected: ["openwork_docs_search"], present: usable ? ["openwork_docs_search"] : [], missing: usable ? [] : ["openwork_docs_search"] },
@@ -153,6 +160,19 @@ function preparation(input: {
 }
 
 describe("Cloud MCP pre-send readiness", () => {
+  test("a successful provider refresh clears only a stale failure", () => {
+    const failed = {
+      status: "failed" as const,
+      issue: failure({ code: "provider_tool_projection_missing" }),
+      attempt: 3,
+      maxAttempts: 3,
+    };
+    const checking = { ...failed, status: "checking" as const };
+
+    expect(clearCloudMcpSubmissionFailure(failed)).toEqual(IDLE_CLOUD_MCP_SUBMISSION_GATE_STATE);
+    expect(clearCloudMcpSubmissionFailure(checking)).toBe(checking);
+  });
+
   test("ready projected tools send immediately", async () => {
     const coordinator = createCloudMcpSubmissionCoordinator();
     const decision = requiredDecision();
@@ -319,14 +339,46 @@ describe("Cloud MCP pre-send readiness", () => {
     expect(storedDraft).toEqual(originalDraft);
   });
 
-  test("generic model tool-calling support is never accepted as projection proof", async () => {
+  test("provider tool-call capability plus verified direct tools is accepted as projection proof", async () => {
+    const coordinator = createCloudMcpSubmissionCoordinator();
+    const decision = requiredDecision();
+    let checks = 0;
+    let repairs = 0;
+    let runs = 0;
+    const result = await coordinator.submit({
+      scopeKey: decision.scopeKey,
+      prepare: preparation({
+        check: async () => {
+          checks += 1;
+          return health({ projectionSource: "provider_capability", usableByCurrentModel: true });
+        },
+        repair: async () => {
+          repairs += 1;
+          return health();
+        },
+      }),
+      send: async () => {
+        runs += 1;
+      },
+    });
+
+    expect(result).toEqual({ outcome: "sent", bypassed: false });
+    expect({ checks, repairs, runs }).toEqual({ checks: 1, repairs: 0, runs: 1 });
+  });
+
+  test("provider capability without model tool calling is blocked without retry", async () => {
     const coordinator = createCloudMcpSubmissionCoordinator();
     const decision = requiredDecision();
     let runs = 0;
     const result = await coordinator.submit({
       scopeKey: decision.scopeKey,
       prepare: preparation({
-        check: async () => health({ projectionSource: "provider_capability" }),
+        check: async () => health({
+          projectionSource: "provider_capability",
+          usableByCurrentModel: false,
+          modelExists: true,
+          toolCalling: false,
+        }),
         repair: async () => health(),
       }),
       send: async () => {
@@ -334,7 +386,37 @@ describe("Cloud MCP pre-send readiness", () => {
       },
     });
 
-    expect(result).toMatchObject({ outcome: "blocked", issue: { code: "provider_tool_projection_unverified" } });
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      issue: {
+        code: "provider_tool_calling_unavailable",
+        retryable: false,
+        message: "The selected model does not support tool calling.",
+      },
+    });
+    expect(runs).toBe(0);
+  });
+
+  test("an unchecked provider projection is blocked", async () => {
+    const coordinator = createCloudMcpSubmissionCoordinator();
+    const decision = requiredDecision();
+    let runs = 0;
+    const unchecked = health({ projectionChecked: false });
+    const result = await coordinator.submit({
+      scopeKey: decision.scopeKey,
+      prepare: preparation({
+        check: async () => unchecked,
+        repair: async () => unchecked,
+      }),
+      send: async () => {
+        runs += 1;
+      },
+    });
+
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      issue: { code: "provider_tool_projection_unverified", retryable: true },
+    });
     expect(runs).toBe(0);
   });
 

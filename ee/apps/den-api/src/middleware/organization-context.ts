@@ -45,7 +45,7 @@ export const resolveOrganizationContextMiddleware: MiddlewareHandler<{
     })) {
       await hydrateSessionActiveOrganization(session, organizationId)
       if (session) {
-        c.set("session", { ...session, activeOrganizationId: organizationId })
+        c.set("session", { ...session, activeOrganizationId: organizationId ? normalizeDenTypeId("organization", organizationId) : null })
       }
     }
 
@@ -85,7 +85,7 @@ export const resolveOrganizationContextMiddleware: MiddlewareHandler<{
       if (context) {
         await hydrateSessionActiveOrganization(session, resolved.activeOrgId)
         if (session) {
-          c.set("session", { ...session, activeOrganizationId: resolved.activeOrgId })
+          c.set("session", { ...session, activeOrganizationId: normalizedOrganizationId })
         }
       }
     }

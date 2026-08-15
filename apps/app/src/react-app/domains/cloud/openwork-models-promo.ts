@@ -83,6 +83,15 @@ export function hasOpenWorkModelsAvailable(input: {
   return Object.keys(openwork?.models ?? {}).length > 0;
 }
 
+export function shouldShowOpenWorkModelsSyncing(input: {
+  entitled: boolean;
+  available: boolean;
+  workspaceReady: boolean;
+  reloadPending: boolean;
+}) {
+  return input.entitled && !input.available && input.workspaceReady && input.reloadPending;
+}
+
 export function getOpenWorkModelsActionUrl(
   isSignedIn: boolean,
   authMode: "sign-in" | "sign-up" = "sign-in",

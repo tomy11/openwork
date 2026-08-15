@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   openWorkConnectAttentionTitle,
+  resolveOpenWorkConnectStateSummary,
   resolveOpenWorkConnectStatus,
 } from "../src/react-app/domains/connections/openwork-connect-status";
 import type { SessionCloudMcpMaintenanceState } from "../src/react-app/domains/connections/use-session-mcp-maintenance";
@@ -26,6 +27,32 @@ function maintenance(
 }
 
 describe("OpenWork Connect status", () => {
+  test("distinguishes missing, disabled, and unreadable Connect state", () => {
+    expect(resolveOpenWorkConnectStateSummary("missing", false)).toEqual({
+      status: "not_configured",
+      statusLabel: "Not configured",
+      tone: "neutral",
+      stageLabel: "Connect setup is not finished",
+      recommendedAction: "Sign in to OpenWork Cloud to finish setup.",
+    });
+    expect(resolveOpenWorkConnectStateSummary("available", false)).toEqual({
+      status: "disabled",
+      statusLabel: "Disabled",
+      tone: "neutral",
+      stageLabel: "Disabled by organization policy",
+      recommendedAction: "Ask an organization admin to enable Connect.",
+    });
+    for (const status of ["invalid", "unreadable"] satisfies Array<"invalid" | "unreadable">) {
+      expect(resolveOpenWorkConnectStateSummary(status, false)).toEqual({
+        status: "unavailable",
+        statusLabel: "Needs attention",
+        tone: "error",
+        stageLabel: "Connect settings are unavailable",
+        recommendedAction: "Restart OpenWork. If this continues, run diagnostics.",
+      });
+    }
+  });
+
   test("labels the diagnosed message as one possible issue for native tooltips", () => {
     expect(openWorkConnectAttentionTitle("Connected service tools could not be verified."))
       .toBe("One possible issue: Connected service tools could not be verified.");
@@ -35,11 +62,19 @@ describe("OpenWork Connect status", () => {
     expect(resolveOpenWorkConnectStatus(false, maintenance("ready"))).toBeNull();
   });
 
-  test("maps the shared lifecycle to checking, ready, and needs attention", () => {
-    expect(resolveOpenWorkConnectStatus(true, undefined)).toMatchObject({
-      state: "checking",
-      label: "Checking",
+  test("shows the verified Cloud connection while workspace maintenance is idle", () => {
+    expect(resolveOpenWorkConnectStatus(true, undefined)).toEqual({
+      state: "ready",
+      label: "Ready",
+      description: "Signed in to OpenWork Cloud. Connected service tools will be checked when a workspace is active.",
     });
+    expect(resolveOpenWorkConnectStatus(true, maintenance("idle"))).toMatchObject({
+      state: "ready",
+      label: "Ready",
+    });
+  });
+
+  test("maps the active lifecycle to checking, ready, and needs attention", () => {
     expect(resolveOpenWorkConnectStatus(true, maintenance("checking"))).toMatchObject({
       state: "checking",
       label: "Checking",

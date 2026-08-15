@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, mock, setSystemTime, test } from "bun:test"
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
+import { Hono } from "hono"
+import { generateSignedCookie } from "hono/cookie"
 import { getDenSessionExpiresAt, getDenSessionRefreshCutoff } from "../src/session-lifetime.js"
 
 type StoredSession = {
@@ -35,9 +37,14 @@ const token = "desktop-bearer-session-token"
 const userId = createDenTypeId("user")
 const sessionId = createDenTypeId("session")
 let stored: StoredSession | null = null
+let cached: StoredSession | null = null
+let cacheEnabled = false
 let applyUpdates = true
+let selects = 0
 const updates: CapturedUpdate[] = []
 const deletes: unknown[] = []
+const cacheSets: StoredSession[] = []
+const cacheDeletes: string[] = []
 let sessionModule: typeof import("../src/session.js")
 
 function seedRequiredEnv() {
@@ -179,15 +186,18 @@ beforeAll(async () => {
 
   mock.module("../src/db.js", () => ({
     db: {
-      select: () => ({
-        from: () => ({
-          innerJoin: () => ({
-            where: (condition: unknown) => ({
-              limit: () => Promise.resolve(selectRows(condition)),
+      select: () => {
+        selects += 1
+        return {
+          from: () => ({
+            innerJoin: () => ({
+              where: (condition: unknown) => ({
+                limit: () => Promise.resolve(selectRows(condition)),
+              }),
             }),
           }),
-        }),
-      }),
+        }
+      },
       update: () => ({
         set: (values: unknown) => ({
           where: (condition: unknown) => {
@@ -212,15 +222,47 @@ beforeAll(async () => {
     },
   }))
 
+  mock.module("../src/cache.js", () => ({
+    cache: {
+      auth: {
+        session: (requestedToken: string) => {
+          const now = new Date()
+          if (cacheEnabled && cached?.session.token === requestedToken && cached.session.expiresAt > now) {
+            return Promise.resolve(cached)
+          }
+          selects += 1
+          const loaded = stored?.session.token === requestedToken && stored.session.expiresAt > now ? stored : null
+          if (cacheEnabled && loaded) {
+            cached = loaded
+            cacheSets.push(loaded)
+          }
+          return Promise.resolve(loaded)
+        },
+        deleteSession: (requestedToken: string) => {
+          cacheDeletes.push(requestedToken)
+          if (cached?.session.token === requestedToken) {
+            cached = null
+          }
+          return Promise.resolve()
+        },
+      },
+    },
+  }))
+
   sessionModule = await import("../src/session.js")
 })
 
 afterEach(() => {
   setSystemTime()
   stored = null
+  cached = null
+  cacheEnabled = false
   applyUpdates = true
+  selects = 0
   updates.length = 0
   deletes.length = 0
+  cacheSets.length = 0
+  cacheDeletes.length = 0
 })
 
 afterAll(() => {
@@ -277,6 +319,83 @@ test("unknown bearer tokens never issue renewal updates", async () => {
   expect(updates).toHaveLength(0)
 })
 
+test("cached desktop bearer sessions avoid the database lookup", async () => {
+  const now = new Date("2026-07-09T12:00:00.000Z")
+  setSystemTime(now)
+  cacheEnabled = true
+  cached = makeStoredSession({
+    now,
+    updatedAt: now,
+    expiresAt: getDenSessionExpiresAt(now),
+  })
+
+  const resolved = await sessionModule.getRequestSession(new Headers({ authorization: `Bearer ${token}` }))
+
+  expect(resolved?.session.id).toBe(sessionId)
+  expect(selects).toBe(0)
+  expect(updates).toHaveLength(0)
+  expect(cacheSets).toHaveLength(0)
+})
+
+test("desktop bearer session cache misses populate from the database lookup", async () => {
+  const now = new Date("2026-07-09T12:00:00.000Z")
+  setSystemTime(now)
+  cacheEnabled = true
+  stored = makeStoredSession({
+    now,
+    updatedAt: now,
+    expiresAt: getDenSessionExpiresAt(now),
+  })
+
+  const resolved = await sessionModule.getRequestSession(new Headers({ authorization: `Bearer ${token}` }))
+
+  expect(resolved?.session.id).toBe(sessionId)
+  expect(selects).toBe(1)
+  expect(cacheSets).toHaveLength(1)
+  expect(cached?.session.token).toBe(token)
+})
+
+test("signed Better Auth cookie sessions resolve through the Den cache", async () => {
+  const now = new Date("2026-07-09T12:00:00.000Z")
+  setSystemTime(now)
+  stored = makeStoredSession({
+    now,
+    updatedAt: now,
+    expiresAt: getDenSessionExpiresAt(now),
+  })
+  const app = new Hono()
+  app.get("/session", async (c) => {
+    const resolved = await sessionModule.getRequestSession(c.req.raw.headers, c)
+    return c.json({ id: resolved?.session.id ?? null })
+  })
+
+  const cookie = await generateSignedCookie("better-auth.session_token", token, process.env.BETTER_AUTH_SECRET ?? "")
+  const response = await app.request("/session", { headers: { cookie } })
+
+  await expect(response.json()).resolves.toEqual({ id: sessionId })
+  expect(selects).toBe(1)
+})
+
+test("unsigned Better Auth cookies are ignored", async () => {
+  const now = new Date("2026-07-09T12:00:00.000Z")
+  setSystemTime(now)
+  stored = makeStoredSession({
+    now,
+    updatedAt: now,
+    expiresAt: getDenSessionExpiresAt(now),
+  })
+  const app = new Hono()
+  app.get("/session", async (c) => {
+    const resolved = await sessionModule.getRequestSession(c.req.raw.headers, c)
+    return c.json({ id: resolved?.session.id ?? null })
+  })
+
+  const response = await app.request("/session", { headers: { cookie: `better-auth.session_token=${token}` } })
+
+  await expect(response.json()).resolves.toEqual({ id: null })
+  expect(selects).toBe(0)
+})
+
 test("an older concurrent touch cannot shorten a newer expiry", async () => {
   const firstNow = new Date("2026-07-09T12:00:00.000Z")
   const secondNow = new Date("2026-07-09T12:01:00.000Z")
@@ -315,6 +434,7 @@ test("desktop bearer sign-out deletes the exact server session", async () => {
   expect(deletes).toHaveLength(1)
   expect(sqlShape(deletes[0])).toContain(`token = ${token}`)
   expect(stored).toBeNull()
+  expect(cacheDeletes).toEqual([token])
 })
 
 test("only the Better Auth POST sign-out bypasses session resolution", () => {

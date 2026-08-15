@@ -25,6 +25,7 @@ const OPENWORK_CONFIG_FILENAMES = [
   "runtime.sqlite-wal",
   "runtime.sqlite-shm",
   "runtime-opencode-config.json",
+  "engine-instances.json",
   "tokens.json",
   "env.json",
   "connect-state.json",

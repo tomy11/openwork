@@ -1,7 +1,8 @@
+import { processBlankSlateProfile, resolveBlankSlateLaunch } from "./blank-slate-profile.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import net from "node:net";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   cp,
   mkdir,
@@ -55,6 +56,7 @@ import { fetchAgentContextDiagnosticsResponse } from "./agent-context-diagnostic
 import {
   createLinuxDesktopIntegration,
 } from "./linux-desktop-integration.mjs";
+import { createDesktopAutomationRunner, normalizeRunnerBaseUrl } from "./automation-runner.mjs";
 import {
   desktopActivationRequired,
   enterprisePreactivationCommandAllowed,
@@ -70,6 +72,13 @@ import {
   writeWindowsBrandShortcut,
   windowsIconFromNativeImage,
 } from "./brand-icon-windows.mjs";
+import { resetMacDockIcon } from "./brand-icon-darwin.mjs";
+import { createDesktopVaultKeyProvider } from "./secure-vault-key.mjs";
+import {
+  clearOpenworkSentrySession,
+  initOpenworkSentry,
+  setOpenworkSentrySession,
+} from "./sentry.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = path.resolve(__dirname, "../../..");
@@ -102,10 +111,20 @@ const DESKTOP_DISTRIBUTION = resolveDesktopDistribution({
 const TAURI_APP_IDENTIFIER = DESKTOP_DISTRIBUTION.appIdentifier;
 const DEV_APP_IDENTIFIER = `${DESKTOP_DISTRIBUTION.appIdentifier}.dev`;
 const DESKTOP_PROTOCOL_SCHEME = DESKTOP_DISTRIBUTION.protocolScheme;
-const APP_NAME =
+const DEFAULT_APP_NAME =
   (!app.isPackaged ? process.env.OPENWORK_ELECTRON_APP_NAME?.trim() : "") ||
   (isDevMode ? `${DESKTOP_DISTRIBUTION.appName} - Dev` : DESKTOP_DISTRIBUTION.appName);
+const BLANK_SLATE_LAUNCH = resolveBlankSlateLaunch({
+  appName: DEFAULT_APP_NAME,
+  profile: processBlankSlateProfile,
+});
+const APP_NAME = BLANK_SLATE_LAUNCH.appName;
 let currentDisplayAppName = APP_NAME;
+await initOpenworkSentry({
+  app,
+  distribution: DESKTOP_DISTRIBUTION,
+  packageMetadata: desktopPackageMetadata,
+});
 const BASE_APP_IDENTIFIER = isDevMode ? DEV_APP_IDENTIFIER : TAURI_APP_IDENTIFIER;
 const APP_IDENTIFIER = resolveAppIdentifier({
   appIdentifierOverride: process.env.OPENWORK_ELECTRON_APP_IDENTIFIER,
@@ -116,7 +135,7 @@ const APP_IDENTIFIER = resolveAppIdentifier({
   isDevMode,
   isPackaged: app.isPackaged,
 });
-if (process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN === "1") {
+if (BLANK_SLATE_LAUNCH.enabled || process.env.OPENWORK_ELECTRON_USE_MOCK_KEYCHAIN === "1") {
   // Fresh, isolated development profiles otherwise trigger macOS's native
   // "Login" keychain prompt as soon as Chromium persists an authenticated
   // cookie. That modal blocks the entire Electron main loop and makes the demo
@@ -183,14 +202,16 @@ function killTerminalsForWebContents(webContentsId) {
 // OPENWORK_DEV_PROFILE in unpackaged dev; then the legacy identifier default.
 app.setName(APP_NAME);
 app.setAppUserModelId(APP_IDENTIFIER);
+if (BLANK_SLATE_LAUNCH.homePath) app.setPath("home", BLANK_SLATE_LAUNCH.homePath);
 if (
   app.isPackaged
+  && !BLANK_SLATE_LAUNCH.enabled
   && process.env.OPENWORK_ELECTRON_DISABLE_PROTOCOL_REGISTRATION !== "1"
   && !(process.platform === "linux" && process.env.APPIMAGE)
 ) {
   app.setAsDefaultProtocolClient(DESKTOP_PROTOCOL_SCHEME);
 }
-const userDataPath = resolveUserDataPath({
+const userDataPath = BLANK_SLATE_LAUNCH.userDataPath ?? resolveUserDataPath({
   appDataPath: app.getPath("appData"),
   appIdentifier: APP_IDENTIFIER,
   userDataOverride: process.env.OPENWORK_ELECTRON_USERDATA,
@@ -218,8 +239,7 @@ function resolveAppIconPath() {
       : []),
     // Repo-relative path to the Electron resource icon set.
     path.resolve(__dirname, "../resources/icons/icon.png"),
-    // Packaged: electron-builder copies extraResources but we fall back to this
-    // if custom packaging ever exposes the icon here.
+    // Packaged Windows and Linux builds ship runtime icons via extraResources.
     path.join(process.resourcesPath ?? "", "icons", "linux", "512x512.png"),
     path.join(process.resourcesPath ?? "", "icons", "icon.png"),
   ];
@@ -370,6 +390,28 @@ const BRAND_ICON_FETCH_TIMEOUT_MS = 10_000;
 // Keep in sync with ee/apps/den-api/src/brand-icon-validation.ts so logo CDNs
 // that expect a browser request behave the same at save time and apply time.
 const BRAND_ICON_FETCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+function scheduleBlankSlateProfileCleanup() {
+  if (!BLANK_SLATE_LAUNCH.rootPath) return;
+  try {
+    const child = spawn(process.execPath, [
+      path.join(__dirname, "blank-slate-cleanup.mjs"),
+      String(process.pid),
+      BLANK_SLATE_LAUNCH.rootPath,
+    ], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    });
+    child.once("error", (error) => {
+      console.warn("[blank-slate] failed to schedule temporary profile cleanup", error);
+    });
+    child.unref();
+  } catch (error) {
+    console.warn("[blank-slate] failed to schedule temporary profile cleanup", error);
+  }
+}
 let brandIconApplySequence = 0;
 let brandIconRuntimeState = { applied: false, sourceUrl: null, reason: null };
 
@@ -542,6 +584,20 @@ async function applyAppIconImage(image, { taskbarIconPath = null, taskbarAppId =
 async function applyDefaultAppIconImage(expectedSequence = null) {
   let image = APP_ICON_IMAGE;
   let taskbarIconPath = null;
+  if (process.platform === "darwin") {
+    // Packaged macOS builds have no loose default icon file (APP_ICON_IMAGE
+    // is null), so reset the dock via dock.setIcon(null) to restore the
+    // bundle icon instead of silently leaving the branded icon in place.
+    if (expectedSequence !== null && expectedSequence !== brandIconApplySequence) {
+      return { ok: false, reason: "stale" };
+    }
+    try {
+      const result = resetMacDockIcon(app.dock, image);
+      return result.ok ? result : brandIconFailure(result.reason);
+    } catch (error) {
+      return brandIconFailure("os-apply-failed", error);
+    }
+  }
   if (process.platform === "win32") {
     try {
       await removeWindowsBrandShortcut();
@@ -567,8 +623,8 @@ async function applyDefaultAppIconImage(expectedSequence = null) {
     }
   }
   if (!image || image.isEmpty()) {
-    // Preserve the pre-existing no-op fallback on platforms whose packaged
-    // application icon is managed entirely by the bundle.
+    // Linux: the packaged window/launcher icon is managed by the desktop
+    // integration, so a missing loose icon is a safe no-op.
     return process.platform === "win32" ? brandIconFailure("stock-icon-unavailable") : { ok: true };
   }
   if (process.platform === "win32" && taskbarIconPath) {
@@ -636,6 +692,17 @@ async function readBrandIconSidecar() {
   try {
     const parsed = JSON.parse(await readFile(brandIconSidecarPath(), "utf8"));
     return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readBrandIconSidecarSourceUrlSync() {
+  try {
+    const parsed = JSON.parse(readFileSync(brandIconSidecarPath(), "utf8"));
+    return parsed && typeof parsed === "object" && typeof parsed.sourceUrl === "string"
+      ? parsed.sourceUrl
+      : null;
   } catch {
     return null;
   }
@@ -845,7 +912,18 @@ async function getBrandIconState() {
   return { ...brandIconRuntimeState };
 }
 
-const INITIAL_APP_ICON_IMAGE = resolveBrandIconImage() ?? APP_ICON_IMAGE;
+const INITIAL_BRAND_ICON_IMAGE = resolveBrandIconImage();
+const INITIAL_APP_ICON_IMAGE = INITIAL_BRAND_ICON_IMAGE ?? APP_ICON_IMAGE;
+if (INITIAL_BRAND_ICON_IMAGE) {
+  // The renderer's level-based reconcile compares getBrandIconState() with
+  // the fresh org config. Record that a cached brand icon is restored at
+  // boot so a clear whose edge the renderer missed still resets the icon.
+  brandIconRuntimeState = {
+    applied: true,
+    sourceUrl: readBrandIconSidecarSourceUrlSync(),
+    reason: null,
+  };
+}
 if (process.platform === "darwin" && INITIAL_APP_ICON_IMAGE && !INITIAL_APP_ICON_IMAGE.isEmpty() && app.dock) {
   app.dock.setIcon(INITIAL_APP_ICON_IMAGE);
 }
@@ -1150,6 +1228,29 @@ const runtimeManager = createRuntimeManager({
   app,
   desktopRoot: path.resolve(__dirname, ".."),
   listLocalWorkspacePaths: () => workspaceStore.listLocalWorkspacePaths(),
+  localManagedMcpVaultKey: createDesktopVaultKeyProvider({
+    filePath: path.join(app.getPath("userData"), "local-managed-mcp-vault-key.bin"),
+    loadSafeStorage: () => require("electron").safeStorage,
+  }),
+});
+const initialRunnerBootstrap = workspaceStore.readDesktopBootstrapConfigSync();
+const legacyRunnerBaseUrls = [
+  initialRunnerBootstrap.apiBaseUrl,
+  initialRunnerBootstrap.baseUrl,
+  initialRunnerBootstrap.baseUrl
+    ? `${String(initialRunnerBootstrap.baseUrl).replace(/\/+$/, "")}/api/den`
+    : null,
+  `${DEFAULT_DEN_BASE_URL}/api/den`,
+].map((value) => normalizeRunnerBaseUrl(value)).filter(Boolean);
+const desktopAutomationRunner = createDesktopAutomationRunner({
+  // v1 credentials predate token audiences. Keep them usable during the Den
+  // rollout only for endpoints trusted before the renderer starts issuing IPC.
+  legacyBaseUrls: legacyRunnerBaseUrls,
+  getLocalRuntime: async () => {
+    const server = await runtimeManager.openworkServerInfo();
+    return { baseUrl: server.baseUrl, token: server.clientToken ?? server.ownerToken };
+  },
+  log: (state) => console.info(`[automation-runner] ${state}`),
 });
 
 let runtimeDisposedForQuit = false;
@@ -1213,6 +1314,9 @@ function assertOpenworkServerReady(info) {
 }
 
 async function bootRuntimeForSelectedWorkspace() {
+  if (typeof process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE === "string") {
+    throw new Error(process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE);
+  }
   const list = await workspaceStore.readWorkspaceState();
   const selectedId = list.selectedId || list.activeId || list.workspaces[0]?.id || "";
   const workspace = selectedId
@@ -1669,13 +1773,27 @@ const desktopCommandHandlers = {
   "desktopNotificationShow": async (event, ...args) => {
       return showDesktopNotification(args[0] ?? {});
   },
+  "desktopSentrySetSession": async (event, ...args) => {
+      const input = args[0] ?? {};
+      return {
+        enabled: setOpenworkSentrySession({
+          userId: input.userId,
+          orgId: input.orgId,
+        }),
+      };
+  },
+  "desktopSentryClearSession": async (event, ...args) => {
+      return { enabled: clearOpenworkSentrySession() };
+  },
   "desktopIntegrationStatus": async (event, ...args) => {
       return linuxDesktopIntegration.getStatus();
   },
   "desktopIntegrationInstall": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) throw new Error("Desktop integration is disabled for test profiles.");
       return linuxDesktopIntegration.install(args[0] ?? {});
   },
   "desktopIntegrationRemove": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) throw new Error("Desktop integration is disabled for test profiles.");
       return linuxDesktopIntegration.remove();
   },
   "getUiControlBridgeInfo": async (event, ...args) => {
@@ -1815,6 +1933,9 @@ const desktopCommandHandlers = {
   },
   "openworkServerInfo": async (event, ...args) => {
       return runtimeManager.openworkServerInfo();
+  },
+  "automationRunnerConfigure": async (event, ...args) => {
+      return desktopAutomationRunner.configure(args[0] ?? null);
   },
   "openworkServerRestart": async (event, ...args) => {
       return runtimeManager.openworkServerRestart(args[0] ?? {});
@@ -1995,7 +2116,7 @@ const desktopCommandHandlers = {
   },
   "__applyBrandAppName": async (event, ...args) => {
     currentDisplayAppName = applyBrandAppName(
-      DESKTOP_DISTRIBUTION.flavor === "enterprise" ? null : args[0],
+      BLANK_SLATE_LAUNCH.enabled || DESKTOP_DISTRIBUTION.flavor === "enterprise" ? null : args[0],
       {
       fallbackName: APP_NAME,
       platform: process.platform,
@@ -2006,12 +2127,13 @@ const desktopCommandHandlers = {
       window: mainWindow,
       },
     );
-    if (process.platform === "win32") {
+    if (process.platform === "win32" && !BLANK_SLATE_LAUNCH.enabled) {
       await registerWindowsDisplayShortcut();
     }
     return { ok: true, appName: currentDisplayAppName };
   },
   "__applyBrandIcon": async (event, ...args) => {
+      if (BLANK_SLATE_LAUNCH.enabled) return { ok: true };
       const value = args[0] === null ? null : String(args[0] ?? "");
       return applyBrandIconUrl(value);
   },
@@ -2476,6 +2598,11 @@ const { ensureAutoUpdater } = registerUpdaterIpc({
   manifestChannel: DESKTOP_DISTRIBUTION.flavor === "public"
     ? "latest"
     : DESKTOP_DISTRIBUTION.flavor,
+  electronNet,
+  shell,
+  distribution: DESKTOP_DISTRIBUTION.flavor,
+  platform: process.platform,
+  arch: process.arch,
 });
 
 if (!app.requestSingleInstanceLock()) {
@@ -2496,7 +2623,14 @@ or use: pnpm dev:worktree`);
     event.preventDefault();
     if (runtimeDisposeInProgress) return;
     showShutdownScreen();
-    void Promise.all([disposeRuntimeBeforeQuit(), uiControlServer.stop()]).finally(() => app.quit());
+    desktopAutomationRunner.stop();
+    void Promise.all([
+      disposeRuntimeBeforeQuit(),
+      uiControlServer.stop(),
+    ]).finally(() => {
+      scheduleBlankSlateProfileCleanup();
+      app.quit();
+    });
   });
 
   app.on("second-instance", async (_event, argv) => {
@@ -2530,10 +2664,9 @@ or use: pnpm dev:worktree`);
     }).catch((error) => {
       console.warn("[nuke] pending cleanup failed", error);
     });
-    await workspaceStore.importBundledDesktopBootstrapConfigIfPreferred();
     const bootstrapConfig = await workspaceStore.getDesktopBootstrapConfig();
     currentDisplayAppName = applyBrandAppName(
-      DESKTOP_DISTRIBUTION.flavor === "enterprise"
+      BLANK_SLATE_LAUNCH.enabled || DESKTOP_DISTRIBUTION.flavor === "enterprise"
         ? null
         : bootstrapConfig.brandAppName,
       {
@@ -2545,10 +2678,10 @@ or use: pnpm dev:worktree`);
       applicationMenu,
       },
     );
-    if (process.platform === "win32") {
+    if (process.platform === "win32" && !BLANK_SLATE_LAUNCH.enabled) {
       await registerWindowsDisplayShortcut();
     }
-    if (process.platform !== "linux") {
+    if (process.platform !== "linux" && !BLANK_SLATE_LAUNCH.enabled) {
       await applyDesktopBootstrapBrandIcon(bootstrapConfig, applyBrandIconUrl);
     }
     applicationMenu.install();
@@ -2577,17 +2710,19 @@ or use: pnpm dev:worktree`);
 
     queueDeepLinks(forwardedDeepLinks(process.argv));
     const win = await createMainWindow();
-    if (process.platform === "linux") {
+    if (process.platform === "linux" && !BLANK_SLATE_LAUNCH.enabled) {
       await applyDesktopBootstrapBrandIcon(bootstrapConfig, applyBrandIconUrl);
     }
     win.webContents.on("did-finish-load", () => {
       flushPendingDeepLinks();
     });
-    setTimeout(() => {
-      void linuxDesktopIntegration.maybePrompt(win).catch((error) => {
-        console.warn("[desktop-integration] prompt failed", error);
-      });
-    }, 500);
+    if (!BLANK_SLATE_LAUNCH.enabled) {
+      setTimeout(() => {
+        void linuxDesktopIntegration.maybePrompt(win).catch((error) => {
+          console.warn("[desktop-integration] prompt failed", error);
+        });
+      }, 500);
+    }
 
     // Initialize the packaged updater after the window is up so the user sees
     // a working app first. Renderer-owned checks pass the selected release

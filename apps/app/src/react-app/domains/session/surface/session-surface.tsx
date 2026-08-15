@@ -67,6 +67,7 @@ import { QueuedMessagesPanel } from "@/react-app/domains/session/modals/queued-m
 import { deriveOpenTargets, selectAutoOpenTarget, type OpenTarget } from "@/react-app/domains/session/artifacts/open-target";
 import { usePanelTabStore } from "@/react-app/domains/session/panel/panel-tab-store";
 import {
+  markSessionSnapshotFetchStart,
   seedSessionState,
   snapshotKey as reactSnapshotKey,
   statusKey as reactStatusKey,
@@ -80,6 +81,7 @@ import {
   getComposerMentions,
   getComposerPasteParts,
   getComposerQueuedDrafts,
+  getComposerRevertMessageId,
   useComposerStateStore,
 } from "./composer-state-store";
 import { MessageList } from "@/components/chat/message-list";
@@ -311,6 +313,8 @@ export type SessionSurfaceProps = {
   providerCatalog?: ProviderCatalog;
   /** Den/import includes OpenWork Models for this org member (not just local sync). */
   openWorkModelsEntitled?: boolean;
+  /** The server is waiting to reload this workspace with OpenWork Models. */
+  openWorkModelsSyncing?: boolean;
   onRefreshOrganizationModels?: () => void | Promise<void>;
   onModelPickerOpenChange: (open: boolean) => void;
   onModelChange: (model: ModelRef) => void;
@@ -346,6 +350,7 @@ export type SessionSurfaceProps = {
   providerConnectedCount?: number;
   onOpenSettingsSection?: ((section: "commands" | "skills" | "mcps" | "plugins" | "extensions" | "providers") => void) | undefined;
   onRevertToMessage?: (messageId: string, sessionId: string) => Promise<boolean>;
+  onRestoreRevertedSession?: (sessionId: string) => Promise<boolean>;
   onForkAtMessage?: (messageId: string | null, sessionId: string) => void;
   onOpenTarget?: (target: OpenTarget, options?: OpenTargetOptions, sessionId?: string) => void;
   environmentRuntimeKey?: string | null;
@@ -555,7 +560,7 @@ function SessionErrorCard({ error, onDismiss, onChangeModel, onOpenModelPicker }
   onOpenModelPicker?: () => void;
 }) {
   return (
-    <div className="mx-auto max-w-[720px] px-3 py-3 sm:px-5">
+    <div className="mx-auto max-w-[720px] px-3 py-3 sm:px-5" data-testid="session-error-card" role="alert">
       <div className="rounded-2xl border border-red-6/30 bg-red-3/15 px-5 py-4">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
@@ -604,6 +609,28 @@ function SessionErrorCard({ error, onDismiss, onChangeModel, onOpenModelPicker }
   );
 }
 
+function RevertedMessagesBanner(props: { hiddenCount: number; restoring: boolean; onRestore: () => void }) {
+  return (
+    <div
+      className="mb-3 flex items-center gap-3 rounded-2xl border border-amber-7/40 bg-amber-2/30 px-4 py-3 text-sm text-amber-11"
+      data-testid="reverted-messages-banner"
+      role="status"
+    >
+      <span className="min-w-0 flex-1 font-medium">
+        {t("session.reverted_messages_hidden", { count: props.hiddenCount })}
+      </span>
+      <button
+        type="button"
+        className="shrink-0 rounded-full border border-amber-7/50 bg-dls-surface px-3 py-1.5 text-xs font-medium text-dls-text transition-colors hover:bg-dls-hover disabled:opacity-50"
+        disabled={props.restoring}
+        onClick={props.onRestore}
+      >
+        {props.restoring ? t("session.restoring") : t("session.restore")}
+      </button>
+    </div>
+  );
+}
+
 function revokeAttachmentPreview(attachment: { previewUrl?: string | undefined }) {
   if (!attachment.previewUrl) return;
   URL.revokeObjectURL(attachment.previewUrl);
@@ -618,7 +645,7 @@ function sameAttachments(left: ComposerAttachment[], right: ComposerAttachment[]
 // merged, so the whole queue is delivered to the agent as one message.
 function mergeDrafts(drafts: ComposerDraft[]): ComposerDraft | null {
   if (drafts.length === 0) return null;
-  if (drafts.length === 1) return drafts[0] ?? null;
+  if (drafts.length === 1) return withoutRevertTarget(drafts[0] ?? null);
   const separator: ComposerPart = { type: "text", text: "\n\n" };
   const parts: ComposerPart[] = [];
   const attachments: ComposerAttachment[] = [];
@@ -641,6 +668,16 @@ function mergeDrafts(drafts: ComposerDraft[]): ComposerDraft | null {
   };
 }
 
+function withoutRevertTarget(draft: ComposerDraft | null): ComposerDraft | null {
+  if (!draft || !draft.revertMessageId) return draft;
+  return { ...draft, revertMessageId: undefined };
+}
+
+function hiddenMessageCount(snapshot: OpenworkSessionSnapshot, revertMessageId: string): number {
+  const index = snapshot.messages.findIndex((message) => message.info.id === revertMessageId);
+  return index < 0 ? snapshot.messages.length : snapshot.messages.length - index;
+}
+
 export function SessionSurface(props: SessionSurfaceProps) {
   const local = useLocal();
   const { config: shellConfig } = useShellConfig();
@@ -656,9 +693,14 @@ export function SessionSurface(props: SessionSurfaceProps) {
   );
   const draft = useComposerStateStore((state) => getComposerDraft(state, props.sessionId));
   const attachments = useComposerStateStore((state) => getComposerAttachments(state, props.sessionId));
+  // True while a send with attachments is in flight (compression + inbox
+  // upload + prompt POST); drives the uploading overlay on composer chips.
+  const [attachmentsUploading, setAttachmentsUploading] = useState(false);
   const mentions = useComposerStateStore((state) => getComposerMentions(state, props.sessionId));
   const pasteParts = useComposerStateStore((state) => getComposerPasteParts(state, props.sessionId));
   const setComposerDraft = useComposerStateStore((state) => state.setDraft);
+  const replaceComposerDraft = useComposerStateStore((state) => state.replaceDraft);
+  const clearComposerRevertTarget = useComposerStateStore((state) => state.clearRevertTarget);
   const setComposerAttachments = useComposerStateStore((state) => state.setAttachments);
   const setComposerMentions = useComposerStateStore((state) => state.setMentions);
   const setComposerPasteParts = useComposerStateStore((state) => state.setPasteParts);
@@ -701,6 +743,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     props.onModelClick(props.sessionId);
   }, [props.onModelClick, props.sessionId]);
   const [error, setError] = useState<SessionError | null>(null);
+  const [restoringRevertedMessages, setRestoringRevertedMessages] = useState(false);
   const [showDelayedLoading, setShowDelayedLoading] = useState(false);
   const [awaitingAssistantBaseline, setAwaitingAssistantBaseline] = useState<number | null>(null);
   const [rendered, setRendered] = useState<{ sessionId: string; snapshot: OpenworkSessionSnapshot } | null>(null);
@@ -741,7 +784,12 @@ export function SessionSurface(props: SessionSurfaceProps) {
   );
   const snapshotQuery = useQuery<OpenworkSessionSnapshot>({
     queryKey: snapshotQueryKey,
-    queryFn: async () => (await props.client.getSessionSnapshot(props.workspaceId, props.sessionId, { limit: 140 })).item,
+    queryFn: async () => {
+      const startedAt = Date.now();
+      const item = (await props.client.getSessionSnapshot(props.workspaceId, props.sessionId, { limit: 140 })).item;
+      markSessionSnapshotFetchStart(item, startedAt);
+      return item;
+    },
     staleTime: 500,
   });
 
@@ -758,6 +806,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     hydratedKeyRef.current = null;
     setSteering(false);
     setError(null);
+    setRestoringRevertedMessages(false);
     setShowDelayedLoading(false);
     setAwaitingAssistantBaseline(null);
     // Composer draft state lives in the shared store keyed by session id, so
@@ -766,6 +815,10 @@ export function SessionSurface(props: SessionSurfaceProps) {
     initializedAutoOpenSessionRef.current = null;
     setVerifiedOpenTargets([]);
   }, [props.sessionId]);
+
+  useEffect(() => () => {
+    clearComposerRevertTarget(props.sessionId);
+  }, [clearComposerRevertTarget, props.sessionId]);
 
   // Publish a composer inspector slice so external drivers can read draft
   // state, attachments, mentions, and sending status from the running app.
@@ -836,6 +889,8 @@ export function SessionSurface(props: SessionSurfaceProps) {
     currentSnapshot,
     cachedRendered: rendered,
   });
+  const revertMessageId = snapshot?.session.revert?.messageID ?? null;
+  const revertedMessageCount = snapshot && revertMessageId ? hiddenMessageCount(snapshot, revertMessageId) : 0;
   const liveStatus = statusState ?? snapshot?.status ?? IDLE_STATUS;
   const preparingCloudTools = props.cloudMcpSubmissionState.status === "checking" ||
     props.cloudMcpSubmissionState.status === "repairing";
@@ -1094,8 +1149,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
       text,
       resolvedText: resolved,
       command: slashCommand ?? undefined,
+      revertMessageId: getComposerRevertMessageId(useComposerStateStore.getState(), props.sessionId) ?? undefined,
     };
-  }, [mentions, pasteParts]);
+  }, [mentions, pasteParts, props.sessionId]);
 
   const handleComposerDraftChange = useCallback((value: string) => {
     setComposerDraft(props.sessionId, value);
@@ -1155,6 +1211,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     if (!text && attachments.length === 0) return;
     const nextDraft = buildDraft(text, attachments);
     const sentAttachments = attachments;
+    if (sentAttachments.length) setAttachmentsUploading(true);
     try {
       const result = await sendDraft(nextDraft);
       if (result.outcome === "blocked" || result.outcome === "cancelled") return;
@@ -1171,6 +1228,8 @@ export function SessionSurface(props: SessionSurfaceProps) {
           .forEach(revokeAttachmentPreview);
       }
     } catch {
+    } finally {
+      setAttachmentsUploading(false);
     }
   }, [attachments, buildDraft, clearComposer, draft, props.sessionId, sendDraft]);
 
@@ -1207,7 +1266,9 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const handleQueue = useCallback(() => {
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
-    appendQueuedDraft(props.sessionId, buildDraft(text, attachments));
+    const queuedDraft = withoutRevertTarget(buildDraft(text, attachments));
+    if (!queuedDraft) return;
+    appendQueuedDraft(props.sessionId, queuedDraft);
     clearComposer();
   }, [appendQueuedDraft, attachments, buildDraft, clearComposer, draft, props.sessionId]);
 
@@ -1223,7 +1284,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
   const [sendingQueued, setSendingQueued] = useState(false);
   const sendQueuedDraftNow = useCallback(async (index: number) => {
     if (drainingQueueRef.current || sendingQueued) return;
-    const target = queuedDrafts[index];
+    const target = withoutRevertTarget(queuedDrafts[index] ?? null);
     if (!target) return;
     setSendingQueued(true);
     removeQueuedDraftFromStore(props.sessionId, index);
@@ -1422,11 +1483,11 @@ export function SessionSurface(props: SessionSurfaceProps) {
     setComposerDraft(props.sessionId, `${draft}${draft && !draft.endsWith("\n") ? "\n" : ""}${links.join("\n")}`);
   };
 
-  const typeComposerText = useCallback(async (text: string) => {
+  const typeComposerText = useCallback(async (text: string, revertMessageId?: string | null) => {
     window.dispatchEvent(new Event("openwork:focusPrompt"));
-    setComposerDraft(props.sessionId, text);
+    replaceComposerDraft(props.sessionId, text, revertMessageId);
     await waitForControl(40);
-  }, [props.sessionId, setComposerDraft]);
+  }, [props.sessionId, replaceComposerDraft]);
 
   useEffect(() => {
     const handleVoiceTranscript = (event: Event) => {
@@ -1792,14 +1853,17 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }, [props.onForkAtMessage, props.sessionId, renderedMessages]);
 
   const handleEditUserMessage = useCallback((messageId: string, text: string) => {
-    void (async () => {
-      // Rewind the session to just before this prompt, then restore the
-      // prompt text into the composer so the user can rewrite and resend it.
-      const reverted = await props.onRevertToMessage?.(messageId, props.sessionId);
-      if (reverted === false) return;
-      await typeComposerText(text);
-    })();
-  }, [props.onRevertToMessage, props.sessionId, typeComposerText]);
+    // Preserve the boundary with the draft; the destructive revert is deferred
+    // until the replacement prompt is actually sent.
+    void typeComposerText(text, messageId);
+  }, [typeComposerText]);
+
+  const handleRestoreRevertedSession = useCallback(() => {
+    if (!props.onRestoreRevertedSession || restoringRevertedMessages) return;
+    setRestoringRevertedMessages(true);
+    void props.onRestoreRevertedSession(props.sessionId)
+      .finally(() => setRestoringRevertedMessages(false));
+  }, [props.onRestoreRevertedSession, props.sessionId, restoringRevertedMessages]);
 
   const sessionScrollTopControlAction = useMemo<OpenworkControlAction>(() => ({
     id: "session.scroll_top",
@@ -1915,11 +1979,26 @@ export function SessionSurface(props: SessionSurfaceProps) {
           onScroll={sessionScroll.handleScroll}
           // Extra top padding while the find bar is open so it never covers
           // the first message (short transcripts cannot scroll it clear).
-          className={`absolute inset-0 overflow-x-hidden overflow-y-auto overscroll-y-contain px-3 pb-4 sm:px-5 ${findOwned ? "pt-16" : "pt-4"}`}
+          className={`absolute inset-0 overflow-x-hidden overflow-y-auto overscroll-y-contain touch-pan-y px-3 pb-4 sm:px-5 ${findOwned ? "pt-16" : "pt-4"}`}
         >
           {/* Chat column: tighter than the composer (800px) so messages
                keep a comfortable reading width and don't feel "too big". */}
           <div ref={contentRef} className="mx-auto w-full max-w-[720px]">
+            {revertMessageId ? (
+              <RevertedMessagesBanner
+                hiddenCount={revertedMessageCount}
+                restoring={restoringRevertedMessages}
+                onRestore={handleRestoreRevertedSession}
+              />
+            ) : null}
+            {error && snapshot && snapshot.messages.length > 0 ? (
+              <SessionErrorCard
+                error={error}
+                onDismiss={handleDismissError}
+                onChangeModel={sessionModel.setModel}
+                onOpenModelPicker={handleOpenModelPicker}
+              />
+            ) : null}
             {showDelayedLoading && pendingSessionLoad ? (
               <div className="px-6 py-16">
                 <div className="mx-auto max-w-sm rounded-3xl border border-dls-border bg-dls-hover/60 px-8 py-10 text-center">
@@ -2028,9 +2107,11 @@ export function SessionSurface(props: SessionSurfaceProps) {
                 props.cloudMcpSubmissionState.issue?.recommendedAction,
               ].filter(Boolean).join(" ")}
             </span>
-            <button type="button" className="font-medium hover:underline" onClick={handleRetryCloudSubmission}>
-              Retry
-            </button>
+            {props.cloudMcpSubmissionState.issue?.retryable !== false ? (
+              <button type="button" className="font-medium hover:underline" onClick={handleRetryCloudSubmission}>
+                Retry
+              </button>
+            ) : null}
             <button type="button" className="font-medium hover:underline" onClick={props.onOpenConnect}>
               Open Connect
             </button>
@@ -2056,11 +2137,13 @@ export function SessionSurface(props: SessionSurfaceProps) {
         modelPickerOpen={modelPickerOpen}
         selectedModel={sessionModel.selectedModel}
         openWorkModelsEntitled={props.openWorkModelsEntitled}
+        openWorkModelsSyncing={props.openWorkModelsSyncing}
         onRefreshOrganizationModels={props.onRefreshOrganizationModels}
         onModelPickerOpenChange={handleModelPickerOpenChange}
         onModelChange={handleModelChange}
         sessionId={props.sessionId}
         attachments={attachments}
+        attachmentsUploading={attachmentsUploading}
         onAttachFiles={handleAttachFiles}
         onRemoveAttachment={handleRemoveAttachment}
         attachmentsEnabled={props.attachmentsEnabled}

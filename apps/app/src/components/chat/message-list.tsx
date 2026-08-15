@@ -35,6 +35,10 @@ import { ReadFileTool, WriteFileTool } from "@/components/tools/file"
 import { GlobTool } from "@/components/tools/glob"
 import { GrepTool } from "@/components/tools/grep"
 import { LspTool } from "@/components/tools/lsp"
+import {
+  isAutomationProposalToolPart,
+  OpenWorkAutomationProposalTool,
+} from "@/components/tools/openwork-automation-proposal"
 import { OpenWorkSessionCreateTool } from "@/components/tools/openwork-session-create"
 import { QuestionTool } from "@/components/tools/question"
 import { SkillTool } from "@/components/tools/skill"
@@ -226,6 +230,10 @@ const ToolMessageInner = ({ part }: ToolMessageProps) => {
     return <OpenWorkSessionCreateTool part={part} />
   }
 
+  if (part.type === "dynamic-tool" && isAutomationProposalToolPart(part)) {
+    return <OpenWorkAutomationProposalTool part={part} />
+  }
+
   if (isTaskToolPart(part)) {
     return <SubagentRunLine part={part} />
   }
@@ -411,7 +419,7 @@ type AssistantMessageProps = {
 }
 
 const AssistantMessage = React.memo(
-  ({ message, hideReasoning }: AssistantMessageProps) => {
+  ({ message, isStreaming, hideReasoning }: AssistantMessageProps) => {
     const { showThinking, highlightQuery } = useMessageList()
     const assistantRenderGroups = React.useMemo(
       () => {
@@ -435,6 +443,7 @@ const AssistantMessage = React.memo(
                   key={`text-${index}`}
                   className="text-foreground prose w-full min-w-0 flex-1 rounded-lg bg-transparent p-0"
                   markdown
+                  isStreaming={isStreaming}
                   highlightQuery={highlightQuery}
                 >
                   {group.text}
@@ -651,7 +660,7 @@ const UserMessage = React.memo(
                 {!isStreaming && (
                   <MessageActions
                     className={cn(
-                      "flex items-center gap-0 opacity-0 transition-opacity duration-150 group-hover:opacity-100"
+                      "flex items-center gap-0 opacity-0 transition-opacity duration-150 group-hover:opacity-100 max-lg:opacity-100 pointer-coarse:opacity-100"
                     )}
                   >
                     <MessageTimestamp message={message} className="mr-1.5" />
@@ -1096,7 +1105,7 @@ function MessageGroup({
         includeTargetFallbacks={false}
       />
       {lastTextMessage && !isStreaming && (
-        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-2 opacity-0 transition-opacity duration-150 group-hover/message-group:opacity-100 md:px-8">
+        <div className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-2 opacity-0 transition-opacity duration-150 group-hover/message-group:opacity-100 max-lg:opacity-100 pointer-coarse:opacity-100 md:px-8">
           <MessageActions className="flex gap-0">
             <CopyMessageButton messages={renderableItems.map((item) => item.message)} />
             {lastRealItem ? (

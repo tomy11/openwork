@@ -240,6 +240,7 @@ export type DenOrgEntitlements = {
 export type DenOrgCapabilities = {
   installLinks: boolean;
   mcpConnections: boolean;
+  codemodeScripts: boolean;
   cloud: boolean;
 };
 
@@ -527,6 +528,14 @@ export function getBackgroundAgentsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/background-agents`;
 }
 
+export function getScriptRunsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/script-runs`;
+}
+
+export function getAutomationsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/automations`;
+}
+
 export function getCustomLlmProvidersRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/custom-llm-providers`;
 }
@@ -603,6 +612,10 @@ export function getPluginRoute(orgSlug: string | null | undefined, pluginId: str
   return `${getPluginsRoute(orgSlug)}/${encodeURIComponent(pluginId)}`;
 }
 
+export function getRemoteMcpAppRoute(orgSlug: string | null | undefined, appId: string): string {
+  return `${getOrgDashboardRoute(orgSlug)}/apps/${encodeURIComponent(appId)}`;
+}
+
 export function getPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string, skillId: string): string {
   return `${getPluginRoute(orgSlug, pluginId)}/skills/${encodeURIComponent(skillId)}`;
 }
@@ -645,6 +658,14 @@ export function getMcpConnectionsRoute(orgSlug?: string | null): string {
 
 export function getYourConnectionsRoute(orgSlug?: string | null): string {
   return `${getOrgDashboardRoute(orgSlug)}/your-connections`;
+}
+
+export function getToolTesterRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/tool-tester`;
+}
+
+export function getLibraryRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/library`;
 }
 
 export function getGithubIntegrationSetupRoute(orgSlug: string | null | undefined, connectorInstanceId: string): string {
@@ -915,12 +936,13 @@ function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
 
 function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
   if (!isRecord(value)) {
-    return { installLinks: false, mcpConnections: false, cloud: false };
+    return { installLinks: false, mcpConnections: false, codemodeScripts: false, cloud: false };
   }
 
   return {
     installLinks: value.installLinks === true,
     mcpConnections: value.mcpConnections === true,
+    codemodeScripts: value.codemodeScripts === true,
     cloud: value.cloud === true,
   };
 }

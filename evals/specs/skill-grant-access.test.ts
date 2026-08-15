@@ -222,7 +222,7 @@ test.skipIf(!apiUrl)(title, async () => {
   expect(deniedExecution.isError).toBe(true);
   expect(toolJson(deniedExecution)).toEqual({
     error: "forbidden",
-    message: "You have not been granted access to this marketplace plugin capability.",
+    message: "You have not been granted access to this plugin capability.",
   });
 
   const deniedMemberId = await organizationMemberIdByEmail(creator, orgId, deniedEmail);

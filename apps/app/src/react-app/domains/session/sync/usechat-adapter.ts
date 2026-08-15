@@ -3,98 +3,16 @@ import type { UIMessage } from "ai";
 import type { FilePart, Part, ToolPart } from "@opencode-ai/sdk/v2/client";
 
 import type { OpenworkSessionSnapshot } from "../../../../app/lib/openwork-server";
-import { safeStringify } from "../../../../app/utils";
 import { SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX } from "../../../../app/types";
 import {
   parseDynamicToolUIPart,
   parseStructuredOutputUIPart,
   STRUCTURED_OUTPUT_TOOL,
 } from "./parse-tool-parts";
-
-function recordValue(value: unknown, key: string) {
-  if (!value || typeof value !== "object") return undefined;
-  return (value as Record<string, unknown>)[key];
-}
-
-function firstStringValue(records: unknown[], keys: string[]) {
-  for (const record of records) {
-    for (const key of keys) {
-      const value = recordValue(record, key);
-      if (typeof value === "string" && value.trim()) return value.trim();
-    }
-  }
-  return null;
-}
-
-function firstNumberValue(records: unknown[], keys: string[]) {
-  for (const record of records) {
-    for (const key of keys) {
-      const value = recordValue(record, key);
-      if (typeof value === "number" && Number.isFinite(value)) return value;
-    }
-  }
-  return null;
-}
-
-function defaultErrorMessage(name: string | null, fallback: string) {
-  if (name === "ProviderAuthError") return "Provider authentication failed";
-  if (name === "MessageOutputLengthError") return "The model reached its output limit before finishing";
-  if (name === "StructuredOutputError") return "The model could not produce valid structured output";
-  if (name === "ContextOverflowError") return "The conversation is too large for the model context window";
-  if (name === "MessageAbortedError") return "The message was interrupted";
-  return fallback;
-}
-
-/**
- * Unsupported file parts live in server-side session history, so the same
- * provider error replays on every later prompt. Tell the user how to escape.
- */
-function withAttachmentRecoveryHint(text: string) {
-  if (!text.includes("file part media type") || !text.includes("not supported")) return text;
-  return `${text}\nAn attached file in this conversation uses a format the model can't read. Revert the conversation to before the attachment was sent, or start a new session.`;
-}
-
-/**
- * OpenCode Codex/ChatGPT OAuth refresh failures surface as a raw engine string.
- * Narrowly rewrite the 401 case so users reconnect OpenAI — not OpenWork Cloud.
- */
-function withOpenAiTokenRefreshHint(text: string) {
-  if (!/Token refresh failed:\s*401/i.test(text)) return text;
-  return "OpenAI couldn’t renew the ChatGPT sign-in for this worker. Retry once. If it happens again, reconnect OpenAI under Connect providers → OpenAI → ChatGPT Pro/Plus.";
-}
-
-function withSessionErrorHints(text: string) {
-  return withOpenAiTokenRefreshHint(withAttachmentRecoveryHint(text));
-}
-
-export function describeOpencodeSessionError(error: unknown, fallback = "Session failed") {
-  if (error instanceof Error) return withSessionErrorHints(error.message || fallback);
-  if (typeof error === "string") return withSessionErrorHints(error.trim() || fallback);
-  if (!error || typeof error !== "object") return fallback;
-
-  const data = recordValue(error, "data");
-  const cause = recordValue(error, "cause");
-  const causeData = recordValue(cause, "data");
-  const records = [error, data, cause, causeData].filter(Boolean);
-  const name = firstStringValue(records, ["name", "type"]);
-  const message = firstStringValue(records, ["message", "detail", "reason", "error"]);
-  const status = firstNumberValue(records, ["statusCode", "status"]);
-  const provider = firstStringValue(records, ["providerID", "providerId", "provider"]);
-  const code = firstStringValue(records, ["code", "errorCode"]);
-  const retries = firstNumberValue(records, ["retries", "retryCount"]);
-  const responseBody = firstStringValue(records, ["responseBody", "body", "response"]);
-
-  const lines = [message ?? defaultErrorMessage(name, fallback)];
-  if (status && !lines[0]?.includes(String(status))) lines.push(`Status: ${status}`);
-  if (provider && !lines[0]?.includes(provider)) lines.push(`Provider: ${provider}`);
-  if (code) lines.push(`Code: ${code}`);
-  if (retries !== null) lines.push(`Retries: ${retries}`);
-  if (responseBody && responseBody !== message) lines.push(`Response: ${responseBody}`);
-  if (lines.some((line) => line !== fallback)) return withSessionErrorHints(lines.join("\n"));
-
-  const serialized = safeStringify(error);
-  return serialized && serialized !== "{}" ? serialized : fallback;
-}
+import {
+  presentOpencodeSessionError,
+  type OpencodeSessionErrorPresentation,
+} from "./session-error";
 
 function sessionErrorMessageId(turnKey: string) {
   return `${SYNTHETIC_SESSION_ERROR_MESSAGE_PREFIX}${turnKey}`;
@@ -109,7 +27,11 @@ function sessionErrorMessageId(turnKey: string) {
  * message instead of duplicating — while a brand new error on a later turn
  * still produces its own message instead of overwriting the previous one.
  */
-export function createSessionErrorUIMessage(turnKey: string, text: string, options?: { created?: number }): UIMessage {
+export function createSessionErrorUIMessage(
+  turnKey: string,
+  presentation: OpencodeSessionErrorPresentation,
+  options?: { created?: number },
+): UIMessage {
   const id = sessionErrorMessageId(turnKey);
   const created = options?.created;
   return {
@@ -118,9 +40,9 @@ export function createSessionErrorUIMessage(turnKey: string, text: string, optio
     ...(typeof created === "number" ? { metadata: { opencode: { created } } } : {}),
     parts: [{
       type: "text",
-      text,
+      text: presentation.title,
       state: "done",
-      providerMetadata: { opencode: { partId: `${id}:text` } },
+      providerMetadata: { opencode: { partId: `${id}:text`, sessionError: presentation } },
     }],
   };
 }
@@ -257,7 +179,7 @@ export function snapshotToUIMessages(snapshot: OpenworkSessionSnapshot): UIMessa
     const error = message.info.role === "assistant" && "error" in message.info ? message.info.error : undefined;
     if (!error) return [uiMessage];
 
-    const errorMessage = createSessionErrorUIMessage(message.info.id, describeOpencodeSessionError(error), { created });
+    const errorMessage = createSessionErrorUIMessage(message.info.id, presentOpencodeSessionError(error), { created });
     return uiMessage.parts.length > 0 ? [uiMessage, errorMessage] : [errorMessage];
   });
 }

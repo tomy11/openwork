@@ -78,7 +78,7 @@ async function scanRecordedRolls(resultsDir: string): Promise<RecordedRollEntry[
     const directoryPath = join(rollsDir, directory.name);
     const roll = await readRollFile(join(directoryPath, "roll.json"));
     if (!roll) continue;
-    const firstFrame = roll.frames[0];
+    const firstFrame = roll.frames.find((frame) => frame.fileName.length > 0);
     rolls.push({
       kind: "roll",
       directoryName: directory.name,

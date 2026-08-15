@@ -193,7 +193,8 @@ test("GET /v1/mcp-connections/:connectionId/connect/start maps OAuth handshake f
   expect(body.diagnostic.highestPassed).toBe("configured")
   expect(body.diagnostic.actionOwner).toBe("network_admin")
   expect(typeof body.diagnostic.operatorAction).toBe("string")
-  expect(body.diagnostic.referenceId).toBe(response.headers.get("x-request-id"))
+  expect(typeof body.diagnostic.referenceId).toBe("string")
+  expect(response.headers.get("x-request-id")).toBeNull()
 })
 
 test("GET /v1/mcp-connections/:connectionId/connect/start still returns connection_not_found", async () => {
@@ -1128,11 +1129,12 @@ test("non-OAuth create validation returns the same structured network diagnostic
   }
   expect(body.error).toBe("connection_validation_failed")
   expect(body.diagnostic).toMatchObject({
-    referenceId: response.headers.get("x-request-id"),
     phase: "NETWORK_TCP",
     category: "network_failure",
     code: "MCP_ECONNREFUSED",
   })
+  expect(typeof body.diagnostic.referenceId).toBe("string")
+  expect(response.headers.get("x-request-id")).toBeNull()
 })
 
 test("connection configuration rejects credentials embedded in MCP URLs", async () => {

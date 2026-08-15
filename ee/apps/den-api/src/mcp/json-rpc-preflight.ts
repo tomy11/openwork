@@ -23,7 +23,6 @@ function jsonRpcErrorResponse(code: -32700 | -32600, message: "Parse error" | "I
     status: 400,
     headers: {
       "content-type": "application/json",
-      "X-Request-Id": referenceId,
     },
   })
 }

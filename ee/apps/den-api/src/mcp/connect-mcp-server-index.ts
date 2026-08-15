@@ -1,0 +1,47 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import type { ExternalMcpConnectionRow } from "../capability-sources/external-mcp-connections.js"
+
+export const CONNECT_MCP_SERVER_INDEX_URI = "openwork://connect/mcp-servers/index.json"
+export const CONNECT_MCP_SERVER_INDEX_SCHEMA_VERSION = "openwork.connect/mcp-servers/1"
+
+export type ConnectMcpServerIndexEntry = {
+  connectionId: string
+  name: string
+  description: string | null
+  url: string
+}
+
+export function buildConnectMcpServerIndex(input: {
+  connections: ExternalMcpConnectionRow[]
+  publicOrigin: string
+}) {
+  return {
+    schemaVersion: CONNECT_MCP_SERVER_INDEX_SCHEMA_VERSION,
+    servers: input.connections
+      .map((connection): ConnectMcpServerIndexEntry => ({
+        connectionId: connection.id,
+        name: connection.name,
+        description: null,
+        url: `${input.publicOrigin}/mcp/agent/connections/${encodeURIComponent(connection.id)}`,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name) || left.connectionId.localeCompare(right.connectionId)),
+  }
+}
+
+export function registerConnectMcpServerIndex(input: {
+  server: McpServer
+  connections: ExternalMcpConnectionRow[]
+  publicOrigin: string
+}) {
+  input.server.registerResource("openwork-connect-mcp-servers", CONNECT_MCP_SERVER_INDEX_URI, {
+    title: "OpenWork Connect MCP servers",
+    description: "Member-authorized MCP servers available through OpenWork Connect.",
+    mimeType: "application/json",
+  }, async () => ({
+    contents: [{
+      uri: CONNECT_MCP_SERVER_INDEX_URI,
+      mimeType: "application/json",
+      text: JSON.stringify(buildConnectMcpServerIndex(input)),
+    }],
+  }))
+}

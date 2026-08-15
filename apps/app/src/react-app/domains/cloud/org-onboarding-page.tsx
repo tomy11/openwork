@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import {
   ArrowRight,
   ArrowUpRightIcon,
@@ -38,6 +38,7 @@ import {
   exchangeHandoffAndSignIn,
 } from "@/app/lib/den-handoff";
 import { denSettingsChangedEvent } from "@/app/lib/den-session-events";
+import { clearOrgSelectionPending, readOrgSelectionPending } from "@/app/lib/den-sign-in-intent";
 import { usePlatform } from "../../kernel/platform";
 import { useBootState } from "../../shell/boot-state";
 import { resolveModelDisplayName, resolveProviderDisplayName } from "@/app/utils";
@@ -239,6 +240,8 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
       const result = await exchangeHandoffAndSignIn(grant, {
         baseUrl: settings.baseUrl,
         client: createDenClient({ baseUrl: settings.baseUrl }),
+        // A pasted one-time code is a desktop-initiated sign-in.
+        desktopInitiated: true,
       });
       if (!result.ok) setSignInError(result.error);
     } finally {
@@ -401,6 +404,9 @@ export function OrgOnboardingPage() {
   );
   const [autoSelectFailedOrgId, setAutoSelectFailedOrgId] = useState<string | null>(null);
   const autoSelectingOrgIdRef = useRef<string | null>(null);
+  // A desktop-initiated sign-in parks the exchange-reported org here instead
+  // of committing it; the chooser pre-highlights it as its default.
+  const [suggestedOrgId] = useState(() => readOrgSelectionPending().suggestion?.id ?? "");
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent(orgOnboardingVisibilityEvent, { detail: { visible: true } }));
@@ -440,7 +446,7 @@ export function OrgOnboardingPage() {
   const orgs = data?.orgs ?? [];
   const postListStep = resolveOrgOnboardingPostListStep({
     orgs,
-    activeOrgId: orgId,
+    activeOrgId: orgId || suggestedOrgId,
     hasSelectedOrganization,
     autoContinueResources,
     autoSelectFailedOrgId,
@@ -459,6 +465,7 @@ export function OrgOnboardingPage() {
       .setActiveOrganization({ organizationId: autoSelectOrg.id })
       .then(() => {
         if (cancelled) return;
+        clearOrgSelectionPending();
         writeDenSettings({
           ...settings,
           authToken: authToken || null,
@@ -1127,6 +1134,7 @@ function OrganizationSelectionPage({
       return nextOrg;
     },
     onSuccess: (nextOrg) => {
+      clearOrgSelectionPending();
       writeDenSettings({
         ...settings,
         authToken: authToken || null,

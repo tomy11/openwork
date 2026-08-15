@@ -26,6 +26,15 @@ on:
       - dev
     paths:
       - "ee/packages/den-db/drizzle/**"
+      # Also run when this workflow itself changes: a broken migrate run fixed
+      # by a workflow-only PR must re-apply pending migrations on merge instead
+      # of waiting for a manual dispatch (migrate is idempotent via the journal).
+      - ".github/workflows/den-db-migrate.yml"
+  schedule:
+    # Self-heal: if a push-triggered run fails (workflow bug, transient infra),
+    # pending migrations get re-applied on the next tick instead of waiting for
+    # a human. The pending-check below makes idle ticks read-only no-ops.
+    - cron: "23,53 * * * *"
   workflow_dispatch:
     inputs:
       baseline:
@@ -97,11 +106,39 @@ jobs:
       - name: Install dependencies
         run: pnpm install --filter "@openwork-ee/den-db..."
 
+      # Read-only gate: compare the drizzle journal against __drizzle_migrations.
+      # Scheduled/push runs with nothing pending stop here, so safe migrations
+      # are only ever toggled when there is real DDL to apply. workflow_dispatch
+      # always proceeds (baseline mode needs to run before the table exists).
+      - name: Check for pending migrations
+        id: pending
+        run: |
+          set -euo pipefail
+          pending="$(cd ee/packages/den-db && node --input-type=module -e "
+            const { readFile } = await import('node:fs/promises');
+            const { Client } = await import('@planetscale/database');
+            const journal = JSON.parse(await readFile('drizzle/meta/_journal.json', 'utf8'));
+            const latest = Math.max(...journal.entries.map((entry) => entry.when));
+            const client = new Client({ host: process.env.DATABASE_HOST, username: process.env.DATABASE_USERNAME, password: process.env.DATABASE_PASSWORD });
+            let applied = 0;
+            try {
+              const result = await client.execute('SELECT MAX(created_at) AS latest FROM __drizzle_migrations');
+              applied = Number(result.rows[0]?.latest ?? 0);
+            } catch {
+              applied = 0;
+            }
+            console.log(latest > applied ? 'true' : 'false');
+          ")"
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          echo "Pending migrations: $pending"
+
       - name: Setup pscale CLI
+        if: steps.pending.outputs.pending == 'true' || github.event_name == 'workflow_dispatch'
         id: setup-pscale
         uses: planetscale/setup-pscale-action@v1
 
       - name: Disable safe migrations (allow DDL for this run only)
+        if: steps.pending.outputs.pending == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           pscale_retry() {
@@ -134,25 +171,18 @@ jobs:
             done
             return 1
           }
-          read_safe_migrations_state() {
-            pscale_retry bash -o pipefail -c 'pscale branch show "$1" "$2" --org "$3" --format json | jq -r ".safe_migrations"' _ "$DATABASE_NAME" "$PLANETSCALE_BRANCH" "$PLANETSCALE_ORG"
-          }
-          if ! state="$(read_safe_migrations_state)"; then
-            state=""
-          fi
-          echo "safe_migrations before run: $state"
-          if [ "$state" = "true" ]; then
-            if ! pscale_retry pscale branch safe-migrations disable "$DATABASE_NAME" "$PLANETSCALE_BRANCH" --org "$PLANETSCALE_ORG"; then
-              echo "::error::Could not disable safe migrations for $DATABASE_NAME/$PLANETSCALE_BRANCH."
-              exit 1
-            fi
-            echo "Safe migrations disabled for the duration of this run."
-          elif [ "$state" = "false" ]; then
-            echo "Safe migrations already disabled; will re-enable at the end of this run."
-          else
-            echo "::error::Could not read safe_migrations state for $DATABASE_NAME/$PLANETSCALE_BRANCH."
+          # Read the resulting state from the toggle's own response instead of a
+          # separate `pscale branch show`: `disable` is idempotent, and it saves a
+          # call that needs different API permissions and a different output shape.
+          if ! state="$(pscale_retry pscale branch safe-migrations disable "$DATABASE_NAME" "$PLANETSCALE_BRANCH" --org "$PLANETSCALE_ORG" --format json)"; then
+            echo "::error::Could not disable safe migrations for $DATABASE_NAME/$PLANETSCALE_BRANCH."
             exit 1
           fi
+          if ! jq -e '.safe_migrations == false' >/dev/null <<<"$state"; then
+            echo "::error::PlanetScale did not confirm safe migrations were disabled. Response: $state"
+            exit 1
+          fi
+          echo "Safe migrations disabled for the duration of this run."
 
           # The toggle propagates to the connection gateways asynchronously and
           # per edge node, so require several consecutive successful DDL probes
@@ -214,7 +244,9 @@ jobs:
           fi
 
       - name: Apply migrations
-        if: github.event_name != 'workflow_dispatch' || !inputs.dry_run
+        if: >-
+          (steps.pending.outputs.pending == 'true' || github.event_name == 'workflow_dispatch') &&
+          (github.event_name != 'workflow_dispatch' || !inputs.dry_run)
         run: |
           set -euo pipefail
           run_with_ddl_retry() {
@@ -239,63 +271,25 @@ jobs:
         if: always() && steps.setup-pscale.conclusion == 'success'
         run: |
           set -euo pipefail
-          pscale_retry() {
-            local attempt err_file error_output output status
-            for attempt in $(seq 1 5); do
-              err_file="$(mktemp)"
-              if output="$("$@" 2>"$err_file")"; then
-                error_output="$(<"$err_file")"
-                rm -f "$err_file"
-                if [ -n "$error_output" ]; then
-                  printf '%s\n' "$error_output" >&2
-                fi
-                printf '%s\n' "$output"
-                return 0
-              else
-                status=$?
-                error_output="$(<"$err_file")"
-                rm -f "$err_file"
-                if [ -n "$output" ]; then
-                  printf '%s\n' "$output" >&2
-                fi
-                if [ -n "$error_output" ]; then
-                  printf '%s\n' "$error_output" >&2
-                fi
-                if [ "$attempt" -lt 5 ]; then
-                  echo "pscale command failed (attempt $attempt/5, exit $status); retrying in 10s..." >&2
-                  sleep 10
-                fi
-              fi
-            done
-            return 1
-          }
-          read_safe_migrations_state() {
-            pscale_retry bash -o pipefail -c 'pscale branch show "$1" "$2" --org "$3" --format json | jq -r ".safe_migrations"' _ "$DATABASE_NAME" "$PLANETSCALE_BRANCH" "$PLANETSCALE_ORG"
-          }
-
           confirmed="false"
           for attempt in $(seq 1 5); do
             echo "Enabling safe migrations (attempt $attempt/5)."
-            if output="$(pscale branch safe-migrations enable "$DATABASE_NAME" "$PLANETSCALE_BRANCH" --org "$PLANETSCALE_ORG" 2>&1)"; then
-              if [ -n "$output" ]; then
-                printf '%s\n' "$output"
+            # Same as the disable step: trust the toggle's own JSON response, and
+            # always echo it when it does not confirm, so a future API/CLI change
+            # shows up in the log instead of being swallowed.
+            if output="$(pscale branch safe-migrations enable "$DATABASE_NAME" "$PLANETSCALE_BRANCH" --org "$PLANETSCALE_ORG" --format json 2>&1)"; then
+              if jq -e '.safe_migrations == true' >/dev/null <<<"$output"; then
+                confirmed="true"
+                echo "PlanetScale confirmed safe migrations are enabled."
+                break
               fi
+              echo "PlanetScale enable response did not confirm safe migrations: $output" >&2
             else
               status=$?
               if [ -n "$output" ]; then
                 printf '%s\n' "$output" >&2
               fi
-              echo "pscale enable failed (attempt $attempt/5, exit $status); checking branch state." >&2
-            fi
-
-            if state="$(read_safe_migrations_state)"; then
-              echo "safe_migrations after run: $state"
-              if [ "$state" = "true" ]; then
-                confirmed="true"
-                break
-              fi
-            else
-              echo "Could not verify safe_migrations state after enable attempt $attempt." >&2
+              echo "pscale enable failed (attempt $attempt/5, exit $status)." >&2
             fi
 
             if [ "$attempt" -lt 5 ]; then

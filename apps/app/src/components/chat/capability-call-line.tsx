@@ -17,9 +17,11 @@ import {
 } from "@/components/ui/collapsible"
 import { DotMatrixLoader } from "@/components/ui/dot-matrix-loader"
 import { getCapabilityCallQuote, getCapabilityCallSentence, parseRecord } from "@/lib/capability-call"
+import { normalizeErrorText } from "@/lib/error-text"
 import { trackToolCallDuration } from "@/lib/tool-call-duration"
 import { isToolPartInFlight } from "@/lib/tool-activity"
 import { cn } from "@/lib/utils"
+import { McpAppFrame } from "./mcp-app-frame"
 
 type CapabilityCallLineProps = ChatToolReconnectCallbacks & {
   part: DynamicToolUIPart
@@ -60,7 +62,11 @@ function failureInstruction(part: DynamicToolUIPart, reconnectName: string | nul
   }
 
   const firstLine = errorText?.split("\n")[0]?.trim()
-  if (firstLine && !firstLine.startsWith("{") && !firstLine.startsWith("[")) return firstLine
+  if (firstLine && !firstLine.startsWith("{") && !firstLine.startsWith("[") && !firstLine.startsWith("<")) return firstLine
+  if (firstLine?.startsWith("<") && errorText) {
+    const normalizedFirstLine = normalizeErrorText(errorText, { cap: 500 }).display.split("\n")[0]?.trim()
+    if (normalizedFirstLine && !normalizedFirstLine.startsWith("<")) return normalizedFirstLine
+  }
   return "The call failed. Full error is under Technical details."
 }
 
@@ -224,6 +230,7 @@ export function CapabilityCallLine({
   const sentence = getCapabilityCallSentence(part)
   const line = inFlight ? sentence.present : sentence.past
   return (
+    <>
     <Collapsible data-capability-call={part.toolName} open={open} onOpenChange={setOpen} className={className}>
       <div className="flex min-w-0 items-center gap-2">
         <CollapsibleTrigger
@@ -245,5 +252,7 @@ export function CapabilityCallLine({
         <TechnicalDetailsPanel part={part} />
       </CollapsibleContent>
     </Collapsible>
+    {part.state === "output-available" ? <McpAppFrame part={part} /> : null}
+    </>
   )
 }

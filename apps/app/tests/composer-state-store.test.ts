@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { ComposerDraft } from "../src/app/types";
 import {
   getComposerQueuedDrafts,
+  getComposerRevertMessageId,
   useComposerStateStore,
 } from "../src/react-app/domains/session/surface/composer-state-store";
 
@@ -65,5 +66,26 @@ describe("composer state store", () => {
     expect(getComposerQueuedDrafts(useComposerStateStore.getState(), "session-b").map((item) => item.text)).toEqual([
       "only B",
     ]);
+  });
+
+  test("carries an edit boundary until clear, replacement, or session switch", () => {
+    const { clearRevertTarget, replaceDraft, setDraft } = useComposerStateStore.getState();
+    replaceDraft("session-a", "original prompt", "message-a");
+
+    expect(getComposerRevertMessageId(useComposerStateStore.getState(), "session-a")).toBe("message-a");
+    setDraft("session-a", "edited prompt");
+    expect(getComposerRevertMessageId(useComposerStateStore.getState(), "session-a")).toBe("message-a");
+
+    setDraft("session-a", "");
+    expect(getComposerRevertMessageId(useComposerStateStore.getState(), "session-a")).toBeNull();
+
+    replaceDraft("session-a", "original prompt", "message-a");
+    replaceDraft("session-a", "normal replacement");
+    expect(getComposerRevertMessageId(useComposerStateStore.getState(), "session-a")).toBeNull();
+
+    replaceDraft("session-a", "original prompt", "message-a");
+    clearRevertTarget("session-a");
+    expect(getComposerRevertMessageId(useComposerStateStore.getState(), "session-a")).toBeNull();
+    expect(useComposerStateStore.getState().sessions["session-a"]?.draft).toBe("original prompt");
   });
 });

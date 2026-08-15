@@ -4,6 +4,7 @@ import {
   buildDenAuthUrl,
   createDenClient,
   getDenMcpUrl,
+  initializeDenBootstrapConfig,
   readDenBootstrapConfig,
   readDenSettings,
   resolveDenBaseUrls,
@@ -14,11 +15,19 @@ import {
 } from "../src/app/lib/openwork-server";
 import { createOpenworkServerStore } from "../src/react-app/domains/connections/openwork-server-store";
 import { buildOpenworkHealthHeaders } from "../src/react-app/kernel/server-provider";
-import { resolveOpenworkConnection } from "../src/react-app/shell/openwork-connection";
+import {
+  isStaleStoredDesktopConnection,
+  resolveOpenworkConnection,
+} from "../src/react-app/shell/openwork-connection";
 
 const originalWindow = globalThis.window;
 const originalFetch = globalThis.fetch;
 const originalDeployment = process.env.VITE_OPENWORK_DEPLOYMENT;
+
+function restoreEnv(key: string, value: string | undefined) {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
 
 function memoryStorage(): Storage {
   const map = new Map<string, string>();
@@ -78,8 +87,14 @@ function installWindow(options: {
     ownerToken: string;
     hostToken?: string;
   };
+  /** Raw openworkServerInfo response for non-ready/restarting server states. */
+  electronServerInfoRaw?: Record<string, unknown>;
+  /** Simulate a desktop bridge whose openworkServerInfo call fails outright. */
+  electronServerInfoError?: boolean;
 }) {
   const localStorage = memoryStorage();
+  const electronBridgeInstalled =
+    options.electronInfo || options.electronServerInfoRaw || options.electronServerInfoError;
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
@@ -88,11 +103,17 @@ function installWindow(options: {
       location: { origin: options.origin },
       __OPENWORK_GATEWAY__: options.gateway ? { version: 1 } : undefined,
       __OPENWORK_BOOTSTRAP__: options.bootstrapToken ? { token: options.bootstrapToken } : undefined,
-      __OPENWORK_ELECTRON__: options.electronInfo
+      __OPENWORK_ELECTRON__: electronBridgeInstalled
         ? {
             invokeDesktop: async (command: string) => {
               if (command !== "openworkServerInfo") {
                 throw new Error(`Unexpected desktop command: ${command}`);
+              }
+              if (options.electronServerInfoError) {
+                throw new Error("desktop bridge unavailable");
+              }
+              if (options.electronServerInfoRaw) {
+                return options.electronServerInfoRaw;
               }
               return {
                 running: true,
@@ -323,6 +344,73 @@ describe("non-gateway connection modes", () => {
     expect(connection.source).toBe("same-origin");
   });
 
+  test("force-env settings overwrite stale localStorage openwork-server credentials", () => {
+    const previous = {
+      url: process.env.VITE_OPENWORK_URL,
+      port: process.env.VITE_OPENWORK_PORT,
+      token: process.env.VITE_OPENWORK_TOKEN,
+      hostToken: process.env.VITE_OPENWORK_HOST_TOKEN,
+      force: process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS,
+    };
+    process.env.VITE_OPENWORK_URL = "http://127.0.0.1:8787";
+    process.env.VITE_OPENWORK_PORT = "8787";
+    process.env.VITE_OPENWORK_TOKEN = "fresh-token";
+    process.env.VITE_OPENWORK_HOST_TOKEN = "fresh-host-token";
+    process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS = "1";
+
+    const storage = installWindow({ origin: "http://127.0.0.1:5173" });
+    storage.setItem("openwork.server.urlOverride", "http://127.0.0.1:9999");
+    storage.setItem("openwork.server.token", "stale-token");
+    storage.setItem("openwork.server.hostToken", "stale-host-token");
+
+    try {
+      hydrateOpenworkServerSettingsFromEnv();
+      expect(readOpenworkServerSettings()).toEqual({
+        urlOverride: "http://127.0.0.1:8787",
+        portOverride: 8787,
+        token: "fresh-token",
+        hostToken: "fresh-host-token",
+        remoteAccessEnabled: false,
+      });
+    } finally {
+      restoreEnv("VITE_OPENWORK_URL", previous.url);
+      restoreEnv("VITE_OPENWORK_PORT", previous.port);
+      restoreEnv("VITE_OPENWORK_TOKEN", previous.token);
+      restoreEnv("VITE_OPENWORK_HOST_TOKEN", previous.hostToken);
+      restoreEnv("VITE_OPENWORK_FORCE_ENV_SETTINGS", previous.force);
+    }
+  });
+
+  test("force-env without a VITE host token clears a leftover browser host token", () => {
+    const previous = {
+      url: process.env.VITE_OPENWORK_URL,
+      port: process.env.VITE_OPENWORK_PORT,
+      token: process.env.VITE_OPENWORK_TOKEN,
+      hostToken: process.env.VITE_OPENWORK_HOST_TOKEN,
+      force: process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS,
+    };
+    process.env.VITE_OPENWORK_URL = "http://127.0.0.1:8787";
+    process.env.VITE_OPENWORK_PORT = "8787";
+    process.env.VITE_OPENWORK_TOKEN = "fresh-token";
+    delete process.env.VITE_OPENWORK_HOST_TOKEN;
+    process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS = "1";
+
+    const storage = installWindow({ origin: "http://127.0.0.1:5178" });
+    storage.setItem("openwork.server.hostToken", "leaked-host-token");
+
+    try {
+      hydrateOpenworkServerSettingsFromEnv();
+      expect(readOpenworkServerSettings().hostToken).toBeUndefined();
+      expect(storage.getItem("openwork.server.hostToken")).toBeNull();
+    } finally {
+      restoreEnv("VITE_OPENWORK_URL", previous.url);
+      restoreEnv("VITE_OPENWORK_PORT", previous.port);
+      restoreEnv("VITE_OPENWORK_TOKEN", previous.token);
+      restoreEnv("VITE_OPENWORK_HOST_TOKEN", previous.hostToken);
+      restoreEnv("VITE_OPENWORK_FORCE_ENV_SETTINGS", previous.force);
+    }
+  });
+
   test("stored server settings still win without the marker", async () => {
     const storage = installWindow({ origin: "https://instance.example.com" });
     storage.setItem("openwork.server.urlOverride", "https://manual.example.com");
@@ -363,6 +451,61 @@ describe("non-gateway connection modes", () => {
     expect(readDenSettings().apiBaseUrl).toBe("https://den.self-hosted.example.com/api/den");
   });
 
+  test("VITE_DEN_API_BASE_URL pins Den API calls to the proxy while sign-in stays on the web base", () => {
+    const previous = process.env.VITE_DEN_API_BASE_URL;
+    process.env.VITE_DEN_API_BASE_URL = "http://127.0.0.1:5178/api/den";
+    installWindow({ origin: "http://127.0.0.1:5178" });
+
+    try {
+      const settings = readDenSettings();
+      expect(settings.baseUrl).toBe("https://app.openworklabs.com");
+      expect(settings.apiBaseUrl).toBe("http://127.0.0.1:5178/api/den");
+
+      // Every Den client derives its API base the same way, so requests go
+      // through the same-origin proxy even when created from the web base.
+      const client = createDenClient({ baseUrl: settings.baseUrl, token: "den-token" });
+      expect(client.baseUrls.apiBaseUrl).toBe("http://127.0.0.1:5178/api/den");
+      expect(client.baseUrls.baseUrl).toBe("https://app.openworklabs.com");
+
+      // Sign-in still opens the real Den web app, not the proxy origin.
+      // Loopback cannot use webAuth return URLs against hosted Den, so the
+      // URL uses desktopAuth (copy link / paste grant) instead.
+      const authUrl = new URL(buildDenAuthUrl(settings.baseUrl, "sign-in"));
+      expect(authUrl.origin).toBe("https://app.openworklabs.com");
+      expect(authUrl.searchParams.get("desktopAuth")).toBe("1");
+      expect(authUrl.searchParams.get("webAuth")).toBeNull();
+    } finally {
+      restoreEnv("VITE_DEN_API_BASE_URL", previous);
+    }
+  });
+
+  test("loopback web auth uses desktop handoff instead of an unapprovable webAuth return URL", () => {
+    installWindow({ origin: "http://127.0.0.1:5178" });
+
+    const authUrl = new URL(buildDenAuthUrl(readDenSettings().baseUrl, "sign-in"));
+
+    expect(authUrl.origin).toBe("https://app.openworklabs.com");
+    expect(authUrl.searchParams.get("desktopAuth")).toBe("1");
+    expect(authUrl.searchParams.get("desktopScheme")).toBe("openwork");
+    expect(authUrl.searchParams.get("webAuth")).toBeNull();
+    expect(authUrl.searchParams.get("webAuthReturn")).toBeNull();
+  });
+
+  test("force-env clears a stale stored Den base URL on web bootstrap init", async () => {
+    const previous = process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS;
+    process.env.VITE_OPENWORK_FORCE_ENV_SETTINGS = "1";
+    const storage = installWindow({ origin: "http://127.0.0.1:5178" });
+    storage.setItem("openwork.den.baseUrl", "http://127.0.0.1:8779");
+
+    try {
+      await initializeDenBootstrapConfig();
+      expect(storage.getItem("openwork.den.baseUrl")).toBeNull();
+      expect(readDenSettings().baseUrl).toBe("https://app.openworklabs.com");
+    } finally {
+      restoreEnv("VITE_OPENWORK_FORCE_ENV_SETTINGS", previous);
+    }
+  });
+
   test("desktop runtime still uses live desktop server info without the marker", async () => {
     installWindow({
       origin: "https://instance.example.com",
@@ -379,5 +522,111 @@ describe("non-gateway connection modes", () => {
     expect(connection.resolvedToken).toBe("owner-token");
     expect(connection.resolvedHostToken).toBe("host-token");
     expect(connection.source).toBe("desktop-runtime");
+  });
+
+  test("a restarting desktop server invalidates stored loopback settings instead of resolving a dead port", async () => {
+    // App update / slow restart: the live runtime answers definitively, but
+    // the server has not republished its base URL and tokens yet. The stored
+    // loopback settings are from the previous server lifetime.
+    const storage = installWindow({
+      origin: "https://instance.example.com",
+      electronServerInfoRaw: { running: false, baseUrl: null, ownerToken: null, clientToken: null },
+    });
+    storage.setItem("openwork.server.urlOverride", "http://127.0.0.1:4100");
+    storage.setItem("openwork.server.token", "tok_previous_lifetime");
+
+    const connection = await resolveOpenworkConnection();
+
+    expect(connection.source).toBe("empty");
+    expect(connection.normalizedBaseUrl).toBe("");
+    expect(connection.resolvedToken).toBe("");
+  });
+
+  test("a restarting desktop server keeps stored remote/manual servers as the fallback", async () => {
+    const storage = installWindow({
+      origin: "https://instance.example.com",
+      electronServerInfoRaw: { running: false, baseUrl: null, ownerToken: null, clientToken: null },
+    });
+    storage.setItem("openwork.server.urlOverride", "https://manual.example.com");
+    storage.setItem("openwork.server.token", "manual-token");
+
+    const connection = await resolveOpenworkConnection();
+
+    expect(connection.source).toBe("stored-settings");
+    expect(connection.normalizedBaseUrl).toBe("https://manual.example.com");
+    expect(connection.resolvedToken).toBe("manual-token");
+  });
+
+  test("a failing desktop bridge still falls back to stored settings", async () => {
+    // No definitive live answer: keep the pre-existing fallback so broken
+    // bridges do not strand configured connections.
+    const storage = installWindow({
+      origin: "https://instance.example.com",
+      electronServerInfoError: true,
+    });
+    storage.setItem("openwork.server.urlOverride", "http://127.0.0.1:4100");
+    storage.setItem("openwork.server.token", "tok_stored");
+
+    const connection = await resolveOpenworkConnection();
+
+    expect(connection.source).toBe("stored-settings");
+    expect(connection.normalizedBaseUrl).toBe("http://127.0.0.1:4100");
+    expect(connection.resolvedToken).toBe("tok_stored");
+  });
+});
+
+describe("isStaleStoredDesktopConnection", () => {
+  test("marks stored loopback connections stale only on a definitive not-ready answer", () => {
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: true,
+        desktopServerReportedNotReady: true,
+        storedBaseUrl: "http://127.0.0.1:4100",
+        runtimeReportedBaseUrl: "",
+      }),
+    ).toBe(true);
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: true,
+        desktopServerReportedNotReady: false,
+        storedBaseUrl: "http://127.0.0.1:4100",
+        runtimeReportedBaseUrl: "",
+      }),
+    ).toBe(false);
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: false,
+        desktopServerReportedNotReady: true,
+        storedBaseUrl: "http://127.0.0.1:4100",
+        runtimeReportedBaseUrl: "",
+      }),
+    ).toBe(false);
+  });
+
+  test("keeps remote URLs unless they match the runtime-reported base URL", () => {
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: true,
+        desktopServerReportedNotReady: true,
+        storedBaseUrl: "https://manual.example.com",
+        runtimeReportedBaseUrl: "",
+      }),
+    ).toBe(false);
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: true,
+        desktopServerReportedNotReady: true,
+        storedBaseUrl: "https://manual.example.com",
+        runtimeReportedBaseUrl: "https://manual.example.com",
+      }),
+    ).toBe(true);
+    expect(
+      isStaleStoredDesktopConnection({
+        desktopRuntime: true,
+        desktopServerReportedNotReady: true,
+        storedBaseUrl: "",
+        runtimeReportedBaseUrl: "",
+      }),
+    ).toBe(false);
   });
 });

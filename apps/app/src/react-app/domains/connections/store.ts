@@ -16,6 +16,8 @@ import {
 import { createClient, unwrap } from "../../../app/lib/opencode";
 import { finishPerf, perfNow, recordPerfLog } from "../../../app/lib/perf-log";
 import {
+  assertDesktopWebUrl,
+  openDesktopUrl,
   readOpencodeConfig,
   writeOpencodeConfig,
   type OpencodeConfigFile,
@@ -26,7 +28,10 @@ import {
   removeMcpFromConfig,
   validateMcpServerName,
 } from "../../../app/mcp";
-import { buildOpenworkWorkspaceBaseUrl } from "../../../app/lib/openwork-server";
+import {
+  buildOpenworkWorkspaceBaseUrl,
+  type OpenworkServerClient,
+} from "../../../app/lib/openwork-server";
 import type {
   Client,
   McpServerEntry,
@@ -35,6 +40,7 @@ import type {
   ReloadTrigger,
 } from "../../../app/types";
 import { isDesktopRuntime, normalizeDirectoryPath, safeStringify } from "../../../app/utils";
+import { conflictsWithOpenworkConnect } from "./mcp-connection-boundary";
 
 import type { OpenworkServerStore } from "./openwork-server-store";
 import { attemptSilentMcpReauth } from "./mcp-silent-reauth";
@@ -73,6 +79,10 @@ export type ConnectionsStoreSnapshot = {
 type MutableState = ConnectionsStoreSnapshot;
 
 export type ConnectionsStore = ReturnType<typeof createConnectionsStore>;
+
+export type McpConnectResult =
+  | { ok: true }
+  | { ok: false; error: string };
 
 export function createConnectionsStore(options: {
   client: () => Client | null;
@@ -316,6 +326,7 @@ export function createConnectionsStore(options: {
       name: entry.name,
       config: entry.config as McpServerEntry["config"],
       source: entry.source,
+      managedOAuth: entry.managedOAuth,
     }));
     const engineSync = response.engineSync ?? null;
 
@@ -327,6 +338,18 @@ export function createConnectionsStore(options: {
         nextStatuses = filterConfiguredStatuses(status as McpStatusMap, next);
       } catch {
         nextStatuses = {};
+      }
+    }
+
+    for (const entry of next) {
+      const managed = entry.managedOAuth;
+      if (!managed) continue;
+      if (!managed.enabled) {
+        nextStatuses[entry.name] = { status: "disabled" };
+      } else if (managed.status === "needs_auth" || managed.status === "connecting" || managed.status === "reconnect_required") {
+        nextStatuses[entry.name] = { status: "needs_auth" };
+      } else if (!nextStatuses[entry.name]) {
+        nextStatuses[entry.name] = { status: "connected" };
       }
     }
 
@@ -571,7 +594,7 @@ export function createConnectionsStore(options: {
     }
   }
 
-  async function connectMcp(entry: McpDirectoryInfo): Promise<boolean> {
+  async function connectMcp(entry: McpDirectoryInfo): Promise<McpConnectResult> {
     const startedAt = perfNow();
     const openworkSnapshot = getOpenworkSnapshot();
     const isRemoteWorkspace =
@@ -591,62 +614,80 @@ export function createConnectionsStore(options: {
       await resolveWritableOpenworkTarget();
 
     if (isRemoteWorkspace && !canUseOpenworkServer) {
-      setStateField("mcpStatus", "OpenWork server unavailable. MCP config is read-only.");
+      const error = "OpenWork server unavailable. MCP config is read-only.";
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "openwork-server-unavailable",
       });
-      return false;
+      return { ok: false, error };
     }
 
     if (hasOpenworkTarget && !canUseOpenworkServer) {
-      setStateField("mcpStatus", "OpenWork server MCP config is read-only.");
+      const error = "OpenWork server MCP config is read-only.";
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "openwork-server-read-only",
       });
-      return false;
+      return { ok: false, error };
     }
 
     if (!canUseOpenworkServer && !isDesktopRuntime()) {
-      setStateField("mcpStatus", t("mcp.desktop_required"));
+      const error = t("mcp.desktop_required");
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "desktop-required",
       });
-      return false;
+      return { ok: false, error };
     }
 
     if (!isRemoteWorkspace && !projectDir && !canUseOpenworkServer) {
-      setStateField("mcpStatus", t("mcp.pick_workspace_first"));
+      const error = t("mcp.pick_workspace_first");
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "missing-workspace",
       });
-      return false;
+      return { ok: false, error };
     }
 
     const activeClient = canUseOpenworkServer ? options.client() ?? await ensureActiveClient().catch(() => null) : await ensureActiveClient();
     if (!activeClient && !canUseOpenworkServer) {
-      setStateField("mcpStatus", t("mcp.connect_server_first"));
+      const error = t("mcp.connect_server_first");
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "no-active-client",
       });
-      return false;
+      return { ok: false, error };
     }
 
     const resolvedProjectDir = activeClient ? await resolveProjectDir(activeClient, projectDir) : projectDir;
     if (!resolvedProjectDir && !canUseOpenworkServer) {
-      setStateField("mcpStatus", t("mcp.pick_workspace_first"));
+      const error = t("mcp.pick_workspace_first");
+      setStateField("mcpStatus", error);
       finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
         reason: "missing-workspace-after-discovery",
       });
-      return false;
+      return { ok: false, error };
     }
 
     const slug = entry.id ?? getMcpServerName(entry);
     const action = snapshot.mcpServers.some((server) => server.name === slug) ? "updated" : "added";
 
+    if (conflictsWithOpenworkConnect(entry)) {
+      const error = t("mcp.name_reserved_openwork_connect");
+      setStateField("mcpStatus", error);
+      finishPerf(options.developerMode(), "mcp.connect", "blocked", startedAt, {
+        reason: "openwork-connect-name-reserved",
+      });
+      return { ok: false, error };
+    }
+
     try {
       mutateState((current) => ({ ...current, mcpStatus: null, mcpConnectingName: entry.name }));
 
-      if (entry.serverName === CLOUD_MCP_SERVER_NAME) {
+      if (entry.managedBy === "openwork-connect") {
+        if (slug !== CLOUD_MCP_SERVER_NAME) {
+          throw new Error("OpenWork Connect MCP metadata is invalid.");
+        }
         if (!canUseOpenworkServer || !openworkClient || !openworkWorkspaceId) {
           throw new Error("OpenWork server is required to repair agent access to connected services.");
         }
@@ -671,7 +712,7 @@ export function createConnectionsStore(options: {
             type: entryType,
             slug,
           });
-          return true;
+          return { ok: true };
         }
         const summary = cloudMcpDisplaySummary({
           signedIn: Boolean(context.denAuthToken?.trim()),
@@ -685,7 +726,49 @@ export function createConnectionsStore(options: {
           type: entryType,
           error: summary.stageLabel,
         });
-        return false;
+        return { ok: false, error: `${summary.stageLabel}. ${summary.recommendedAction}` };
+      }
+
+      if (entry.managedOAuth) {
+        if (isRemoteWorkspace || !isDesktopRuntime()) {
+          throw new Error("OpenWork-managed MCP OAuth is currently available for local desktop workspaces only.");
+        }
+        if (entryType !== "remote" || !entry.url) {
+          throw new Error("OpenWork-managed OAuth requires a remote MCP URL.");
+        }
+        if (!canUseOpenworkServer || !openworkClient || !openworkWorkspaceId) {
+          throw new Error("The local OpenWork server is required for managed MCP sign-in.");
+        }
+        const result = await openworkClient.addManagedMcp(openworkWorkspaceId, {
+          name: slug,
+          url: entry.url,
+          oauth: {
+            applicationType: "native",
+            requestedScopes: entry.oauthConfig?.scope?.split(/\s+/).filter(Boolean),
+            clientId: entry.oauthConfig?.clientId,
+            clientSecret: entry.oauthConfig?.clientSecret,
+          },
+        });
+        const connected = await waitForManagedMcpAuthorization(
+          openworkClient,
+          openworkWorkspaceId,
+          slug,
+          result,
+        );
+        options.markReloadRequired?.("mcp", { type: "mcp", name: slug, action });
+        await refreshMcpServers();
+        if (connected) setStateField("mcpStatus", t("mcp.connected"));
+        finishPerf(options.developerMode(), "mcp.connect", connected ? "done" : "blocked", startedAt, {
+          name: entry.name,
+          type: entryType,
+          slug,
+        });
+        return connected
+          ? { ok: true }
+          : {
+              ok: false,
+              error: state.mcpStatus ?? "MCP sign-in is still pending. Finish it in your browser, then refresh connections.",
+            };
       }
 
       // Resolve dynamic URLs for built-in MCPs
@@ -862,19 +945,17 @@ export function createConnectionsStore(options: {
         type: entryType,
         slug,
       });
-      return true;
+      return { ok: true };
     } catch (error) {
       console.error("[mcp.connect] failed", entry.name, error);
-      setStateField(
-        "mcpStatus",
-        error instanceof Error ? error.message : t("mcp.connect_failed"),
-      );
+      const message = error instanceof Error ? error.message : t("mcp.connect_failed");
+      setStateField("mcpStatus", message);
       finishPerf(options.developerMode(), "mcp.connect", "error", startedAt, {
         name: entry.name,
         type: entryType,
         error: error instanceof Error ? error.message : safeStringify(error),
       });
-      return false;
+      return { ok: false, error: message };
     } finally {
       setStateField("mcpConnectingName", null);
     }
@@ -933,7 +1014,45 @@ export function createConnectionsStore(options: {
     return "skipped";
   }
 
-  function authorizeMcp(entry: McpServerEntry) {
+  async function waitForManagedMcpAuthorization(
+    openworkClient: OpenworkServerClient,
+    workspaceId: string,
+    name: string,
+    result: { status: "connected" } | { status: "needs_auth"; authorizeUrl: string },
+  ): Promise<boolean> {
+    if (result.status === "connected") return true;
+    await openDesktopUrl(assertDesktopWebUrl(result.authorizeUrl));
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const connection = await openworkClient.getManagedMcp(workspaceId, name);
+      if (connection.status === "connected") return true;
+      if (connection.status === "reconnect_required") {
+        throw new Error(connection.lastError || "MCP sign-in needs to be restarted.");
+      }
+    }
+    setStateField("mcpStatus", "MCP sign-in is still pending. Finish it in your browser, then refresh connections.");
+    return false;
+  }
+
+  async function authorizeMcp(entry: McpServerEntry) {
+    if (entry.managedOAuth) {
+      try {
+        const { openworkClient, openworkWorkspaceId, canUseOpenworkServer } = await resolveWritableOpenworkTarget();
+        if (!canUseOpenworkServer || !openworkClient || !openworkWorkspaceId) {
+          throw new Error("The local OpenWork server is required for managed MCP sign-in.");
+        }
+        mutateState((current) => ({ ...current, mcpStatus: null, mcpConnectingName: entry.name }));
+        const result = await openworkClient.connectManagedMcp(openworkWorkspaceId, entry.name);
+        const connected = await waitForManagedMcpAuthorization(openworkClient, openworkWorkspaceId, entry.name, result);
+        await refreshMcpServers();
+        if (connected) setStateField("mcpStatus", t("mcp.connected"));
+      } catch (error) {
+        setStateField("mcpStatus", error instanceof Error ? error.message : t("mcp.connect_failed"));
+      } finally {
+        setStateField("mcpConnectingName", null);
+      }
+      return;
+    }
     if (entry.config.type !== "remote" || entry.config.oauth === false) {
       setStateField("mcpStatus", t("mcp.login_unavailable"));
       return;

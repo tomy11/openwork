@@ -158,6 +158,21 @@ export type WorkerListItem = {
   createdAt: string | null;
 };
 
+export type CodemodeRun = {
+  id: string;
+  source: string;
+  status: "succeeded" | "failed";
+  errorKind: string | null;
+  errorMessage: string | null;
+  toolCallCount: number;
+  toolCalls: Array<{ name: string }>;
+  durationMs: number;
+  startedAt: string;
+  finishedAt: string;
+  createdAt: string;
+  orgMembershipId: string | null;
+};
+
 export type WorkerRuntimeService = {
   name: RuntimeServiceName;
   enabled: boolean;
@@ -782,6 +797,53 @@ export function getWorkersList(payload: unknown): WorkerListItem[] {
   }
 
   return rows;
+}
+
+function parseCodemodeRun(value: unknown): CodemodeRun | null {
+  if (
+    !isRecord(value)
+    || typeof value.id !== "string"
+    || typeof value.source !== "string"
+    || (value.status !== "succeeded" && value.status !== "failed")
+    || typeof value.toolCallCount !== "number"
+    || typeof value.durationMs !== "number"
+    || typeof value.startedAt !== "string"
+    || typeof value.finishedAt !== "string"
+    || typeof value.createdAt !== "string"
+  ) {
+    return null;
+  }
+
+  const toolCalls = Array.isArray(value.toolCalls)
+    ? value.toolCalls.flatMap((call) =>
+        isRecord(call) && typeof call.name === "string" ? [{ name: call.name }] : [],
+      )
+    : [];
+
+  return {
+    id: value.id,
+    source: value.source,
+    status: value.status,
+    errorKind: typeof value.errorKind === "string" ? value.errorKind : null,
+    errorMessage: typeof value.errorMessage === "string" ? value.errorMessage : null,
+    toolCallCount: value.toolCallCount,
+    toolCalls,
+    durationMs: value.durationMs,
+    startedAt: value.startedAt,
+    finishedAt: value.finishedAt,
+    createdAt: value.createdAt,
+    orgMembershipId: typeof value.orgMembershipId === "string" ? value.orgMembershipId : null,
+  };
+}
+
+export function getCodemodeRuns(payload: unknown): CodemodeRun[] {
+  if (!isRecord(payload) || !Array.isArray(payload.runs)) {
+    return [];
+  }
+  return payload.runs.flatMap((run) => {
+    const parsed = parseCodemodeRun(run);
+    return parsed ? [parsed] : [];
+  });
 }
 
 export function getWorkerStatusMeta(status: string): { label: string; bucket: WorkerStatusBucket } {

@@ -113,6 +113,45 @@ function healthPath(path: string) {
   return path === "/health" || path === "/ready"
 }
 
+type SentryLogLevel = StructuredLogLevel | "off"
+
+const sentryLogLevelPriority: Record<StructuredLogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+}
+
+function parseSentryLogLevel(): SentryLogLevel {
+  const value = process.env.SENTRY_LOG_LEVEL?.trim().toLowerCase()
+  if (!value) {
+    return "warn"
+  }
+
+  switch (value) {
+    case "debug":
+    case "info":
+    case "warn":
+    case "error":
+    case "off":
+      return value
+    default:
+      throw new Error("SENTRY_LOG_LEVEL must be one of debug, info, warn, error, off")
+  }
+}
+
+function shouldEmitSentryLog(level: StructuredLogLevel, configuredLevel: SentryLogLevel) {
+  if (configuredLevel === "off") {
+    return false
+  }
+  return sentryLogLevelPriority[level] >= sentryLogLevelPriority[configuredLevel]
+}
+
+function incomingHealthPath(urlPath: string) {
+  const path = urlPath.split(/[?#]/u, 1)[0]
+  return healthPath(path)
+}
+
 function stringField(fields: JsonObject, key: string) {
   const value = fields[key]
   return typeof value === "string" ? value : undefined
@@ -507,6 +546,7 @@ async function startSentry(state: RuntimeState) {
   const release = observabilityConfig.sentryBuild.values.SENTRY_RELEASE
   const environment = observabilityConfig.sentryBuild.values.SENTRY_ENVIRONMENT
   const dist = observabilityConfig.sentryBuild.values.SENTRY_DIST
+  const sentryLogLevel = parseSentryLogLevel()
 
   Sentry.init({
     dsn: observabilityConfig.sentry.dsn,
@@ -514,7 +554,7 @@ async function startSentry(state: RuntimeState) {
     release,
     environment,
     dist,
-    enableLogs: true,
+    enableLogs: sentryLogLevel !== "off",
     attachStacktrace: false,
     maxValueLength: 2_000,
     normalizeDepth: 4,
@@ -535,6 +575,14 @@ async function startSentry(state: RuntimeState) {
     beforeSendSpan: sanitizeSentrySpan,
     beforeSendLog: sanitizeSentryLog,
     beforeBreadcrumb: (breadcrumb) => sanitizeSentryBreadcrumb(breadcrumb),
+    integrations(defaults) {
+      return [
+        ...defaults.filter((integration) => integration.name !== "Http"),
+        Sentry.httpIntegration({
+          ignoreIncomingRequests: (urlPath) => incomingHealthPath(urlPath),
+        }),
+      ]
+    },
   })
 
   state.honoMiddlewareFactory = (app) => {
@@ -549,6 +597,10 @@ async function startSentry(state: RuntimeState) {
     }
   }
   state.emitProviderLog = (level, message, fields) => {
+    if (!shouldEmitSentryLog(level, sentryLogLevel)) {
+      return
+    }
+
     switch (level) {
       case "debug":
         Sentry.logger.debug(message, fields)

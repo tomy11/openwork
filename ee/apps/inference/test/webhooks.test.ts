@@ -47,7 +47,16 @@ function createWebhookTestServer() {
   const ledgerEntryId = createDenTypeId("inferenceUsageLedgerEntry")
   const bucketId = createDenTypeId("inferenceOrgUsageBucket")
   const reports: OpenRouterUnknownModelUsageReport[] = []
-  const insertedEntries: { openworkRequestId: string; externalEventId: string | null; costAmount: number }[] = []
+  const insertedEntries: {
+    openworkRequestId: string
+    externalEventId: string | null
+    costAmount: number
+    modelId: string
+    providerId: string
+    inputTokens: number | null
+    outputTokens: number | null
+    totalTokens: number | null
+  }[] = []
   const bucketCharges: { amount: number }[] = []
   const calls = {
     ensureUsableBuckets: 0,
@@ -93,6 +102,11 @@ function createWebhookTestServer() {
         openworkRequestId: input.span.openworkRequestId,
         externalEventId: input.span.externalEventId,
         costAmount: input.costAmount,
+        modelId: input.span.reportedModel,
+        providerId: "openrouter",
+        inputTokens: input.span.usageMetadata.inputTokens,
+        outputTokens: input.span.usageMetadata.outputTokens,
+        totalTokens: input.span.usageMetadata.totalTokens,
       })
       return { id: ledgerEntryId }
     },
@@ -153,7 +167,7 @@ test("reports fatal Sentry diagnostics and skips deduction when OpenRouter usage
     requestId: "request-unknown",
     eventId: "event-unknown",
     generationId: "generation-unknown",
-    requestModel: "openrouter/fusion",
+    requestModel: "z-ai/glm-5.2",
     responseModel: "vendor/new-model",
     includeSensitive: true,
   })))
@@ -178,7 +192,7 @@ test("reports fatal Sentry diagnostics and skips deduction when OpenRouter usage
   assert.equal(report.openworkRequestId, "request-unknown")
   assert.equal(report.externalEventId, "event-unknown")
   assert.equal(report.generationId, "generation-unknown")
-  assert.equal(report.usage.requestModel, "openrouter/fusion")
+  assert.equal(report.usage.requestModel, "z-ai/glm-5.2")
   assert.equal(report.usage.responseModel, "vendor/new-model")
   assert.equal(report.usage.inputTokens, 11)
   assert.equal(report.usage.outputTokens, 13)
@@ -197,8 +211,8 @@ test("deducts usage without Sentry diagnostics when OpenRouter usage reports a k
     requestId: "request-known",
     eventId: "event-known",
     generationId: "generation-known",
-    requestModel: "openrouter/fusion",
-    responseModel: "openrouter/fusion",
+    requestModel: "z-ai/glm-5.2",
+    responseModel: "z-ai/glm-5.2",
   })))
 
   assert.equal(response.status, 200)
@@ -211,6 +225,15 @@ test("deducts usage without Sentry diagnostics when OpenRouter usage reports a k
   assert.equal(calls.findOpenRouterUsageLedgerEntry, 1)
   assert.equal(calls.insertOpenRouterUsageLedgerEntry, 1)
   assert.equal(calls.chargeBuckets, 1)
-  assert.deepEqual(insertedEntries, [{ openworkRequestId: "request-known", externalEventId: "event-known", costAmount: 1 }])
+  assert.deepEqual(insertedEntries, [{
+    openworkRequestId: "request-known",
+    externalEventId: "event-known",
+    costAmount: 1,
+    modelId: "z-ai/glm-5.2",
+    providerId: "openrouter",
+    inputTokens: 11,
+    outputTokens: 13,
+    totalTokens: 24,
+  }])
   assert.deepEqual(bucketCharges, [{ amount: 1 }])
 })

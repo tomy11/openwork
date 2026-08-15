@@ -324,6 +324,20 @@ describe("describeOpencodeSessionError", () => {
     })).toBe("Service unavailable\nStatus: 503\nResponse: upstream overloaded");
   });
 
+  it("summarizes and bounds an HTML API response body", () => {
+    const responseBody = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>${"x".repeat(1_024 * 1_024)}</body></html>`;
+    const described = describeOpencodeSessionError({
+      name: "APIError",
+      data: { message: "Proxy request failed", statusCode: 502, responseBody },
+    });
+
+    expect(described).toContain("Upstream returned an HTML error page (502 Bad Gateway)");
+    expect(described).toContain("[Error text truncated; original size:");
+    expect(described.toLowerCase()).not.toContain("<!doctype");
+    expect(described.toLowerCase()).not.toContain("<html");
+    expect(described.length).toBeLessThanOrEqual(500);
+  });
+
   it("uses named error defaults when opencode omits a message", () => {
     expect(describeOpencodeSessionError({
       name: "MessageOutputLengthError",

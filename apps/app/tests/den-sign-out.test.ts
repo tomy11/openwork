@@ -62,4 +62,20 @@ describe("Den sign-out", () => {
       createDenClient({ baseUrl: "https://den.test", token: "tok_test" }).signOut(),
     ).rejects.toThrow("Failed to fetch");
   });
+
+  test("rejects direct desktop signup without calling the auth endpoint", async () => {
+    const requests: string[] = [];
+    setFetch(async (input) => {
+      requests.push(String(input));
+      return new Response(null, { status: 204 });
+    });
+
+    const result = createDenClient({ baseUrl: "https://den.test" }).signUpEmail("user@example.test", "aaaaaaaa");
+    await expect(result).rejects.toMatchObject({
+      status: 410,
+      code: "desktop_signup_deprecated",
+      message: "Create your account in the browser to choose a secure password.",
+    });
+    expect(requests).toEqual([]);
+  });
 });

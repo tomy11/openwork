@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { auth, UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js"
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import type { RequestOptions } from "@modelcontextprotocol/sdk/shared/protocol.js"
 import { z } from "zod"
 import type {
@@ -16,14 +16,24 @@ import type {
   EnterpriseMcpConnection,
   EnterpriseMcpFetch,
   EnterpriseMcpLifecycle,
+  EnterpriseMcpListResourcesInput,
+  EnterpriseMcpListResourceTemplatesInput,
   EnterpriseMcpListToolsInput,
   EnterpriseMcpOperationPhase,
   EnterpriseMcpRequestPhase,
+  EnterpriseMcpReadResourceInput,
 } from "./contracts.js"
 import { EnterpriseMcpClientError, EnterpriseMcpLifecycleDeadlineError, EnterpriseMcpToolResultError } from "./errors.js"
 import { EnterpriseMcpOAuthProvider } from "./oauth-provider.js"
 import { createEnterpriseMcpRequestObserver, type EnterpriseMcpRequestObserver } from "./request-observer.js"
+import { createEnterpriseMcpTokenResponseCompat } from "./token-response-compat.js"
 import { collectEnterpriseMcpTools } from "./tool-catalog.js"
+import {
+  assertEnterpriseMcpResourceResult,
+  collectEnterpriseMcpResources,
+  collectEnterpriseMcpResourceTemplates,
+  ENTERPRISE_MCP_RESOURCE_URI_LIMIT_BYTES,
+} from "./resource-catalog.js"
 import { assertEnterpriseMcpToolArguments } from "./tool-input.js"
 
 const connectionSchema = z.object({
@@ -43,6 +53,10 @@ const oauthConfigurationSchema = z.object({
   requestedScopes: z.array(z.string().trim().min(1)).max(128).optional(),
 })
 const toolNameSchema = z.string().trim().min(1)
+const resourceUriSchema = z.string().trim().min(1).max(ENTERPRISE_MCP_RESOURCE_URI_LIMIT_BYTES).refine(
+  (value) => Buffer.byteLength(value, "utf8") <= ENTERPRISE_MCP_RESOURCE_URI_LIMIT_BYTES,
+  "MCP resource URIs must not exceed 16 KiB.",
+)
 const authorizationIdSchema = z.string().min(1).max(8 * 1024)
 const authorizationCodeSchema = z.string().min(1).max(8 * 1024)
 
@@ -50,6 +64,9 @@ const DEFAULT_OPERATION_TIMEOUT_MS = 30_000
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000
 const DEFAULT_AUTHORIZATION_TRANSACTION_TTL_MS = 10 * 60_000
 const DEFAULT_EXPIRATION_SKEW_MS = 30_000
+export const ENTERPRISE_MCP_PROTOCOL_VERSION_FALLBACK = "2025-06-18"
+const MCP_APP_EXTENSION = "io.modelcontextprotocol/ui"
+const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
 
 const optionsSchema = z.object({
   operationTimeoutMs: z.number().int().positive(),
@@ -63,11 +80,13 @@ const optionsSchema = z.object({
 type Session = {
   client: Client
   transport: StreamableHTTPClientTransport
+  serverUrl: URL
   oauthProvider?: EnterpriseMcpOAuthProvider
   observer: EnterpriseMcpRequestObserver
   controller: AbortController
   requestOptions: RequestOptions
   lifecycle: EnterpriseMcpLifecycle
+  createTransport: () => StreamableHTTPClientTransport
 }
 
 function requestInit(authorization: EnterpriseMcpAuthorization): RequestInit | undefined {
@@ -166,6 +185,8 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
     return phase === "mcp-initialize"
       || phase === "mcp-tool-discovery"
       || phase === "mcp-tool-execution"
+      || phase === "mcp-resource-discovery"
+      || phase === "mcp-resource-read"
       || phase === "endpoint-request"
   }
 
@@ -173,7 +194,7 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
     session: Session,
     input: { connectionId: string; operationPhase: EnterpriseMcpOperationPhase },
   ): Promise<void> {
-    if (!session.oauthProvider || input.operationPhase !== "tool-execution") return
+    if (!session.oauthProvider || !["tool-execution", "resource-discovery", "resource-read"].includes(input.operationPhase)) return
     const failure = session.observer.lastRequestFailure()
     if (!failure || !isMcpResourceRequest(failure.requestPhase)) return
     const rejected = (failure.httpStatus === 401 && failure.invalidToken)
@@ -218,10 +239,22 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
     }, remaining)
     controller.signal.addEventListener("abort", () => clearTimeout(timeout), { once: true })
 
+    const compatibleFetch = createEnterpriseMcpTokenResponseCompat({
+      fetch: configuredFetch,
+      onTranslation: (translation) => emitDiagnostic({
+        kind: "request",
+        connectionId: input.connection.id,
+        operationPhase: input.operationPhase,
+        requestPhase: translation.requestPhase,
+        outcome: translation.outcome,
+        httpStatus: translation.httpStatus,
+        responseBodyExcerpt: translation.responseBodyExcerpt,
+      }),
+    })
     const observer = createEnterpriseMcpRequestObserver({
       connectionId: input.connection.id,
       operationPhase: input.operationPhase,
-      fetch: configuredFetch,
+      fetch: compatibleFetch,
       diagnosticSink: options.diagnosticSink ? emitDiagnostic : undefined,
       signal: options.lifecycle
         ? AbortSignal.any([controller.signal, options.lifecycle.signal])
@@ -248,12 +281,18 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
           oauthConfiguration,
         })
       : undefined
-    const transport = new StreamableHTTPClientTransport(serverUrl, {
+    const createTransport = () => new StreamableHTTPClientTransport(serverUrl, {
       authProvider: oauthProvider,
       fetch: observer.fetch,
       requestInit: requestInit(input.connection.authorization),
     })
-    const client = new Client({ name: clientName, version: clientVersion }, { capabilities: {} })
+    const transport = createTransport()
+    const capabilities = {
+      extensions: {
+        [MCP_APP_EXTENSION]: { mimeTypes: [MCP_APP_MIME_TYPE] },
+      },
+    }
+    const client = new Client({ name: clientName, version: clientVersion }, { capabilities })
     const requestOptions: RequestOptions = {
       signal: requestSignal,
       timeout: requestTimeoutMs,
@@ -264,12 +303,65 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
     return {
       client,
       transport,
+      serverUrl,
       oauthProvider,
       observer,
       controller,
       requestOptions,
       lifecycle: { expiresAt: configuredExpiresAt, signal: requestSignal },
+      createTransport,
     }
+  }
+
+  function hasInitializeHttp400(error: unknown): boolean {
+    let current: unknown = error
+    const seen = new Set<unknown>()
+    for (let depth = 0; depth < 5 && current && !seen.has(current); depth += 1) {
+      seen.add(current)
+      if (current instanceof StreamableHTTPError && current.code === 400) return true
+      current = typeof current === "object" && current !== null && "cause" in current
+        ? current.cause
+        : undefined
+    }
+    return false
+  }
+
+  async function connectWithProtocolVersionFallback(input: {
+    session: Session
+    connectionId: string
+    operationPhase: EnterpriseMcpOperationPhase
+  }): Promise<void> {
+    try {
+      await input.session.client.connect(input.session.transport, input.session.requestOptions)
+      return
+    } catch (error) {
+      if (
+        input.session.observer.lastFailedRequestPhase() !== "mcp-initialize"
+        || !hasInitializeHttp400(error)
+      ) throw error
+    }
+
+    emitDiagnostic({
+      kind: "request",
+      connectionId: input.connectionId,
+      operationPhase: input.operationPhase,
+      requestPhase: "mcp-initialize",
+      outcome: "started",
+      protocolVersionFallback: ENTERPRISE_MCP_PROTOCOL_VERSION_FALLBACK,
+    })
+    input.session.client = new Client(
+      { name: clientName, version: clientVersion },
+      {
+        capabilities: {
+          extensions: {
+            [MCP_APP_EXTENSION]: { mimeTypes: [MCP_APP_MIME_TYPE] },
+          },
+        },
+        protocolVersion: ENTERPRISE_MCP_PROTOCOL_VERSION_FALLBACK,
+      },
+    )
+    input.session.transport = input.session.createTransport()
+    await input.session.client.connect(input.session.transport, input.session.requestOptions)
   }
 
   async function runOperation<T>(input: {
@@ -342,7 +434,11 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
       flow: { kind: "runtime" },
       operation: async (session) => {
         try {
-          await session.client.connect(session.transport, session.requestOptions)
+          await connectWithProtocolVersionFallback({
+            session,
+            connectionId: input.connection.id,
+            operationPhase: input.operationPhase,
+          })
           emitDiagnostic({
             kind: "operation",
             connectionId: input.connection.id,
@@ -399,7 +495,14 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
         operationPhase: "connection-handshake",
         operation: async (session) => {
           try {
-            await session.client.connect(session.transport, session.requestOptions)
+            const hadOAuthCredential = session.oauthProvider
+              ? Boolean(await session.oauthProvider.tokens())
+              : false
+            await connectWithProtocolVersionFallback({
+              session,
+              connectionId: input.connection.id,
+              operationPhase: "connection-handshake",
+            })
             emitDiagnostic({
               kind: "operation",
               connectionId: input.connection.id,
@@ -413,6 +516,29 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
             // implementing tools/list at all.
             if (session.client.getServerCapabilities()?.tools) {
               await session.client.listTools(undefined, session.requestOptions)
+            }
+            // OAuth connections must not be treated as member-connected merely
+            // because a provider exposes initialize and tools/list publicly.
+            // When no member credential exists, proactively run OAuth discovery
+            // so providers such as BigQuery can return an authorization URL
+            // without first issuing an MCP-level 401 challenge.
+            if (session.oauthProvider && !hadOAuthCredential) {
+              const authResult = await auth(session.oauthProvider, {
+                serverUrl: session.serverUrl,
+                fetchFn: session.observer.fetch,
+              })
+              const authorizeUrl = session.oauthProvider.authorizeUrl
+              if (authResult === "REDIRECT") {
+                if (!authorizeUrl) {
+                  throw new Error("The OAuth provider requested authorization without an authorization URL.")
+                }
+                try {
+                  await closeWithinDeadline(() => session.client.close(), closeTimeoutMs)
+                } catch {
+                  // The bounded cleanup attempt must not discard a valid authorization URL.
+                }
+                return { status: "needs_auth", authorizeUrl }
+              }
             }
             try {
               await closeWithinDeadline(() => session.client.close(), closeTimeoutMs)
@@ -457,7 +583,11 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
           try {
             await session.transport.finishAuth(code)
             exchangedTokens = true
-            await session.client.connect(session.transport, session.requestOptions)
+            await connectWithProtocolVersionFallback({
+              session,
+              connectionId: input.connection.id,
+              operationPhase: "authorization-callback",
+            })
             emitDiagnostic({
               kind: "operation",
               connectionId: input.connection.id,
@@ -549,6 +679,23 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
       })
     },
 
+    async callToolRaw(input: EnterpriseMcpCallToolInput) {
+      const toolName = configurationValue(() => toolNameSchema.parse(input.toolName))
+      configurationValue(() => assertEnterpriseMcpToolArguments(input.arguments))
+      return runConnectedOperation({
+        connection: input.connection,
+        redirectUri: input.redirectUri,
+        operationPhase: "tool-execution",
+        operation: async (session) => {
+          const result = await session.client.callTool({
+            name: toolName,
+            arguments: input.arguments,
+          }, undefined, session.requestOptions)
+          return result
+        },
+      })
+    },
+
     async callTool(input: EnterpriseMcpCallToolInput) {
       const toolName = configurationValue(() => toolNameSchema.parse(input.toolName))
       configurationValue(() => assertEnterpriseMcpToolArguments(input.arguments))
@@ -563,6 +710,67 @@ export function createEnterpriseMcpClient(options: EnterpriseMcpClientOptions): 
           }, undefined, session.requestOptions)
           if ("isError" in result && result.isError) throw new EnterpriseMcpToolResultError(result)
           return result
+        },
+      })
+    },
+
+    async listResources(input: EnterpriseMcpListResourcesInput) {
+      return runConnectedOperation({
+        connection: input.connection,
+        redirectUri: input.redirectUri,
+        operationPhase: "resource-discovery",
+        operation: (session) => collectEnterpriseMcpResources({
+          requestOptions: session.requestOptions,
+          listPage: (cursor, options) => session.client.listResources(
+            cursor ? { cursor } : undefined,
+            options,
+          ),
+        }),
+      })
+    },
+
+    async readResource(input: EnterpriseMcpReadResourceInput) {
+      const uri = configurationValue(() => resourceUriSchema.parse(input.uri))
+      return runConnectedOperation({
+        connection: input.connection,
+        redirectUri: input.redirectUri,
+        operationPhase: "resource-read",
+        operation: async (session) => {
+          const result = await session.client.readResource({ uri }, session.requestOptions)
+          assertEnterpriseMcpResourceResult(result)
+          return result
+        },
+      })
+    },
+
+    async listResourceTemplates(input: EnterpriseMcpListResourceTemplatesInput) {
+      return runConnectedOperation({
+        connection: input.connection,
+        redirectUri: input.redirectUri,
+        operationPhase: "resource-discovery",
+        operation: (session) => collectEnterpriseMcpResourceTemplates({
+          requestOptions: session.requestOptions,
+          listPage: (cursor, options) => session.client.listResourceTemplates(
+            cursor ? { cursor } : undefined,
+            options,
+          ),
+        }),
+      })
+    },
+
+    async describeServer(input: EnterpriseMcpListResourcesInput) {
+      return runConnectedOperation({
+        connection: input.connection,
+        redirectUri: input.redirectUri,
+        operationPhase: "protocol-initialize",
+        operation: async (session) => {
+          const instructions = session.client.getInstructions()
+          const serverInfo = session.client.getServerVersion()
+          return {
+            capabilities: session.client.getServerCapabilities() ?? {},
+            ...(serverInfo ? { serverInfo } : {}),
+            ...(instructions ? { instructions } : {}),
+          }
         },
       })
     },

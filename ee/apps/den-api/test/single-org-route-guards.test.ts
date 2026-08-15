@@ -176,6 +176,14 @@ test("single_org SSO-only guard recognizes email/password auth requests", () => 
   }))).toBe(false)
 })
 
+test("single_org SSO-only guard still recognizes invited email signup requests", () => {
+  expect(authRoutesModule.isBetterAuthEmailPasswordRequest(new Request("http://den.local/api/auth/sign-up/email?invite=inv_example", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "invited@example.com", name: "Invited User", password: "correct horse battery staple" }),
+  }))).toBe(true)
+})
+
 test("single_org signup guard recognizes only the Better Auth email signup route", () => {
   expect(authRoutesModule.isBetterAuthEmailSignupRequest(new Request("http://den.local/api/auth/sign-up/email", {
     method: "POST",

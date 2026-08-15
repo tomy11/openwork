@@ -75,4 +75,12 @@ if [ -n "${OPENWORK_ELECTRON_APP_NAME:-}" ]; then
   export OPENWORK_ELECTRON_APP_NAME
 fi
 
+if [ -n "${OPENWORK_EVAL_ELECTRON_BINARY:-}" ]; then
+  if [ ! -x "$OPENWORK_EVAL_ELECTRON_BINARY" ]; then
+    echo "OPENWORK_EVAL_ELECTRON_BINARY is not an executable file: $OPENWORK_EVAL_ELECTRON_BINARY" >&2
+    exit 1
+  fi
+  exec "$OPENWORK_EVAL_ELECTRON_BINARY"
+fi
+
 exec pnpm --filter @openwork/desktop dev:electron

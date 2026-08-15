@@ -6,6 +6,7 @@ import type {
   EnterpriseMcpOperationPhase,
   EnterpriseMcpRequestPhase,
 } from "./contracts.js"
+import { boundedRedactedResponseBodyExcerpt } from "./response-body-excerpt.js"
 
 const jsonRpcRequestSchema = z.object({
   method: z.string(),
@@ -38,6 +39,8 @@ function bodyRequestPhase(body: BodyInit | null | undefined): EnterpriseMcpReque
     if (request.data.method === "initialize") return "mcp-initialize"
     if (request.data.method === "tools/list") return "mcp-tool-discovery"
     if (request.data.method === "tools/call") return "mcp-tool-execution"
+    if (request.data.method === "resources/list" || request.data.method === "resources/templates/list") return "mcp-resource-discovery"
+    if (request.data.method === "resources/read") return "mcp-resource-read"
   } catch {
     return null
   }
@@ -50,6 +53,8 @@ function isMcpRequestPhase(phase: EnterpriseMcpRequestPhase): boolean {
     || phase === "mcp-initialize"
     || phase === "mcp-tool-discovery"
     || phase === "mcp-tool-execution"
+    || phase === "mcp-resource-discovery"
+    || phase === "mcp-resource-read"
 }
 
 export function classifyEnterpriseMcpRequest(url: URL, init?: RequestInit): EnterpriseMcpRequestPhase {
@@ -92,6 +97,13 @@ export function createEnterpriseMcpRequestObserver(input: {
   let lastRequestPhase: EnterpriseMcpRequestPhase | null = null
   let lastFailedRequestPhase: EnterpriseMcpRequestPhase | null = null
   let lastRequestFailure: ReturnType<EnterpriseMcpRequestObserver["lastRequestFailure"]> = null
+  const emitDiagnostic: EnterpriseMcpDiagnosticSink = (event) => {
+    try {
+      input.diagnosticSink?.(event)
+    } catch {
+      // Diagnostics must never change the request outcome they observe.
+    }
+  }
 
   return {
     lastRequestPhase: () => lastRequestPhase,
@@ -102,7 +114,7 @@ export function createEnterpriseMcpRequestObserver(input: {
       const requestPhase = classifyEnterpriseMcpRequest(url, init)
       lastRequestPhase = requestPhase
       const startedAt = input.clock.now()
-      input.diagnosticSink?.({
+      emitDiagnostic({
         kind: "request",
         connectionId: input.connectionId,
         operationPhase: input.operationPhase,
@@ -131,7 +143,10 @@ export function createEnterpriseMcpRequestObserver(input: {
           // erase the resource's last rejection before that retry completes.
           lastRequestFailure = null
         }
-        input.diagnosticSink?.({
+        const responseBodyExcerpt = !response.ok && isMcpRequestPhase(requestPhase)
+          ? await boundedRedactedResponseBodyExcerpt(response)
+          : undefined
+        emitDiagnostic({
           kind: "request",
           connectionId: input.connectionId,
           operationPhase: input.operationPhase,
@@ -139,6 +154,7 @@ export function createEnterpriseMcpRequestObserver(input: {
           outcome: response.ok ? "succeeded" : "failed",
           durationMs: input.clock.now() - startedAt,
           httpStatus: response.status,
+          ...(responseBodyExcerpt ? { responseBodyExcerpt } : {}),
         })
         return response
       } catch (error) {
@@ -149,7 +165,7 @@ export function createEnterpriseMcpRequestObserver(input: {
           insufficientScope: false,
           invalidToken: false,
         }
-        input.diagnosticSink?.({
+        emitDiagnostic({
           kind: "request",
           connectionId: input.connectionId,
           operationPhase: input.operationPhase,

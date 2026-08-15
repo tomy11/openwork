@@ -28,6 +28,7 @@ const extraAppPorts = (process.env.OPENWORK_EXTRA_APP_PORTS?.trim() || "5174")
   .map((value) => value.trim())
   .filter(Boolean)
 const databaseUrl = process.env.DATABASE_URL?.trim() || "mysql://root:password@127.0.0.1:3306/openwork_den"
+const databaseRedisUrl = process.env.DATABASE_REDIS_URL?.trim() || "redis://127.0.0.1:6379"
 const dbEncryptionKey =
   process.env.DEN_DB_ENCRYPTION_KEY?.trim() ||
   "local-dev-db-encryption-key-please-change-1234567890"
@@ -59,15 +60,15 @@ function detectWebOrigins() {
   return Array.from(origins).join(",")
 }
 
-function parseDatabaseEndpoint(value) {
+function parseUrlEndpoint(value, defaultPort) {
   const parsed = new URL(value)
   return {
     host: parsed.hostname,
-    port: Number(parsed.port || "3306"),
+    port: Number(parsed.port || defaultPort),
   }
 }
 
-function canReachMysql(host, port) {
+function canReachTcp(host, port) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port })
 
@@ -118,7 +119,7 @@ function run(command, args, options = {}) {
   })
 }
 
-let startedMysql = false
+const startedDockerServices = new Set()
 let turboChild = null
 let cleaningUp = false
 
@@ -151,8 +152,12 @@ async function cleanup(exitCode = 0) {
 
   await stopTurboChild()
 
-  if (startedMysql) {
-    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "down"], {
+  if (startedDockerServices.size > 0) {
+    const services = Array.from(startedDockerServices)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "stop", ...services], {
+      stdio: "inherit",
+    }).catch(() => {})
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "rm", "-f", ...services], {
       stdio: "inherit",
     }).catch(() => {})
   }
@@ -174,8 +179,8 @@ async function main() {
     }
   }
 
-  const { host, port } = parseDatabaseEndpoint(databaseUrl)
-  const mysqlAvailable = await canReachMysql(host, port)
+  const { host, port } = parseUrlEndpoint(databaseUrl, "3306")
+  const mysqlAvailable = await canReachTcp(host, port)
 
   if (!mysqlAvailable) {
     if (!(host === "127.0.0.1" || host === "localhost")) {
@@ -184,9 +189,23 @@ async function main() {
 
     console.log(`[den] MySQL not reachable at ${host}:${port}; starting Docker MySQL...`)
     await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "mysql"])
-    startedMysql = true
+    startedDockerServices.add("mysql")
   } else {
     console.log(`[den] Using existing MySQL at ${host}:${port}`)
+  }
+
+  const redis = parseUrlEndpoint(databaseRedisUrl, "6379")
+  const redisAvailable = await canReachTcp(redis.host, redis.port)
+  if (!redisAvailable) {
+    if (!(redis.host === "127.0.0.1" || redis.host === "localhost")) {
+      throw new Error(`Redis at ${redis.host}:${redis.port} is not reachable, and auto-start only supports localhost`)
+    }
+
+    console.log(`[den] Redis not reachable at ${redis.host}:${redis.port}; starting Docker Redis...`)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "redis"])
+    startedDockerServices.add("redis")
+  } else {
+    console.log(`[den] Using existing Redis at ${redis.host}:${redis.port}`)
   }
 
   console.log("[den] Syncing Den schema...")
@@ -220,6 +239,7 @@ async function main() {
       env: {
         ...process.env,
         DATABASE_URL: databaseUrl,
+        DATABASE_REDIS_URL: databaseRedisUrl,
         DEN_DB_ENCRYPTION_KEY: dbEncryptionKey,
         BETTER_AUTH_URL: process.env.BETTER_AUTH_URL?.trim() || `http://localhost:${webPort}`,
         DEN_MCP_RESOURCE_URL: process.env.DEN_MCP_RESOURCE_URL?.trim() || `http://127.0.0.1:${apiPort}/mcp`,

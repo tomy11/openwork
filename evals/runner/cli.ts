@@ -41,6 +41,7 @@ interface CliArgs {
   stack: string | null;
   stackDown: boolean;
   kubeProfile: "single-org" | "multi-org";
+  kubeEgress: "allowlist" | null;
   images: "published" | "local" | null;
   deleteCluster: boolean;
   scaffold: string | null;
@@ -68,6 +69,7 @@ export function parseArgs(argv: string[]): CliArgs {
     stack: null,
     stackDown: false,
     kubeProfile: "single-org",
+    kubeEgress: null,
     images: null,
     deleteCluster: false,
     scaffold: null,
@@ -100,6 +102,13 @@ export function parseArgs(argv: string[]): CliArgs {
         throw new Error(`Unknown --kube-profile value: ${profile}. Supported: single-org, multi-org.`);
       }
       args.kubeProfile = profile;
+      index += 1;
+    } else if (value === "--kube-egress") {
+      const egress = readRequiredValue(argv, index, value);
+      if (egress !== "allowlist") {
+        throw new Error(`Unknown --kube-egress value: ${egress}. Supported: allowlist.`);
+      }
+      args.kubeEgress = egress;
       index += 1;
     } else if (value === "--images") {
       const images = readRequiredValue(argv, index, value);
@@ -240,7 +249,7 @@ export function createEvalHosts({ manifest, env, repoRoot, log }: { manifest: En
 }
 
 function printHelp(): void {
-  console.log("Usage: node evals/runner/run.mjs [--mode automation|demo] [--list | --all | --flow <id> ... | scaffold <id> [--force]] [--cdp-url <url>] [--env <name>] [--repeat <n>] [--out <dir>] [--pr [number]] [--stack den|kube] [--kube-profile single-org|multi-org] [--images published|local] [--stack-down [--delete-cluster]]");
+  console.log("Usage: node evals/runner/run.mjs [--mode automation|demo] [--list | --all | --flow <id> ... | scaffold <id> [--force]] [--cdp-url <url>] [--env <name>] [--repeat <n>] [--out <dir>] [--pr [number]] [--stack den|kube] [--kube-profile single-org|multi-org] [--kube-egress allowlist] [--images published|local] [--stack-down [--delete-cluster]]");
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -290,6 +299,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       skipApp: !(await selectedStackNeedsApp(args)),
       profile: args.kubeProfile,
       images: args.images ?? undefined,
+      egress: args.kubeEgress ?? undefined,
     });
   } else if (args.stack) {
     throw new Error(`Unknown stack: ${args.stack}. Supported: den, kube`);

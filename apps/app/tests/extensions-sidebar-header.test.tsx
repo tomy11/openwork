@@ -14,9 +14,7 @@ const appSidebarPath = fileURLToPath(
 const sessionPagePath = fileURLToPath(
   new URL("../src/react-app/domains/session/chat/session-page.tsx", import.meta.url),
 );
-const generalSettingsPath = fileURLToPath(
-  new URL("../src/react-app/domains/settings/pages/general-view.tsx", import.meta.url),
-);
+
 
 describe("Extensions sidebar destination", () => {
   test("exposes its label, keyboard button, and active page state", () => {
@@ -26,7 +24,7 @@ describe("Extensions sidebar destination", () => {
           <SidebarDestination
             active
             icon={Puzzle}
-            label="Extensions"
+            label="Library"
             onSelect={() => {}}
           />
         </SidebarMenu>
@@ -34,10 +32,13 @@ describe("Extensions sidebar destination", () => {
     );
 
     expect(html).toContain('type="button"');
-    expect(html).toContain('aria-label="Extensions"');
+    expect(html).toContain('aria-label="Library"');
     expect(html).toContain('aria-current="page"');
     expect(html).toContain("data-active");
-    expect(html).toContain(">Extensions<");
+    expect(html).toContain(">Library<");
+    // Idle weight matches the neighboring Search row (70% foreground) so the
+    // sidebar header reads as one family; active/hover restore full strength.
+    expect(html).toContain("text-sidebar-foreground/70");
   });
 
   test("sits below Search and above Pinned sessions", () => {
@@ -56,13 +57,13 @@ describe("Extensions sidebar destination", () => {
 });
 
 describe("Extensions main page", () => {
-  test("uses the main content header and is absent from Settings navigation", () => {
+  test("uses the main content header and is listed in Settings navigation", () => {
     const sessionPageSource = readFileSync(sessionPagePath, "utf8");
-    const generalSettingsSource = readFileSync(generalSettingsPath, "utf8");
 
     expect(sessionPageSource).toContain("props.mainContentTitle");
     expect(sessionPageSource).toContain("<h1");
-    expect(getWorkspaceSettingsTabs()).not.toContain("extensions");
-    expect(generalSettingsSource).not.toContain('{ tab: "extensions"');
+    // The Library is intentionally reachable both standalone and inside the
+    // Settings pane (feat: Library inside the Settings pane).
+    expect(getWorkspaceSettingsTabs()).toContain("extensions");
   });
 });

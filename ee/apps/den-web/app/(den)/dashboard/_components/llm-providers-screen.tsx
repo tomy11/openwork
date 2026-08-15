@@ -285,7 +285,6 @@ export function LlmProvidersScreen() {
   return (
     <DashboardPageTemplate
       icon={KeyRound}
-      badgeLabel="New"
       title="Bring your Own Keys"
       description="Connect Anthropic, OpenAI, Azure or any models.dev provider with your own credentials, choose the exact models each one exposes, and grant access to the right people and teams."
       colors={["#F3FFF9", "#0F766E", "#34D399", "#7DD3FC"]}

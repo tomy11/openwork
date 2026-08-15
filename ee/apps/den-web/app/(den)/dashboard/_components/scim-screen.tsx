@@ -322,7 +322,6 @@ export function ScimScreen() {
     return (
       <DashboardPageTemplate
         icon={Shield}
-        badgeLabel="Admin"
         title="SCIM"
         description="Provision organization members from your identity provider with an org-scoped SCIM connector."
         colors={["#ECFEFF", "#155E75", "#06B6D4", "#A5F3FC"]}
@@ -337,7 +336,6 @@ export function ScimScreen() {
   return (
     <DashboardPageTemplate
       icon={Shield}
-      badgeLabel="Admin"
       title="SCIM"
       description="Create one SCIM connector per workspace, then give your identity provider the base URL and bearer token shown here."
       colors={["#ECFEFF", "#155E75", "#06B6D4", "#A5F3FC"]}

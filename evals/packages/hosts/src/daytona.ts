@@ -393,8 +393,12 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
     const sandbox = requireSandbox();
     const safeName = sanitizeName(name);
     const spawnStamp = timestamp();
-    const profileRoot = `/workspace/.openwork-daytona/profiles/${safeName}-${spawnStamp}`;
-    const profileDir = `${profileRoot}/electron-userdata`;
+    if (opts.profileDir !== undefined && !opts.profileDir.trim()) {
+      throw new Error("Electron profileDir must not be empty.");
+    }
+    const callerOwnedProfile = opts.profileDir !== undefined;
+    const profileRoot = opts.profileDir ?? `/workspace/.openwork-daytona/profiles/${safeName}-${spawnStamp}`;
+    const userDataDir = `${profileRoot}/electron-userdata`;
     const bootstrapPath = `${profileRoot}/bootstrap.json`;
     const port = await allocateSandboxPort(electronPorts, exec, sandbox);
     // Per-spawn log so the integrity check below can never read a previous
@@ -402,7 +406,7 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
     const logPath = `/tmp/electron-${safeName}-${spawnStamp}.log`;
 
     try {
-      await checkedExec(exec, ["exec", sandbox, "--", "mkdir", "-p", shellQuote(profileDir)], `mkdir Daytona Electron profile ${profileDir}`, { timeoutMs: 30_000 });
+      await checkedExec(exec, ["exec", sandbox, "--", "mkdir", "-p", shellQuote(userDataDir)], `mkdir Daytona Electron profile ${userDataDir}`, { timeoutMs: 30_000 });
       if (opts.bootstrap) {
         const bootstrapJson = `${JSON.stringify(opts.bootstrap, null, 2)}\n`;
         const encoded = Buffer.from(bootstrapJson, "utf8").toString("base64");
@@ -418,9 +422,11 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
       appendExtraEnv(env, opts.env);
       env.set("DAYTONA_ELECTRON_LOG", logPath);
       env.set("OPENWORK_ELECTRON_REMOTE_DEBUG_PORT", String(port));
-      env.set("OPENWORK_ELECTRON_USERDATA", profileDir);
+      env.set("OPENWORK_ELECTRON_USERDATA", userDataDir);
       env.set("OPENWORK_WORKSPACE_DIR", "/workspace");
       env.set("OPENWORK_GOOGLE_WORKSPACE_ALLOW_PLAINTEXT_VAULT", "1");
+      const packagedBinary = process.env.OPENWORK_EVAL_ELECTRON_BINARY?.trim();
+      if (packagedBinary) env.set("OPENWORK_EVAL_ELECTRON_BINARY", packagedBinary);
       if (opts.bootstrap) env.set("OPENWORK_DESKTOP_BOOTSTRAP_PATH", bootstrapPath);
 
       const startCommand = `set -euo pipefail; cd /workspace; ${shellExport(env)} bash /workspace/.devcontainer/start-daytona-electron.sh --detach`;
@@ -464,8 +470,8 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
         hostKind: "daytona",
         cdpUrl,
         sandboxId: sandbox,
-        profileDir,
-        meta: { cdpPort: String(port), log: logPath },
+        profileDir: profileRoot,
+        meta: { cdpPort: String(port), log: logPath, profileOwner: callerOwnedProfile ? "caller" : "host" },
       };
       spawnedSurfaces.add(handle);
       return handle;
@@ -564,7 +570,9 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
 
     if (handle.kind === "electron" && port !== null) {
       const pattern = selfMatchSafePortPattern("electron", port);
-      const profilePattern = handle.profileDir ? electronProfilePattern(handle.profileDir) : "";
+      const profilePattern = handle.profileDir
+        ? electronProfilePattern(`${electronProfileRoot(handle.profileDir)}/electron-userdata`)
+        : "";
       const stopCommand = [
         profilePattern ? killGroupsForPatternCommand(profilePattern, "TERM") : "true",
         `pkill -f ${shellQuote(pattern)} || true`,
@@ -584,7 +592,7 @@ export function createDaytonaHost(options: DaytonaHostOptions): DaytonaHost {
         `verify Daytona Electron CDP stopped ${handle.name}`,
         { timeoutMs: 15_000 },
       );
-      if (handle.profileDir) {
+      if (handle.profileDir && handle.meta?.profileOwner !== "caller") {
         await checkedExec(
           exec,
           ["exec", sandbox, "--", `bash -lc ${shellQuote(`rm -rf ${shellQuote(electronProfileRoot(handle.profileDir))}`)}`],

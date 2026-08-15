@@ -3,6 +3,20 @@ import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  cacheVerifiedRecoveryArtifact,
+  compatibleRecoveryReleases,
+  compareStableVersions,
+  parseRecoveryManifest,
+  readCachedRecoveryArtifact,
+  readRecoveryState,
+  recordHealthyVersion,
+  recoveryManifestName,
+  recoveryVersionMarkers,
+  selectRecoveryArtifact,
+  stableVersion,
+  verifyCachedRecoveryArtifact,
+} from "./recovery.mjs";
 
 const ELECTRON_UPDATER_CHANNEL_FILENAME = "electron-updater-channel.v1.json";
 
@@ -148,7 +162,7 @@ function isVersionNewer(candidate, current) {
   return comparison === null ? candidate !== current : comparison > 0;
 }
 
-export function targetedStableUpdaterFeed(currentVersion, targetVersion) {
+export function targetedStableUpdaterFeed(currentVersion, targetVersion, allowOlder = false) {
   const normalizedTarget = normalizeStableTargetVersion(targetVersion);
   if (!normalizedTarget) {
     throw new Error("Target update version must use the stable x.y.z format.");
@@ -157,8 +171,10 @@ export function targetedStableUpdaterFeed(currentVersion, targetVersion) {
   if (comparison === null) {
     throw new Error("Installed version could not be validated for a targeted update.");
   }
-  if (comparison <= 0) {
-    throw new Error("Target update version must be newer than the installed version.");
+  if (comparison === 0 || (!allowOlder && comparison < 0)) {
+    throw new Error(allowOlder
+      ? "Recovery target version must differ from the installed version."
+      : "Target update version must be newer than the installed version.");
   }
   return `https://github.com/different-ai/openwork/releases/download/v${normalizedTarget}`;
 }
@@ -175,16 +191,23 @@ function updaterChannelState(app, channel, targetVersion = null, manifestChannel
   };
 }
 
-async function applyElectronUpdaterFeed(app, updater, targetVersion = null, manifestChannel = "latest") {
+async function applyElectronUpdaterFeed(app, updater, targetVersion = null, manifestChannel = "latest", allowOlder = false) {
   const channel = await readElectronUpdaterChannel(app, manifestChannel);
   if (targetVersion && channel !== "stable") {
     throw new Error("Version-specific update feeds are supported only on the stable channel.");
   }
-  const state = updaterChannelState(app, channel, targetVersion, manifestChannel);
+  const currentVersion = resolveAppVersion(app);
+  const state = targetVersion
+    ? {
+        channel,
+        feedUrl: targetedStableUpdaterFeed(currentVersion, targetVersion, allowOlder),
+        currentVersion,
+      }
+    : updaterChannelState(app, channel, null, manifestChannel);
   updater.allowPrerelease = state.channel === "alpha";
   // Moving from alpha back to stable can be a semver downgrade; still show
   // the latest stable so users can return to the stable channel deliberately.
-  updater.allowDowngrade = state.channel === "stable" && !targetVersion;
+  updater.allowDowngrade = state.channel === "stable" && (!targetVersion || allowOlder);
   // Select the manifest through the generic provider's own `channel` option
   // rather than AppUpdater#channel: that setter is a no-op unless the instance
   // was constructed with a channel, which would silently leave a custom
@@ -265,12 +288,20 @@ export function registerUpdaterIpc({
   loadAutoUpdater = () => import("electron-updater"),
   manifestChannel = "latest",
   shipItDefaultsDomain = SHIP_IT_DEFAULTS_DOMAIN,
+  electronNet = null,
+  shell = null,
+  distribution = "public",
+  platform = process.platform,
+  arch = process.arch,
+  env = process.env,
 }) {
   let autoUpdaterInstance = null;
   let autoUpdaterLoaded = false;
   let checkedUpdateVersion = null;
   let checkedUpdateTargetVersion = null;
   let updateDownloaded = false;
+  let recoveryReleases = [];
+  const recoveryWitness = { installRequests: [], openedArtifactUrls: [], quitRequested: false };
 
   function sendToRenderer(channel, data) {
     try {
@@ -330,6 +361,215 @@ export function registerUpdaterIpc({
     }
     return autoUpdaterInstance;
   }
+
+  async function resolveRecoveryArtifact(version) {
+    if (!electronNet?.fetch) return null;
+    try {
+      const manifestUrl = `https://github.com/different-ai/openwork/releases/download/v${version}/${recoveryManifestName(platform, arch, distribution)}`;
+      const response = await electronNet.fetch(manifestUrl, { headers: { Accept: "text/yaml, text/plain, */*" } });
+      if (!response.ok) return null;
+      return selectRecoveryArtifact(parseRecoveryManifest(await response.text()), {
+        version,
+        platform,
+        arch,
+        distribution,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async function cacheCurrentHealthyRelease() {
+    if (!electronNet?.fetch) return null;
+    const currentVersion = stableVersion(resolveAppVersion(app));
+    if (!currentVersion) return null;
+    const state = await readRecoveryState(app, distribution);
+    if (state.currentVersion !== currentVersion) return null;
+    const existing = await readCachedRecoveryArtifact(app, { platform, arch, distribution });
+    if (existing?.artifact.version === currentVersion) return existing;
+    const artifact = await resolveRecoveryArtifact(currentVersion);
+    if (!artifact) return null;
+    const filePath = await cacheVerifiedRecoveryArtifact({
+      app,
+      artifact,
+      fetchArtifact: (url) => electronNet.fetch(url),
+    });
+    return { artifact, filePath };
+  }
+
+  function evalRecoveryReleases() {
+    if (typeof env.OPENWORK_EVAL_RECOVERY_RELEASES === "string") {
+      try {
+        const target = String(env.OPENWORK_EVAL_RECOVERY_TARGET ?? "").split("-");
+        const targetPlatform = target[0];
+        const targetArch = target[1];
+        const targetDistribution = target.slice(2).join("-");
+        const raw = JSON.parse(env.OPENWORK_EVAL_RECOVERY_RELEASES);
+        const stable = Array.isArray(raw) ? raw.filter((release) =>
+          stableVersion(release?.version)
+          && release?.channel === "stable"
+          && release?.artifact?.platform === targetPlatform
+          && release?.artifact?.arch === targetArch
+          && release?.artifact?.distribution === targetDistribution
+          && typeof release?.artifact?.url === "string",
+        ) : [];
+        return stable.map((release, index) => ({
+          id: release.version,
+          version: release.version,
+          marking: index === 0 ? "current" : index === 1 ? "previous" : null,
+          artifact: release.artifact,
+          cachedFilePath: null,
+          eval: true,
+        }));
+      } catch {
+        return [];
+      }
+    }
+    if (typeof env.OPENWORK_EVAL_RECOVERY_CANDIDATES === "string") {
+      try {
+        const raw = JSON.parse(env.OPENWORK_EVAL_RECOVERY_CANDIDATES);
+        return Array.isArray(raw) ? raw.filter((candidate) =>
+          candidate?.verified === true
+          && stableVersion(candidate?.version)
+          && typeof candidate?.artifactUrl === "string",
+        ).map((candidate) => ({
+          id: candidate.version,
+          version: candidate.version,
+          marking: "previous",
+          artifact: { platform, arch, distribution, url: candidate.artifactUrl },
+          cachedFilePath: null,
+          eval: true,
+        })) : [];
+      } catch {
+        return [];
+      }
+    }
+    return null;
+  }
+
+  ipcMain.handle("openwork:recovery:recordHealthy", async () => {
+    return recordHealthyVersion(app, distribution, resolveAppVersion(app));
+  });
+
+  ipcMain.handle("openwork:recovery:list", async (_event, policy = {}) => {
+    const evalReleases = evalRecoveryReleases();
+    if (evalReleases) {
+      recoveryReleases = evalReleases;
+      return {
+        ok: true,
+        releases: recoveryReleases.map(({ id, version, marking }) => ({ id, version, marking })),
+      };
+    }
+    const state = await readRecoveryState(app, distribution);
+    const installedVersion = resolveAppVersion(app);
+    const markers = recoveryVersionMarkers(installedVersion, state);
+    const cached = await readCachedRecoveryArtifact(app, { platform, arch, distribution });
+    const catalogVersions = Array.isArray(policy?.versions) ? policy.versions : [];
+    const localOnly = catalogVersions.length === 0;
+    recoveryReleases = await compatibleRecoveryReleases({
+      versions: [
+        ...catalogVersions,
+        installedVersion,
+        ...(state.currentVersion ? [state.currentVersion] : []),
+        ...(state.previousVersion ? [state.previousVersion] : []),
+        ...(cached ? [cached.artifact.version] : []),
+      ],
+      currentVersion: markers.currentVersion,
+      previousVersion: markers.previousVersion,
+      minimumVersion: policy?.minimumVersion,
+      allowedVersions: policy?.allowedVersions,
+      resolveArtifact: async (version) =>
+        cached?.artifact.version === version
+          ? { ...cached.artifact, cachedFilePath: cached.filePath }
+          : localOnly ? null : resolveRecoveryArtifact(version),
+    });
+    return {
+      ok: true,
+      releases: recoveryReleases.map(({ id, version, marking }) => ({ id, version, marking })),
+    };
+  });
+
+  async function useRecoveryRelease(rawId) {
+    const id = stableVersion(rawId);
+    const release = id ? recoveryReleases.find((candidate) => candidate.id === id) : null;
+    if (!release) return { ok: false, reason: "That recovery version is no longer available. Retry the release list." };
+    if (release.eval) {
+      if (env.OPENWORK_EVAL_RECOVERY_CANDIDATES) {
+        recoveryWitness.installRequests.push({ version: release.version, artifactUrl: release.artifact.url });
+      } else {
+        recoveryWitness.openedArtifactUrls.push(release.artifact.url);
+      }
+      return { ok: true, action: "eval" };
+    }
+    if (compareStableVersions(release.version, resolveAppVersion(app)) === 0) {
+      return { ok: false, reason: "That version is already installed." };
+    }
+    if (release.cachedFilePath) {
+      if (!(await verifyCachedRecoveryArtifact(release.cachedFilePath, release.artifact))) {
+        return { ok: false, reason: "The cached recovery installer could not be verified. Retry while online." };
+      }
+      if (!shell?.openPath) return { ok: false, reason: "This package cannot open the recovery installer." };
+      const openError = await shell.openPath(release.cachedFilePath);
+      if (openError) return { ok: false, reason: openError };
+      return {
+        ok: true,
+        action: "installer",
+        message: "The verified installer is open. Follow the operating system steps to finish.",
+      };
+    }
+    const freshArtifact = await resolveRecoveryArtifact(release.version);
+    if (!freshArtifact || freshArtifact.url !== release.artifact.url || freshArtifact.sha512 !== release.artifact.sha512) {
+      return { ok: false, reason: "This installer could not be verified. Refresh the list and try again." };
+    }
+    const currentVersion = resolveAppVersion(app);
+    const updater = await ensureAutoUpdater();
+    if (updater && app.isPackaged) {
+      try {
+        await applyElectronUpdaterFeed(app, updater, release.version, manifestChannel, true);
+        const result = await updater.checkForUpdates();
+        if (compareVersions(result?.updateInfo?.version ?? "", release.version) !== 0) {
+          throw new Error("Recovery manifest resolved to a different version.");
+        }
+        if (compareStableVersions(release.version, currentVersion) === null) {
+          throw new Error("Installed version could not be validated.");
+        }
+        updater.autoInstallOnAppQuit = true;
+        await updater.downloadUpdate();
+        updater.quitAndInstall(false, true);
+        return { ok: true, action: "install" };
+      } catch (error) {
+        preventPendingUpdaterInstall(updater);
+        return { ok: false, reason: String(error?.message ?? error) };
+      }
+    }
+    if (!electronNet?.fetch || !shell?.openPath) return { ok: false, reason: "Automatic recovery is unavailable on this package." };
+    try {
+      const filePath = await cacheVerifiedRecoveryArtifact({
+        app,
+        artifact: freshArtifact,
+        fetchArtifact: (url) => electronNet.fetch(url),
+      });
+      if (!(await verifyCachedRecoveryArtifact(filePath, freshArtifact))) {
+        return { ok: false, reason: "The downloaded recovery installer could not be verified." };
+      }
+      const openError = await shell.openPath(filePath);
+      if (openError) return { ok: false, reason: openError };
+      return { ok: true, action: "installer", message: "The verified installer is open. Follow the operating system steps to finish." };
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error) };
+    }
+  }
+
+  ipcMain.handle("openwork:recovery:use", async (_event, id) => useRecoveryRelease(id));
+  ipcMain.handle("openwork:recovery:restorePrevious", async () => {
+    const previous = recoveryReleases.find((release) => release.marking === "previous");
+    return previous ? useRecoveryRelease(previous.id) : { ok: false, reason: "No verified previous version is available." };
+  });
+  ipcMain.handle("openwork:recovery:evalSnapshot", async () => ({
+    candidates: recoveryReleases,
+    releases: recoveryReleases,
+    ...recoveryWitness,
+  }));
 
   ipcMain.handle("openwork:updater:getChannel", async () => {
     const channel = await readElectronUpdaterChannel(app, manifestChannel);
@@ -436,6 +676,9 @@ export function registerUpdaterIpc({
       if (!checkedUpdateVersion) {
         return { ok: false, reason: "No update available." };
       }
+      await cacheCurrentHealthyRelease().catch((error) => {
+        console.warn("[updater] could not cache the current healthy installer", error);
+      });
       // Clear any stuck ShipIt state from a prior aborted install so this
       // download applies cleanly on quit.
       await cleanStaleUpdaterState(app, shipItDefaultsDomain);

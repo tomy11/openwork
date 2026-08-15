@@ -152,7 +152,29 @@ The existing Secret must contain the keys listed under `secret.keys`, especially
 - `BETTER_AUTH_SECRET`
 - `DEN_DB_ENCRYPTION_KEY`
 
-Set `DAYTONA_API_KEY` when `config.provisioner.mode` is `daytona`. Set `POLAR_ACCESS_TOKEN` when Polar feature gating is enabled. Set `OPENROUTER_MANAGEMENT_API_KEY` when enabling OpenWork Models management.
+Set optional `DATABASE_REDIS_URL` to enable Den API Redis-backed session and query caching. Set `DAYTONA_API_KEY` when `config.provisioner.mode` is `daytona`. Set `POLAR_ACCESS_TOKEN` when Polar feature gating is enabled. Set `OPENROUTER_MANAGEMENT_API_KEY` when enabling OpenWork Models management.
+
+Redis cache examples:
+
+```yaml
+secret:
+  values:
+    databaseRedisUrl: "rediss://redis-master.openwork.svc.cluster.local:6379"
+```
+
+Prefer `rediss://`. For hosting platforms that only provide a private internal
+`redis://` URL, such as Render internal Redis, explicitly acknowledge the trust
+boundary with `redis.allowInsecureInternal=true`. Use this only when the Redis
+endpoint is non-public and reachable only from trusted services in the private
+network.
+
+```yaml
+redis:
+  allowInsecureInternal: true
+secret:
+  values:
+    databaseRedisUrl: "redis://red-...:6379"
+```
 
 ## Custom CA certificates
 
@@ -431,10 +453,14 @@ observability:
     dsnSecret:
       existingSecret: openwork-sentry-runtime
       key: SENTRY_DSN
-    tracesSampleRate: "1"
+    tracesSampleRate: "0.01"
     environment: production
     release: "2026.07.11"
 ```
+
+Sentry Logs default to warning-and-error only through `SENTRY_LOG_LEVEL=warn`.
+Set `SENTRY_LOG_LEVEL=info` only during short debugging windows if you need
+successful request logs in Sentry; stdout JSON logs remain available either way.
 
 Sentry source-map upload is build-time behavior. Helm configures runtime pods
 after images already exist, so it cannot retroactively upload source maps for

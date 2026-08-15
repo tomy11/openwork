@@ -39,6 +39,11 @@ config:
     webAppHosts: openwork.example.com
     bootstrapAdminEmails: ""
     installLinksGatingEnabled: "false"
+    # Enable only after compatible Desktop MCP Apps hosts are deployed.
+    generatedArtifactViewsEnabled: "false"
+    # Imported, cached standard MCP Apps are on by default after the compatible
+    # Desktop host rollout. Set false for an operator rollback.
+    remoteMcpAppsEnabled: "true"
     connectLinkMode: exchange
     connectLinkKeyId: ""
     openworkAppConnectUrl: ""
@@ -123,7 +128,7 @@ observability:
     dsnSecret:
       existingSecret: ""
       key: SENTRY_DSN
-    tracesSampleRate: "1"
+    tracesSampleRate: "0.01"
     environment: ""
     release: ""
     dist: ""
@@ -134,11 +139,18 @@ customCa:
   existingConfigMap: ""
   key: ca.crt
 
+redis:
+  # Prefer rediss:// DATABASE_REDIS_URL values. Set this to true only for
+  # trusted private, non-public Redis endpoints that do not support TLS, such as
+  # some managed internal Redis URLs exposed by hosting platforms.
+  allowInsecureInternal: false
+
 secret:
   create: true
   existingSecret: ""
   keys:
     databaseUrl: DATABASE_URL
+    databaseRedisUrl: DATABASE_REDIS_URL
     betterAuthSecret: BETTER_AUTH_SECRET
     denDbEncryptionKey: DEN_DB_ENCRYPTION_KEY
     daytonaApiKey: DAYTONA_API_KEY
@@ -158,6 +170,7 @@ secret:
     connectLinkPrivateKey: DEN_CONNECT_LINK_PRIVATE_KEY
   values:
     databaseUrl: mysql://openwork:change-me@mysql:3306/openwork_den
+    databaseRedisUrl: ""
     betterAuthSecret: CHANGE_ME_32_CHARS_MINIMUM_BETTER_AUTH
     denDbEncryptionKey: CHANGE_ME_32_CHARS_MINIMUM_DB_ENCRYPTION
     daytonaApiKey: ""

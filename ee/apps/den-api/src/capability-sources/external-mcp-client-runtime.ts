@@ -5,10 +5,15 @@ import {
 import {
   abandonExternalMcpAuth as abandonWithEnterpriseClient,
   callExternalMcpTool as callWithEnterpriseClient,
+  callExternalMcpToolRaw as callRawWithEnterpriseClient,
   completeExternalMcpAuth as completeWithEnterpriseClient,
   connectExternalMcp as connectWithEnterpriseClient,
+  describeExternalMcpServer as describeWithEnterpriseClient,
   inspectExternalMcpToolCall as inspectWithEnterpriseClient,
+  listExternalMcpResources as listResourcesWithEnterpriseClient,
+  listExternalMcpResourceTemplates as listResourceTemplatesWithEnterpriseClient,
   listExternalMcpTools as listWithEnterpriseClient,
+  readExternalMcpResource as readResourceWithEnterpriseClient,
 } from "./enterprise-mcp-client-adapter.js"
 
 export type ExternalMcpClientRuntime = {
@@ -17,6 +22,11 @@ export type ExternalMcpClientRuntime = {
   abandonExternalMcpAuth: typeof abandonWithEnterpriseClient
   listExternalMcpTools: typeof listWithEnterpriseClient
   callExternalMcpTool: typeof callWithEnterpriseClient
+  callExternalMcpToolRaw: typeof callRawWithEnterpriseClient
+  describeExternalMcpServer: typeof describeWithEnterpriseClient
+  listExternalMcpResources: typeof listResourcesWithEnterpriseClient
+  listExternalMcpResourceTemplates: typeof listResourceTemplatesWithEnterpriseClient
+  readExternalMcpResource: typeof readResourceWithEnterpriseClient
   inspectExternalMcpToolCall: typeof inspectWithEnterpriseClient
 }
 
@@ -26,6 +36,11 @@ const enterpriseMcpClient: ExternalMcpClientRuntime = {
   abandonExternalMcpAuth: abandonWithEnterpriseClient,
   listExternalMcpTools: listWithEnterpriseClient,
   callExternalMcpTool: callWithEnterpriseClient,
+  callExternalMcpToolRaw: callRawWithEnterpriseClient,
+  describeExternalMcpServer: describeWithEnterpriseClient,
+  listExternalMcpResources: listResourcesWithEnterpriseClient,
+  listExternalMcpResourceTemplates: listResourceTemplatesWithEnterpriseClient,
+  readExternalMcpResource: readResourceWithEnterpriseClient,
   inspectExternalMcpToolCall: inspectWithEnterpriseClient,
 }
 
@@ -37,6 +52,11 @@ export const {
   abandonExternalMcpAuth,
   listExternalMcpTools,
   callExternalMcpTool,
+  callExternalMcpToolRaw,
+  describeExternalMcpServer,
+  listExternalMcpResources,
+  listExternalMcpResourceTemplates,
+  readExternalMcpResource,
   inspectExternalMcpToolCall,
 } = enterpriseMcpClient
 

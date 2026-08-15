@@ -3,9 +3,9 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { Archive, ArrowLeft, FileText, MoreHorizontal, Pencil, Plus, Server, Store, Terminal, Users, Webhook } from "lucide-react";
+import { AppWindow, Archive, ArrowLeft, Code2, FileText, MoreHorizontal, Pencil, Plus, Server, Store, Terminal, Users, Webhook } from "lucide-react";
 
-import { getNewPluginSkillRoute, getOrgAccessFlags, getPluginSkillRoute, getPluginsRoute } from "../../_lib/den-org";
+import { getNewPluginSkillRoute, getOrgAccessFlags, getPluginSkillRoute, getPluginsRoute, getRemoteMcpAppRoute } from "../../_lib/den-org";
 import { buttonVariants, DenButton } from "../../_components/ui/button";
 import { DenInput } from "../../_components/ui/input";
 import { DenTextarea } from "../../_components/ui/textarea";
@@ -14,24 +14,36 @@ import {
   type DenPlugin,
   type PluginHook,
   type PluginMcp,
+  type PluginProgram,
+  type PluginRemoteMcpApp,
   type PluginSkill,
   type PluginAgent,
   type PluginCommand,
   formatPluginTimestamp,
   useArchivePlugin,
+  useAttachProgramToPlugin,
   usePlugin,
   useUpdatePlugin,
 } from "./plugin-data";
-import { CatalogColorRail } from "./catalog-card-surface";
+import { CatalogIdentityTile } from "./catalog-identity-tile";
+import { type PluginAccessGrant, usePluginAccess } from "./plugin-access-data";
+import { PluginAccessSection } from "./plugin-access-section";
+import { SavedScriptDetailPanel } from "./saved-script-detail-panel";
+import { useLibrary, type LibraryProgramItem } from "./library-data";
 
 export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
   const router = useRouter();
   const { orgContext, orgSlug } = useOrgDashboard();
   const { data: plugin, isLoading, error, refetch } = usePlugin(pluginId);
+  const pluginAccessQuery = usePluginAccess(pluginId);
   const archivePlugin = useArchivePlugin();
+  const attachProgram = useAttachProgramToPlugin(pluginId);
+  const libraryQuery = useLibrary();
   const [actionsOpen, setActionsOpen] = useState(false);
   const [editPlugin, setEditPlugin] = useState<{ name: string; description: string } | null>(null);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [addProgramOpen, setAddProgramOpen] = useState(false);
+  const [selectedScriptId, setSelectedScriptId] = useState<string | null>(null);
   const actionsRef = useRef<HTMLDivElement | null>(null);
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
@@ -70,12 +82,28 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
     );
   }
 
+  if (selectedScriptId) {
+    return (
+      <div className="mx-auto max-w-[1180px] px-6 py-8 md:px-8">
+        <SavedScriptDetailPanel configObjectId={selectedScriptId} onClose={() => setSelectedScriptId(null)} />
+      </div>
+    );
+  }
+
   const marketplaces = plugin.marketplaces ?? [];
+  const creator = orgContext?.members.find((member) => member.id === plugin.createdByOrgMembershipId) ?? null;
+  const accessBlastRadius = getPluginAccessBlastRadius(
+    pluginAccessQuery.data ?? [],
+    orgContext?.teams ?? [],
+    orgContext?.currentMember.id ?? null,
+  );
   const missingLabels: string[] = [];
   if (plugin.agents.length === 0) missingLabels.push("agents");
   if (plugin.commands.length === 0) missingLabels.push("commands");
   if (plugin.hooks.length === 0) missingLabels.push("hooks");
   if (plugin.mcps.length === 0) missingLabels.push("MCP servers");
+  if (plugin.programs.length === 0) missingLabels.push("Programs");
+  if (plugin.apps.length === 0) missingLabels.push("Remote Apps");
 
   async function handleArchivePlugin() {
     try {
@@ -150,48 +178,58 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
         ) : null}
       </div>
 
-      <article className="overflow-hidden rounded-2xl border border-[var(--dls-border)] bg-[var(--dls-surface)]">
-        <div className="flex items-stretch">
-          <CatalogColorRail itemId={plugin.id} itemName={plugin.name} size="detail" />
-
-          <div className="min-w-0 flex-1 px-6 py-4">
-            <div className="flex flex-wrap items-center gap-2">
-              <h1 className="truncate text-[18px] font-semibold tracking-[-0.02em] text-gray-950">
-                {plugin.name}
-              </h1>
-              {plugin.version ? (
-                <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
-                  v{plugin.version}
-                </span>
-              ) : null}
-            </div>
-            {plugin.description ? (
-              <p className="mt-1 text-[13px] leading-[1.55] text-gray-500">{plugin.description}</p>
+      <article className="flex items-start gap-4">
+        <CatalogIdentityTile name={plugin.name} size="lg" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="truncate text-[18px] font-semibold tracking-[-0.02em] text-gray-950">
+              {plugin.name}
+            </h1>
+            {plugin.version ? (
+              <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
+                v{plugin.version}
+              </span>
             ) : null}
-
-            {marketplaces.length > 0 ? (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {marketplaces.map((marketplace) => (
-                  <span
-                    key={marketplace.id}
-                    className="inline-flex items-center gap-1 rounded-full bg-gray-50 px-2 py-0.5 text-[11px] text-gray-600"
-                  >
-                    <Store className="h-3 w-3 text-gray-400" aria-hidden />
-                    <span className="truncate">{marketplace.name}</span>
-                  </span>
-                ))}
-              </div>
-            ) : null}
-
-            <p className="mt-3 text-[11.5px] text-gray-400">
-              Updated {formatPluginTimestamp(plugin.updatedAt)}
-            </p>
           </div>
+          {plugin.description ? (
+            <p className="mt-1 text-[13px] leading-[1.55] text-gray-500">{plugin.description}</p>
+          ) : null}
+          <p className="mt-1.5 text-[11.5px] text-gray-400">
+            Added by {creator?.user.name ?? "Unknown member"} · {formatPluginTimestamp(plugin.createdAt)}
+          </p>
+          <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-[11.5px] text-gray-400">
+            {marketplaces.length > 0 ? (
+              <>
+                <Store className="h-3 w-3" aria-hidden />
+                <span className="truncate">
+                  {marketplaces.map((marketplace) => marketplace.name).join(" · ")}
+                </span>
+                <span>·</span>
+              </>
+            ) : null}
+            <span>Updated {formatPluginTimestamp(plugin.updatedAt)}</span>
+          </p>
         </div>
       </article>
 
       <div className="mt-6 space-y-6">
+        <PluginAccessSection
+          pluginId={plugin.id}
+          pluginCreatedByOrgMembershipId={plugin.createdByOrgMembershipId}
+          grants={pluginAccessQuery.data ?? []}
+          isLoading={pluginAccessQuery.isLoading}
+          error={pluginAccessQuery.error}
+        />
         <SkillsSection orgSlug={orgSlug} plugin={plugin} />
+        <ProgramsSection
+          plugin={plugin}
+          onAdd={() => {
+            attachProgram.reset();
+            setAddProgramOpen(true);
+          }}
+          onOpen={(programId) => setSelectedScriptId(programId)}
+        />
+        <RemoteMcpAppsSection plugin={plugin} orgSlug={orgSlug} />
         <PrimitiveSection icon={Users} label="Agents" items={plugin.agents} render={renderAgentRow} />
         <PrimitiveSection icon={Terminal} label="Commands" items={plugin.commands} render={renderCommandRow} />
         <PrimitiveSection icon={Webhook} label="Hooks" items={plugin.hooks} render={renderHookRow} />
@@ -219,12 +257,27 @@ export function PluginDetailScreen({ pluginId }: { pluginId: string }) {
       <ArchivePluginDialog
         open={archiveOpen}
         pluginName={plugin.name}
+        affectedPeopleCount={accessBlastRadius.peopleCount}
+        affectedTeamCount={accessBlastRadius.teamCount}
         busy={archivePlugin.isPending}
         error={archivePlugin.error}
         onClose={() => {
           if (!archivePlugin.isPending) setArchiveOpen(false);
         }}
         onConfirm={() => void handleArchivePlugin()}
+      />
+      <AddProgramDialog
+        open={addProgramOpen}
+        plugin={plugin}
+        programs={(libraryQuery.data ?? []).filter((item): item is LibraryProgramItem => item.type === "program")}
+        busy={attachProgram.isPending}
+        error={attachProgram.error}
+        onClose={() => {
+          if (!attachProgram.isPending) setAddProgramOpen(false);
+        }}
+        onAttach={(programId) => {
+          void attachProgram.mutateAsync(programId).then(() => setAddProgramOpen(false)).catch(() => undefined);
+        }}
       />
     </div>
   );
@@ -324,6 +377,8 @@ function EditPluginDialog({
 function ArchivePluginDialog({
   open,
   pluginName,
+  affectedPeopleCount,
+  affectedTeamCount,
   busy,
   error,
   onClose,
@@ -331,6 +386,8 @@ function ArchivePluginDialog({
 }: {
   open: boolean;
   pluginName: string;
+  affectedPeopleCount: number;
+  affectedTeamCount: number;
   busy: boolean;
   error: unknown;
   onClose: () => void;
@@ -354,6 +411,11 @@ function ArchivePluginDialog({
         <p id="archive-plugin-description" className="mt-2 text-[13px] leading-6 text-gray-500">
           This removes the plugin from active Den lists without deleting its historical skills, marketplace relationships, or audit trail.
         </p>
+        {affectedPeopleCount > 0 ? (
+          <p className="mt-3 text-[12.5px] font-medium text-amber-700">
+            This removes it for {affectedPeopleCount} people across {affectedTeamCount} {affectedTeamCount === 1 ? "team" : "teams"}.
+          </p>
+        ) : null}
         {error ? (
           <p className="mt-3 text-[12.5px] text-red-600">
             {error instanceof Error ? error.message : "Failed to archive plugin."}
@@ -370,6 +432,29 @@ function ArchivePluginDialog({
       </div>
     </div>
   );
+}
+
+function getPluginAccessBlastRadius(
+  grants: PluginAccessGrant[],
+  teams: Array<{ id: string; memberIds: string[] }>,
+  currentMemberId: string | null,
+) {
+  const people = new Set<string>();
+  const teamIds = new Set<string>();
+  const teamsById = new Map(teams.map((team) => [team.id, team]));
+
+  for (const grant of grants) {
+    if (grant.orgMembershipId) people.add(grant.orgMembershipId);
+    if (grant.teamId) teamIds.add(grant.teamId);
+  }
+  for (const teamId of teamIds) {
+    for (const memberId of teamsById.get(teamId)?.memberIds ?? []) {
+      people.add(memberId);
+    }
+  }
+  if (currentMemberId) people.delete(currentMemberId);
+
+  return { peopleCount: people.size, teamCount: teamIds.size };
 }
 
 function formatMissingList(labels: string[]) {
@@ -522,6 +607,139 @@ function renderCommandRow(command: PluginCommand) {
         <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{command.description}</p>
       ) : null}
     </div>
+  );
+}
+
+function ProgramsSection({ plugin, onAdd, onOpen }: { plugin: DenPlugin; onAdd: () => void; onOpen: (programId: string) => void }) {
+  return (
+    <section>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400">
+            <Code2 className="h-3.5 w-3.5" />
+            Programs
+          </h2>
+          <p className="mt-1 text-[12px] text-gray-400">Reusable Code Mode Programs shared with this Plugin and its Marketplace audiences.</p>
+        </div>
+        <DenButton size="sm" onClick={onAdd}><Plus className="h-3.5 w-3.5" aria-hidden />Add Program</DenButton>
+      </div>
+      {plugin.programs.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-gray-200 bg-white px-5 py-8 text-center">
+          <p className="text-[14px] font-medium text-gray-900">No Programs in this Plugin yet.</p>
+          <p className="mt-1 text-[12.5px] text-gray-500">Create a Program from a successful Code Mode run and choose this Plugin, or attach an existing Program.</p>
+        </div>
+      ) : (
+        <div className="grid gap-2">{plugin.programs.map((program) => renderProgramRow(program, () => onOpen(program.id)))}</div>
+      )}
+    </section>
+  );
+}
+
+function RemoteMcpAppsSection({ plugin, orgSlug }: { plugin: DenPlugin; orgSlug: string | null }) {
+  if (plugin.apps.length === 0) return null;
+  return (
+    <section>
+      <div className="mb-3">
+        <h2 className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-400">
+          <AppWindow className="h-3.5 w-3.5" />
+          Remote Apps
+        </h2>
+        <p className="mt-1 text-[12px] text-gray-400">Portable MCP Apps installed inside this Plugin and shared with the same audiences.</p>
+      </div>
+      <div className="grid gap-2">
+        {plugin.apps.map((app) => renderRemoteMcpAppRow(app, getRemoteMcpAppRoute(orgSlug, app.id)))}
+      </div>
+    </section>
+  );
+}
+
+function AddProgramDialog({
+  open,
+  plugin,
+  programs,
+  busy,
+  error,
+  onClose,
+  onAttach,
+}: {
+  open: boolean;
+  plugin: DenPlugin;
+  programs: LibraryProgramItem[];
+  busy: boolean;
+  error: unknown;
+  onClose: () => void;
+  onAttach: (programId: string) => void;
+}) {
+  const existing = new Set(plugin.programs.map((program) => program.id));
+  const available = programs.filter((program) => !existing.has(program.id) && program.role === "manager");
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 px-4 py-6" onClick={busy ? undefined : onClose}>
+      <div role="dialog" aria-modal="true" aria-labelledby="add-program-title" className="w-full max-w-[520px] rounded-2xl border border-gray-100 bg-white p-6 shadow-[0_24px_60px_-24px_rgba(15,23,42,0.4)]" onClick={(event) => event.stopPropagation()}>
+        <h2 id="add-program-title" className="text-[16px] font-semibold tracking-[-0.01em] text-gray-950">Add a Program to {plugin.name}</h2>
+        <p className="mt-1 text-[13px] leading-6 text-gray-500">Programs in this Plugin are visible to the same people and teams as the Plugin, including Marketplace audiences.</p>
+        <div className="mt-4 max-h-72 space-y-2 overflow-y-auto">
+          {available.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center text-[13px] text-gray-500">No unattached Programs you manage are available. Create one from a successful Code Mode run and choose this Plugin when saving.</div>
+          ) : available.map((program) => (
+            <button key={program.id} type="button" disabled={busy} onClick={() => onAttach(program.id)} className="w-full rounded-xl border border-gray-100 px-4 py-3 text-left transition hover:border-gray-200 hover:bg-gray-50 disabled:opacity-60">
+              <p className="text-[14px] font-semibold text-gray-900">{program.name}</p>
+              <p className="mt-0.5 text-[12.5px] text-gray-500">{program.plugin ? `Currently in ${program.plugin.name}` : "Shared directly"}{program.description ? ` · ${program.description}` : ""}</p>
+            </button>
+          ))}
+        </div>
+        {error ? <p className="mt-3 text-[12.5px] text-red-600">{error instanceof Error ? error.message : "Failed to add Program."}</p> : null}
+        <div className="mt-5 flex justify-end"><DenButton variant="secondary" onClick={onClose} disabled={busy}>Close</DenButton></div>
+      </div>
+    </div>
+  );
+}
+
+function renderProgramRow(program: PluginProgram, onOpen: () => void) {
+  return (
+    <button
+      key={program.id}
+      type="button"
+      onClick={onOpen}
+      className="w-full rounded-xl border border-gray-100 bg-white px-4 py-3 text-left transition hover:border-gray-200 hover:bg-gray-50"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="truncate text-[14px] font-semibold tracking-[-0.01em] text-gray-900">{program.name}</p>
+        <span className="rounded-full bg-gray-50 px-2 py-0.5 text-[11px] text-gray-500">
+          {program.requiredCapabilityCount} read-only capabilit{program.requiredCapabilityCount === 1 ? "y" : "ies"}
+        </span>
+      </div>
+      {program.description ? (
+        <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{program.description}</p>
+      ) : null}
+      <p className="mt-2 text-[11px] text-gray-400">
+        {program.versionId ? `Current version ${program.versionId.slice(0, 8)}` : "No published version"}
+        {program.outputSchema ? " · Validated output" : ""}
+      </p>
+    </button>
+  );
+}
+
+function renderRemoteMcpAppRow(app: PluginRemoteMcpApp, href: string) {
+  return (
+    <Link
+      key={app.id}
+      href={href}
+      className="block rounded-xl border border-gray-100 bg-white px-4 py-3 transition hover:border-gray-200 hover:bg-gray-50"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="truncate text-[14px] font-semibold tracking-[-0.01em] text-gray-900">{app.name}</p>
+        <span className="rounded-full bg-gray-50 px-2 py-0.5 text-[11px] text-gray-500">
+          Standard MCP App resource
+        </span>
+      </div>
+      {app.description ? <p className="mt-0.5 line-clamp-2 text-[12.5px] leading-[1.55] text-gray-500">{app.description}</p> : null}
+      <p className="mt-2 text-[11px] text-gray-400">
+        {app.version ? `Installed revision ${app.version}` : "Installed revision"}
+        {app.sourceUrl ? " · Cached from a published URL" : ""}
+      </p>
+    </Link>
   );
 }
 

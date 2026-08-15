@@ -48,14 +48,14 @@ test("email password sign-in parsing normalizes the account identifier", async (
     method: "POST",
   })
 
-  await expect(authProtection.readEmailPasswordSignInAttempt(request)).resolves.toEqual({
+  await expect(authProtection.readEmailSignInAttempt(request)).resolves.toEqual({
     email: "user@example.com",
   })
 
   const ignored = new Request("http://den.local/api/auth/sign-in/social", {
     method: "POST",
   })
-  await expect(authProtection.readEmailPasswordSignInAttempt(ignored)).resolves.toBeNull()
+  await expect(authProtection.readEmailSignInAttempt(ignored)).resolves.toBeNull()
 })
 
 test("breached password screening reads password fields only on password creation routes", async () => {
@@ -122,39 +122,164 @@ test("breached password response blocks compromised passwords and fails closed o
   })
 })
 
-test("short password response rejects passwords below the minimum length on creation routes", async () => {
+test("password policy response rejects passwords that miss mandatory requirements on creation routes", async () => {
   const tooShort = new Request("http://den.local/api/auth/sign-up/email", {
-    body: JSON.stringify({ email: "user@example.com", password: "short" }),
+    body: JSON.stringify({ email: "user@example.com", password: "Aa1!" }),
     headers: { "content-type": "application/json" },
     method: "POST",
   })
-  const rejected = await authProtection.getShortPasswordResponse(tooShort)
+  const rejected = await authProtection.getPasswordPolicyResponse(tooShort)
   expect(rejected?.status).toBe(400)
   await expect(rejected?.json()).resolves.toEqual({
     error: "password_too_short",
     message: `Password must be at least ${authProtection.MIN_PASSWORD_LENGTH} characters.`,
   })
 
-  const atBoundary = new Request("http://den.local/api/auth/sign-up/email", {
-    body: JSON.stringify({ email: "user@example.com", password: "a".repeat(authProtection.MIN_PASSWORD_LENGTH) }),
+  const tooLong = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: `Aa1!${"x".repeat(authProtection.MAX_PASSWORD_LENGTH - 3)}` }),
     headers: { "content-type": "application/json" },
     method: "POST",
   })
-  await expect(authProtection.getShortPasswordResponse(atBoundary)).resolves.toBeNull()
+  const overLimit = await authProtection.getPasswordPolicyResponse(tooLong)
+  expect(overLimit?.status).toBe(400)
+  await expect(overLimit?.json()).resolves.toEqual({
+    error: "password_too_long",
+    message: `Password must be at most ${authProtection.MAX_PASSWORD_LENGTH} characters.`,
+  })
 
-  const longEnough = new Request("http://den.local/api/auth/sign-up/email", {
-    body: JSON.stringify({ email: "user@example.com", password: "longenough" }),
+  const missingUppercase = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "lowercase1!" }),
     headers: { "content-type": "application/json" },
     method: "POST",
   })
-  await expect(authProtection.getShortPasswordResponse(longEnough)).resolves.toBeNull()
+  const noUppercase = await authProtection.getPasswordPolicyResponse(missingUppercase)
+  expect(noUppercase?.status).toBe(400)
+  await expect(noUppercase?.json()).resolves.toEqual({
+    error: "password_missing_uppercase",
+    message: "Password must include at least one uppercase letter.",
+  })
+
+  const missingLowercase = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "UPPERCASE1!" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const noLowercase = await authProtection.getPasswordPolicyResponse(missingLowercase)
+  expect(noLowercase?.status).toBe(400)
+  await expect(noLowercase?.json()).resolves.toEqual({
+    error: "password_missing_lowercase",
+    message: "Password must include at least one lowercase letter.",
+  })
+
+  const missingSpecialCharacter = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "Password1" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const noSpecialCharacter = await authProtection.getPasswordPolicyResponse(missingSpecialCharacter)
+  expect(noSpecialCharacter?.status).toBe(400)
+  await expect(noSpecialCharacter?.json()).resolves.toEqual({
+    error: "password_missing_special_character",
+    message: "Password must include at least one special character.",
+  })
+
+  const missingDigit = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "Password!" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const noDigit = await authProtection.getPasswordPolicyResponse(missingDigit)
+  expect(noDigit?.status).toBe(400)
+  await expect(noDigit?.json()).resolves.toEqual({
+    error: "password_missing_digit",
+    message: "Password must include at least one digit.",
+  })
+
+  const validSignup = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "ValidPass1!" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  await expect(authProtection.getPasswordPolicyResponse(validSignup)).resolves.toBeNull()
+
+  const validChange = new Request("http://den.local/api/auth/change-password", {
+    body: JSON.stringify({ newPassword: "ChangedPass1!" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  await expect(authProtection.getPasswordPolicyResponse(validChange)).resolves.toBeNull()
+
+  const invalidChange = new Request("http://den.local/api/auth/change-password", {
+    body: JSON.stringify({ newPassword: "ChangedPass!" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const rejectedChange = await authProtection.getPasswordPolicyResponse(invalidChange)
+  expect(rejectedChange?.status).toBe(400)
+  await expect(rejectedChange?.json()).resolves.toMatchObject({
+    error: "password_missing_digit",
+  })
 
   const signIn = new Request("http://den.local/api/auth/sign-in/email", {
     body: JSON.stringify({ email: "user@example.com", password: "x" }),
     headers: { "content-type": "application/json" },
     method: "POST",
   })
-  await expect(authProtection.getShortPasswordResponse(signIn)).resolves.toBeNull()
+  await expect(authProtection.getPasswordPolicyResponse(signIn)).resolves.toBeNull()
+})
+
+test("weak password response rejects low-strength signup passwords with feedback", async () => {
+  const weak = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", name: "Example User", password: "aaaaaaaa" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const rejected = await authProtection.getWeakPasswordResponse(weak)
+  expect(rejected?.status).toBe(400)
+  await expect(rejected?.json()).resolves.toMatchObject({
+    error: "password_too_weak",
+    message: "Repeated characters like \"aaa\" are easy to guess.",
+    feedback: {
+      warning: "Repeated characters like \"aaa\" are easy to guess.",
+      suggestions: [
+        "Add more words that are less common.",
+        "Avoid repeated words and characters.",
+      ],
+    },
+  })
+
+  const commonPattern = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", name: "Example User", password: "Password1*" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  const predictable = await authProtection.getWeakPasswordResponse(commonPattern)
+  expect(predictable?.status).toBe(400)
+  await expect(predictable?.json()).resolves.toMatchObject({
+    error: "password_too_weak",
+    message: "This is similar to a commonly used password.",
+    feedback: {
+      warning: "This is similar to a commonly used password.",
+      suggestions: [
+        "Add more words that are less common.",
+        "Capitalize more than the first letter.",
+      ],
+    },
+  })
+
+  const strong = new Request("http://den.local/api/auth/sign-up/email", {
+    body: JSON.stringify({ email: "user@example.com", name: "Example User", password: "correct horse battery staple" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  await expect(authProtection.getWeakPasswordResponse(strong)).resolves.toBeNull()
+
+  const signIn = new Request("http://den.local/api/auth/sign-in/email", {
+    body: JSON.stringify({ email: "user@example.com", password: "aaaaaaaa" }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  })
+  await expect(authProtection.getWeakPasswordResponse(signIn)).resolves.toBeNull()
 })
 
 test("breached password response can skip screening for isolated deployments", async () => {

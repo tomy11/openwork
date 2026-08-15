@@ -6,6 +6,9 @@ import { parseInvitationPreviewPayload } from "../app/(den)/_lib/den-org";
 const joinOrgScreenPath = fileURLToPath(
   new URL("../app/(den)/_components/join-org-screen.tsx", import.meta.url),
 );
+const authPanelPath = fileURLToPath(
+  new URL("../app/(den)/_components/auth-panel.tsx", import.meta.url),
+);
 const onboardingShellPath = fileURLToPath(
   new URL("../app/(den)/_components/onboarding-shell.tsx", import.meta.url),
 );
@@ -27,6 +30,10 @@ const brandIdentityPath = fileURLToPath(
 
 function readJoinOrgScreenSource() {
   return readFileSync(joinOrgScreenPath, "utf8");
+}
+
+function readAuthPanelSource() {
+  return readFileSync(authPanelPath, "utf8");
 }
 
 function readOnboardingShellSource() {
@@ -101,7 +108,10 @@ describe("join organization invite clean layout contract", () => {
     expect(source).toMatch(/<AuthPanel[\s\S]*?\blockEmail\b/);
     expect(source).toMatch(/<AuthPanel[\s\S]*?\bhideEmailField\b/);
     expect(source).toMatch(/<AuthPanel[\s\S]*?\bhideLockedEmailSummary\b/);
+    expect(source).toMatch(/<AuthPanel[\s\S]*?\bemailFirstFlow\b/);
+    expect(source).toMatch(/<AuthPanel[\s\S]*?\bresolveEmailFirstOnPrefill\b/);
     expect(source).toContain('title: "Create your account."');
+    expect(source).toContain("Choose a name and a password. Your email stays locked to");
     expect(source).toContain('title: "Sign in to continue."');
     expect(source).not.toContain("title: `Join ${preview.organization.name}.`");
     expect(source).toContain("Not now");
@@ -110,6 +120,29 @@ describe("join organization invite clean layout contract", () => {
     expect(source).toContain('router.replace("/");');
     expect(source).not.toContain("Decline invitation");
     expect(source).not.toContain("Cancel invitation");
+  });
+
+  test("resolves the invited email auth method before showing invite credentials", () => {
+    const source = readJoinOrgScreenSource();
+    const authPanelSource = readAuthPanelSource();
+
+    expect(source).toContain("resolveEmailFirstOnPrefill");
+    expect(source).toContain("emailFirstInvitationId={preview.invitation.id}");
+    expect(authPanelSource).toContain("function getLoginOptionsPath(targetEmail: string)");
+    expect(authPanelSource).toContain('params.set("invite", emailFirstInvite);');
+    expect(authPanelSource).toContain('emailFirstStep === "sso"');
+    expect(authPanelSource).toContain("startEmailFirstSso");
+    expect(authPanelSource).toContain("resolvedLoginOptionPrefillRef");
+    expect(authPanelSource).toMatch(/emailFirstStep === "new_account"[\s\S]*?!hideEmailField/);
+    expect(authPanelSource).toMatch(/emailFirstStep === "new_account"[\s\S]*?!hideSocialAuth/);
+  });
+
+  test("shows password strength feedback only on signup password fields", () => {
+    const authPanelSource = readAuthPanelSource();
+
+    expect(authPanelSource).toMatch(/emailFirstStep === "new_account"[\s\S]*?signupPasswordFeedback/);
+    expect(authPanelSource).toContain('visibleAuthMode === "sign-up" && signupPasswordFeedback');
+    expect(authPanelSource).not.toMatch(/emailFirstStep === "password"[\s\S]{0,500}signupPasswordFeedback/);
   });
 
   test("preserves invitation preview, account switching, status, and accept behavior", () => {
@@ -205,9 +238,15 @@ describe("join organization invite clean layout contract", () => {
     const installSource = readFileSync(installScreenPath, "utf8");
     const identitySource = readFileSync(brandIdentityPath, "utf8");
 
-    expect(successSource).toContain("Get the desktop app");
+    expect(successSource).toContain("downloadCtaLabel");
+    expect(successSource).toContain("Already have OpenWork? Open it.");
+    expect(successSource).toContain("buildInstallDownloadHref");
+    expect(successSource).toContain("startInstallerDownload");
+    expect(successSource).not.toContain("window.location.assign(await createOrganizationInstallLink");
+    expect(successSource).not.toContain("Get the desktop app");
     expect(successSource).toContain("Return to OpenWork");
     expect(successSource).toContain("desktopAuthRequested");
+    expect(successSource).toContain('data-testid="join-org-connected"');
     expect(successSource).toContain("Continue in the browser");
     expect(successSource).toContain("Email me the download link");
     expect(successSource).not.toContain("capabilities");

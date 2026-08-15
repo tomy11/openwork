@@ -189,9 +189,11 @@ OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.25
 `docker-compose.den-dev.yml` forwards the full OTLP runtime surface to both Den
 services: base and per-signal endpoints, base and per-signal protocol values,
 headers, per-signal exporters, and sampler settings. It also forwards runtime
-Sentry settings (`SENTRY_DSN`, `SENTRY_TRACES_SAMPLE_RATE`,
+Sentry settings (`SENTRY_DSN`, `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_LOG_LEVEL`,
 `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`, and `SENTRY_DIST`) while keeping
-distinct `OTEL_SERVICE_NAME` defaults for Den API and Den Web.
+distinct `OTEL_SERVICE_NAME` defaults for Den API and Den Web. Sentry tracing
+defaults to `0.01`; `SENTRY_LOG_LEVEL` defaults to `warn` so successful request
+logs stay on stdout unless explicitly enabled for Sentry.
 
 Sentry source-map upload is build-time only. Runtime Compose and Helm settings
 cannot upload maps after the image is built. The Dockerfiles default their
@@ -354,7 +356,7 @@ docker compose up --build
 
 Then open:
 
-- `http://127.0.0.1:8787/ui`
+- `http://127.0.0.1:8787/health`
 
 ### Config
 

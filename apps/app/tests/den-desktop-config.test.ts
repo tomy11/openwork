@@ -7,10 +7,70 @@ import {
   selectEffectiveOnboardingPrompts,
 } from "@openwork/types/den/desktop-policies";
 import { createDenClient, normalizeDenDesktopConfig } from "../src/app/lib/den";
+import {
+  CONNECT_STATE_PUSH_MAX_ATTEMPTS,
+  CONNECT_STATE_PUSH_RETRY_DELAY_MS,
+  deliverConnectState,
+  resolveConnectStateToPush,
+} from "../src/react-app/domains/cloud/desktop-config-provider";
 
 const originalFetch = globalThis.fetch;
 
 describe("Den desktop config client", () => {
+  test("only pushes an explicit Connect policy", () => {
+    expect(resolveConnectStateToPush({})).toBeNull();
+    expect(resolveConnectStateToPush({ connectEnabled: false })).toBe(false);
+    expect(resolveConnectStateToPush({ connectEnabled: true })).toBe(true);
+  });
+
+  test("retries the Connect push until the local server accepts it", async () => {
+    let attempts = 0;
+    const waits: number[] = [];
+
+    const delivered = await deliverConnectState(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) return false;
+        if (attempts === 2) throw new Error("local server starting");
+        return true;
+      },
+      async (delayMs) => {
+        waits.push(delayMs);
+      },
+      () => false,
+    );
+
+    expect(delivered).toBe(true);
+    expect(attempts).toBe(3);
+    expect(waits).toEqual([CONNECT_STATE_PUSH_RETRY_DELAY_MS, CONNECT_STATE_PUSH_RETRY_DELAY_MS]);
+  });
+
+  test("stops the Connect push when cancelled or exhausted", async () => {
+    let cancelledAttempts = 0;
+    const cancelled = await deliverConnectState(
+      async () => {
+        cancelledAttempts += 1;
+        return false;
+      },
+      async () => {},
+      () => cancelledAttempts >= 2,
+    );
+    expect(cancelled).toBe(false);
+    expect(cancelledAttempts).toBe(2);
+
+    let exhaustedAttempts = 0;
+    const exhausted = await deliverConnectState(
+      async () => {
+        exhaustedAttempts += 1;
+        return false;
+      },
+      async () => {},
+      () => false,
+    );
+    expect(exhausted).toBe(false);
+    expect(exhaustedAttempts).toBe(CONNECT_STATE_PUSH_MAX_ATTEMPTS);
+  });
+
   afterEach(() => {
     Object.defineProperty(globalThis, "fetch", {
       configurable: true,

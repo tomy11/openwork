@@ -140,7 +140,7 @@ test.skipIf(!apiUrl || !appSpecsEnabled)(title, async () => {
   await signInDesktopAs(app, den, member);
   const { workspaceId } = await createAndSelectWorkspace(app, { path: workspacePath });
   await go(app, `/workspace/${workspaceId}/settings/extensions/connections`);
-  await waitFor(app, `window.location.hash.includes("/extensions") && document.body.innerText.includes("Extensions")`, {
+  await waitFor(app, `window.location.hash.includes("/extensions") && document.body.innerText.includes("Library")`, {
     timeoutMs: 60_000,
     label: "extensions connections route (app canonicalises away /settings)",
   });

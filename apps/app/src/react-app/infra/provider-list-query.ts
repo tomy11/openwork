@@ -40,6 +40,13 @@ export async function refreshProviderListQueries(queryClient: QueryClient) {
   await queryClient.refetchQueries({ queryKey: PROVIDER_LIST_QUERY_ROOT, type: "active" });
 }
 
+/** Drop account-sensitive provider snapshots when the Den session ends. */
+export function clearProviderListQueries(queryClient: QueryClient) {
+  queryClient.removeQueries({ queryKey: PROVIDER_LIST_QUERY_ROOT });
+  connectedProviderSnapshots.clear();
+  connectedProviderSnapshotChanges.clear();
+}
+
 export async function fetchProviderList(input: {
   client: Client;
   baseUrl?: string | null;

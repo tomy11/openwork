@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
-const srcRoot = new URL("../src", import.meta.url).pathname
+const srcRoot = fileURLToPath(new URL("../src", import.meta.url))
 
 const routeMethods = ["get", "post", "patch", "put", "delete", "all", "on"]
 const accessPolicyMarkers = [
@@ -13,6 +14,7 @@ const accessPolicyMarkers = [
   "adminRoute",
   "signedWebhookRoute",
   "tokenRoute",
+  "cloudTransportRoute",
   "delegatedRoute",
 ]
 
@@ -115,5 +117,12 @@ describe("Den API route access policies", () => {
       .filter((route) => !accessPolicyMarkers.some((marker) => route.call.includes(marker)))
 
     expect(missingPolicy.map((route) => `${route.filePath}:${route.line}`)).toEqual([])
+  })
+
+  test("organization analytics requires an admin role", () => {
+    const analyticsRoute = findRouteCalls(join(srcRoot, "routes/telemetry/index.ts"))
+      .find((route) => route.call.includes('"/v1/telemetry/analytics"'))
+
+    expect(analyticsRoute?.call).toContain('orgRoleRoute(["admin"])')
   })
 })

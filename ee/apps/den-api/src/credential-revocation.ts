@@ -5,6 +5,7 @@ import {
   OAuthAccessTokenTable,
   OAuthRefreshTokenTable,
 } from "@openwork-ee/den-db/schema"
+import { cache } from "./cache.js"
 import { db } from "./db.js"
 
 type OrganizationId = typeof MemberTable.$inferSelect.organizationId
@@ -25,7 +26,7 @@ export async function revokeMembershipSessionCredentials(input: {
   }
 
   const sessions = await db
-    .select({ id: AuthSessionTable.id })
+    .select({ id: AuthSessionTable.id, token: AuthSessionTable.token })
     .from(AuthSessionTable)
     .where(eq(AuthSessionTable.userId, input.userId))
 
@@ -35,6 +36,7 @@ export async function revokeMembershipSessionCredentials(input: {
     await db
       .delete(AuthSessionTable)
       .where(inArray(AuthSessionTable.id, sessions.map((session) => session.id)))
+    await Promise.all(sessions.map((session) => cache.auth.deleteSession(session.token)))
   }
 
   const oauthAccessTokens = await db

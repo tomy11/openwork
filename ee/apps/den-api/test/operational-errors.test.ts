@@ -18,7 +18,7 @@ test("OAuth token errors include cache headers and a support reference", async (
 
   expect(response.headers.get("Cache-Control")).toBe("no-store")
   expect(response.headers.get("Pragma")).toBe("no-cache")
-  expect(response.headers.get("X-Request-Id")).toBe("req_oauth_token")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
   const body: unknown = await response.json()
   expect(isRecord(body) && body.reference_id).toBe("req_oauth_token")
 })
@@ -52,7 +52,7 @@ test("OAuth text/plain JSON 429 errors are parsed and normalized", async () => {
   expect(response.headers.get("Cache-Control")).toBe("no-store")
   expect(response.headers.get("Pragma")).toBe("no-cache")
   expect(response.headers.get("Retry-After")).toBe("23")
-  expect(response.headers.get("X-Request-Id")).toBe("req_text_plain_rate_limit")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
 
   const body: unknown = await response.json()
   expect(body).toMatchObject({
@@ -102,7 +102,7 @@ test("streaming non-JSON MCP errors keep their body and content type", async () 
   )
 
   expect(response.headers.get("content-type")).toBe("text/event-stream")
-  expect(response.headers.get("X-Request-Id")).toBe("req_mcp_stream")
+  expect(response.headers.get("X-Request-Id")).toBeNull()
   await expect(response.text()).resolves.toBe("data: retry\n\n")
 })
 
@@ -123,7 +123,7 @@ test("streaming non-JSON MCP errors are not parsed as JSON", async () => {
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("text/event-stream")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_pending_stream")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -144,7 +144,7 @@ test("streaming JSON-seq MCP errors are not buffered as finite JSON", async () =
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("application/json-seq")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_json_seq")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -165,7 +165,7 @@ test("streaming stream+json MCP errors are not buffered as finite JSON", async (
   expect(result).toBeInstanceOf(Response)
   if (result instanceof Response) {
     expect(result.headers.get("content-type")).toBe("application/stream+json")
-    expect(result.headers.get("X-Request-Id")).toBe("req_mcp_stream_json")
+    expect(result.headers.get("X-Request-Id")).toBeNull()
   }
 })
 
@@ -189,7 +189,7 @@ test("operational route error logging omits provider-controlled exception text",
     expect(response.status).toBe(500)
     expect(response.headers.get("Cache-Control")).toBe("no-store")
     expect(response.headers.get("Pragma")).toBe("no-cache")
-    expect(response.headers.get("X-Request-Id")).toBe("req_safe_log")
+    expect(response.headers.get("X-Request-Id")).toBeNull()
     const body: unknown = await response.json()
     expect(body).toMatchObject({
       error: "server_error",

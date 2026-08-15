@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, isNull, or } from "@openwork-ee/den-db/drizzle"
+import { and, desc, eq, inArray, isNotNull, isNull } from "@openwork-ee/den-db/drizzle"
 import {
   AuthUserTable,
   InvitationTable,
@@ -33,6 +33,7 @@ import { getModelsDevProvider, listModelsDevProviders } from "../../llm/models-d
 import type { MemberTeamsContext } from "../../middleware/member-teams.js"
 import { denTypeIdSchema, emptyResponse, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
 import { repairMemberInferenceAccessIfNeeded } from "../../inference.js"
+import { listAccessibleLlmProviderAccess } from "./llm-provider-access.js"
 import type { OrgRouteVariables } from "./shared.js"
 import { ensureOrganizationAdmin, idParamSchema, memberHasRole, orgAccessFailureStatus } from "./shared.js"
 
@@ -180,10 +181,10 @@ async function canAccessLlmProvider(input: {
   currentMemberId: MemberId
   memberTeams: Array<{ id: TeamId }>
 }) {
-  const access = await listAccessibleProviderAccess({
+  const access = await listAccessibleLlmProviderAccess({
     organizationId: input.organizationId,
     currentMemberId: input.currentMemberId,
-    memberTeams: input.memberTeams,
+    teamIds: input.memberTeams.map((team) => team.id),
   })
 
   return access.some((entry) => entry.llmProviderId === input.llmProviderId)
@@ -203,39 +204,6 @@ function parseMemberId(value: string) {
 
 function parseTeamId(value: string) {
   return normalizeDenTypeId("team", value)
-}
-
-async function listAccessibleProviderAccess(input: {
-  organizationId: typeof LlmProviderTable.$inferSelect.organizationId
-  currentMemberId: MemberId
-  memberTeams: Array<{ id: TeamId }>
-}) {
-  const teamIds = input.memberTeams.map((team) => team.id)
-  // A row with neither member nor team is an org-wide ("everyone") grant.
-  const everyoneGrant = and(
-    isNull(LlmProviderAccessTable.orgMembershipId),
-    isNull(LlmProviderAccessTable.teamId),
-  )
-  const accessWhere = and(
-    eq(LlmProviderTable.organizationId, input.organizationId),
-    or(
-      eq(LlmProviderAccessTable.orgMembershipId, input.currentMemberId),
-      ...(teamIds.length > 0 ? [inArray(LlmProviderAccessTable.teamId, teamIds)] : []),
-      everyoneGrant,
-    ),
-  )
-
-  return db
-    .select({
-      id: LlmProviderAccessTable.id,
-      llmProviderId: LlmProviderAccessTable.llmProviderId,
-      orgMembershipId: LlmProviderAccessTable.orgMembershipId,
-      teamId: LlmProviderAccessTable.teamId,
-      createdAt: LlmProviderAccessTable.createdAt,
-    })
-    .from(LlmProviderAccessTable)
-    .innerJoin(LlmProviderTable, eq(LlmProviderAccessTable.llmProviderId, LlmProviderTable.id))
-    .where(accessWhere)
 }
 
 async function resolveMemberIds(input: {
@@ -404,10 +372,10 @@ async function loadLlmProviders(input: {
   isAdmin: boolean
   scope: "usable" | "manageable"
 }) {
-  const accessibleAccess = await listAccessibleProviderAccess({
+  const accessibleAccess = await listAccessibleLlmProviderAccess({
     organizationId: input.organizationId,
     currentMemberId: input.currentMemberId,
-    memberTeams: input.memberTeams,
+    teamIds: input.memberTeams.map((team) => team.id),
   })
 
   const accessibleProviderIds = [...new Set(accessibleAccess.map((entry) => entry.llmProviderId))]
@@ -740,7 +708,7 @@ export function registerOrgLlmProviderRoutes<T extends { Variables: OrgRouteVari
         200: jsonResponse("Provider connection payload returned successfully.", llmProviderResponseSchema),
         400: jsonResponse("The provider connect path parameters were invalid.", invalidRequestSchema),
         401: jsonResponse("The caller must be signed in to connect to an organization LLM provider.", unauthorizedSchema),
-        403: jsonResponse("Only members with explicit member or team access grants can connect to this provider.", forbiddenSchema),
+        403: jsonResponse("Only members with access can connect to this provider.", forbiddenSchema),
         404: jsonResponse("The provider could not be found.", notFoundSchema),
       },
     }),

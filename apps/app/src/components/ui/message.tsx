@@ -6,7 +6,6 @@ import {
 } from "@/components/ui/tooltip"
 import { MarkdownBlock } from "@/components/markdown/markdown"
 import { cn } from "@/lib/utils"
-import { motion } from "motion/react"
 
 const messageContentClassName =
   "rounded-lg p-2 text-foreground leading-relaxed bg-secondary prose wrap-break-word whitespace-normal"
@@ -53,7 +52,7 @@ export type MessageContentProps = {
   isStreaming?: boolean
   highlightQuery?: string
   className?: string
-} & React.ComponentProps<typeof motion.div>
+} & React.ComponentProps<"div">
 
 const MessageContent = ({
   children,
@@ -76,12 +75,12 @@ const MessageContent = ({
   }
 
   return (
-    <motion.div
+    <div
       className={cn(messageContentClassName, className)}
       {...props}
     >
       {children}
-    </motion.div>
+    </div>
   )
 }
 

@@ -6,6 +6,7 @@ function seedRequiredEnv() {
   process.env.DEN_DB_ENCRYPTION_KEY = process.env.DEN_DB_ENCRYPTION_KEY ?? "x".repeat(32)
   process.env.BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET ?? "y".repeat(32)
   process.env.BETTER_AUTH_URL = process.env.BETTER_AUTH_URL ?? "http://127.0.0.1:8790"
+  process.env.DEN_ORG_MODE = "multi_org"
   process.env.OPENWORK_DEV_MODE = "0"
 }
 
@@ -152,5 +153,28 @@ test("login-options also requires BotID before deterministic auth-method routing
   expect(body).toEqual({
     error: "bot_verification_failed",
     message: "Request verification failed.",
+  })
+})
+
+test("login-options returns SSO as the first step for verified SSO domains", async () => {
+  requirement = {
+    organizationId: "organization_sso_invite_test",
+    organizationSlug: "invite-sso",
+    signInPath: "/sso/invite-sso",
+    ssoProviderId: "openwork-sso-organization_sso_invite_test",
+    hasSso: true,
+  }
+
+  const response = await createAuthApp().request("http://den.local/v1/auth/login-options?email=invited@verified.example.test")
+  const body = await response.json()
+
+  expect(response.status).toBe(200)
+  expect(body).toEqual({
+    email: "invited@verified.example.test",
+    nextStep: "sso",
+    allowPublicSignup: true,
+    organizationSlug: "invite-sso",
+    signInPath: "/sso/invite-sso",
+    signInUrl: "http://127.0.0.1:8790/sso/invite-sso",
   })
 })

@@ -11,6 +11,7 @@ import {
   isOpenWorkModelsPromoEligible,
   isOpenWorkModelsPromoEligibleForDenBaseUrl,
   shouldShowOpenWorkModelsPromo,
+  shouldShowOpenWorkModelsSyncing,
   wasOpenWorkModelsStartupPromoShown,
 } from "./openwork-models-promo";
 
@@ -46,5 +47,28 @@ describe("hasOpenWorkModelsAvailable", () => {
         providers: [{ id: "openwork", models: { "gpt-5": {} } }],
       }),
     ).toBe(true);
+  });
+});
+
+describe("shouldShowOpenWorkModelsSyncing", () => {
+  test("only reports a real pending workspace reload", () => {
+    expect(shouldShowOpenWorkModelsSyncing({
+      entitled: true,
+      available: false,
+      workspaceReady: false,
+      reloadPending: true,
+    })).toBe(false);
+    expect(shouldShowOpenWorkModelsSyncing({
+      entitled: true,
+      available: false,
+      workspaceReady: true,
+      reloadPending: false,
+    })).toBe(false);
+    expect(shouldShowOpenWorkModelsSyncing({
+      entitled: true,
+      available: false,
+      workspaceReady: true,
+      reloadPending: true,
+    })).toBe(true);
   });
 });

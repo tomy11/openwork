@@ -1,7 +1,7 @@
 /** @jsxImportSource react */
 import { Button } from "@/components/ui/button";
 import type { ReactNode } from "react";
-import { ArrowRight, CheckCircle2, KeyRound, RefreshCw, X } from "lucide-react";
+import { ArrowRight, CheckCircle2, KeyRound, X } from "lucide-react";
 
 import { t } from "@/i18n";
 import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
@@ -50,7 +50,6 @@ export type AiSettingsViewProps = {
   /** Den entitlement is present but local engine has no selectable openwork models yet. */
   showOpenWorkModelsSyncing?: boolean;
   onSubscribeOpenWorkModels?: () => void | Promise<void>;
-  onRefreshOpenWorkModels?: () => void | Promise<void>;
   onDismissOpenWorkModels?: () => void | Promise<void>;
   cloudProvidersView?: ReactNode;
 };
@@ -246,22 +245,14 @@ export function AiSettingsView(props: AiSettingsViewProps) {
                 <div className="flex items-center gap-2">
                   <span className="truncate text-sm font-medium text-dls-text">OpenWork Models</span>
                   <span className="shrink-0 rounded-full border border-amber-6 bg-amber-3 px-2 py-0.5 text-[10px] font-medium text-amber-11">
-                    Included — finish syncing
+                    Included — syncing
                   </span>
                 </div>
                 <div className="truncate text-xs text-muted-foreground">
-                  Your plan includes OpenWork Models, but they are not ready in this workspace yet.
+                  OpenWork Models will become available automatically when the pending workspace reload completes.
                 </div>
               </div>
             </div>
-            <Button
-              variant="outline"
-              onClick={() => void props.onRefreshOpenWorkModels?.()}
-              disabled={props.busy || props.providerAuthBusy}
-            >
-              <RefreshCw className="mr-1.5 size-3.5" />
-              Refresh models
-            </Button>
           </LayoutSectionItem>
         ) : null}
 

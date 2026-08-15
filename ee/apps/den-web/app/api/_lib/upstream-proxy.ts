@@ -17,6 +17,26 @@ const HOP_BY_HOP_HEADERS = new Set([
 const REQUEST_ONLY_HEADERS = new Set(["host", "content-length"]);
 const RESPONSE_ONLY_HEADERS = new Set(["content-length", "content-encoding"]);
 const SPOOFABLE_FORWARDING_HEADERS = new Set(["forwarded", "x-forwarded-host", "x-forwarded-prefix", "x-forwarded-proto"]);
+const LOCATION_BASED_HEADERS = new Set(["content-location", "link", "location", "refresh"]);
+const INTERNAL_RESPONSE_HEADERS = new Set([
+  "alt-svc",
+  "cf-cache-status",
+  "cf-ray",
+  "rndr-id",
+  "server",
+  "via",
+  "x-amzn-trace-id",
+  "x-envoy-upstream-service-time",
+  "x-forwarded-for",
+  "x-forwarded-host",
+  "x-forwarded-prefix",
+  "x-forwarded-proto",
+  "x-real-ip",
+  "x-render-origin-server",
+  "x-request-id",
+  "x-vercel-id",
+]);
+const SAFE_X_RESPONSE_HEADERS = new Set(["x-content-type-options"]);
 
 /**
  * OpenWork Cloud instances are served from Daytona preview origins that are
@@ -134,7 +154,33 @@ function shouldSkipRequestHeader(name: string): boolean {
 
 function shouldSkipResponseHeader(name: string): boolean {
   const normalized = name.toLowerCase();
-  return HOP_BY_HOP_HEADERS.has(normalized) || RESPONSE_ONLY_HEADERS.has(normalized) || normalized === "set-cookie";
+  return HOP_BY_HOP_HEADERS.has(normalized)
+    || RESPONSE_ONLY_HEADERS.has(normalized)
+    || INTERNAL_RESPONSE_HEADERS.has(normalized)
+    || (!SAFE_X_RESPONSE_HEADERS.has(normalized) && normalized.startsWith("x-"))
+    || normalized === "set-cookie";
+}
+
+function shouldSkipExposedResponseHeader(name: string): boolean {
+  const normalized = name.toLowerCase();
+  return HOP_BY_HOP_HEADERS.has(normalized)
+    || INTERNAL_RESPONSE_HEADERS.has(normalized)
+    || (!SAFE_X_RESPONSE_HEADERS.has(normalized) && normalized.startsWith("x-"));
+}
+
+function sanitizeExposeHeaders(headers: Headers): void {
+  const exposedHeaders = headers.get("access-control-expose-headers");
+  if (!exposedHeaders) return;
+
+  const safeHeaders = exposedHeaders
+    .split(",")
+    .map((header) => header.trim())
+    .filter((header) => header && !shouldSkipExposedResponseHeader(header));
+  if (safeHeaders.length > 0) {
+    headers.set("access-control-expose-headers", safeHeaders.join(", "));
+  } else {
+    headers.delete("access-control-expose-headers");
+  }
 }
 
 async function injectActiveTraceContext(headers: Headers): Promise<void> {
@@ -180,40 +226,77 @@ function copySetCookieHeaders(upstreamHeaders: Headers, responseHeaders: Headers
   }
 }
 
-function rewriteLocationHeader(location: string, request: NextRequest, apiBase: string): string {
-  let parsedLocation: URL;
+function publicProxyUrlForUpstreamUrl(value: string, request: NextRequest, apiBase: string, options: ProxyOptions): string {
+  let parsedValue: URL;
   try {
-    parsedLocation = new URL(location);
+    parsedValue = new URL(value);
   } catch {
-    return location;
+    return value;
   }
 
   let apiOrigin: string;
   try {
     apiOrigin = new URL(apiBase).origin;
   } catch {
-    return location;
+    return value;
   }
 
-  if (parsedLocation.origin !== apiOrigin || !parsedLocation.pathname.startsWith("/api/auth/")) {
-    return location;
+  if (parsedValue.origin !== apiOrigin) {
+    return value;
   }
 
   const requestOrigin = new URL(request.url).origin;
-  return `${requestOrigin}${parsedLocation.pathname}${parsedLocation.search}${parsedLocation.hash}`;
+  const routePrefix = options.routePrefix.startsWith("/") ? options.routePrefix : `/${options.routePrefix}`;
+  const upstreamPrefix = normalizePathPrefix(options.upstreamPathPrefix ?? "");
+  let publicPath: string;
+
+  if (upstreamPrefix) {
+    const normalizedUpstreamPrefix = `/${upstreamPrefix}`;
+    if (!parsedValue.pathname.startsWith(normalizedUpstreamPrefix)) return value;
+    const suffix = parsedValue.pathname.slice(normalizedUpstreamPrefix.length);
+    publicPath = `${routePrefix}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+  } else {
+    publicPath = `${routePrefix}${parsedValue.pathname.startsWith("/") ? parsedValue.pathname : `/${parsedValue.pathname}`}`;
+  }
+
+  return `${requestOrigin}${publicPath}${parsedValue.search}${parsedValue.hash}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function rewriteEmbeddedUpstreamUrls(value: string, request: NextRequest, apiBase: string, options: ProxyOptions): string {
+  let apiOrigin: string;
+  try {
+    apiOrigin = new URL(apiBase).origin;
+  } catch {
+    return value;
+  }
+
+  const absoluteUpstreamUrl = new RegExp(`${escapeRegExp(apiOrigin)}[^\\s,;<>\"]*`, "g");
+  return value.replace(absoluteUpstreamUrl, (match) => publicProxyUrlForUpstreamUrl(match, request, apiBase, options));
+}
+
+function rewriteLocationBasedHeader(value: string, request: NextRequest, apiBase: string, options: ProxyOptions): string {
+  const rewrittenSingleUrl = publicProxyUrlForUpstreamUrl(value, request, apiBase, options);
+  return rewrittenSingleUrl === value
+    ? rewriteEmbeddedUpstreamUrls(value, request, apiBase, options)
+    : rewrittenSingleUrl;
 }
 
 function cloneResponseHeaders(request: NextRequest, upstream: Response, options: ProxyOptions, apiBase: string): Headers {
   const headers = new Headers();
   upstream.headers.forEach((value, name) => {
     if (shouldSkipResponseHeader(name)) return;
-    if (name.toLowerCase() === "location" && options.rewriteAuthLocationsToRequestOrigin) {
-      headers.append(name, rewriteLocationHeader(value, request, apiBase));
+    if (LOCATION_BASED_HEADERS.has(name.toLowerCase())) {
+      headers.append(name, rewriteLocationBasedHeader(value, request, apiBase, options));
       return;
     }
     headers.append(name, value);
   });
   copySetCookieHeaders(upstream.headers, headers);
+  sanitizeExposeHeaders(headers);
   return headers;
 }
 

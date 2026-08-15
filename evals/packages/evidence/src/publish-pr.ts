@@ -31,6 +31,7 @@ export interface PublishPrOptions {
   pr?: string | number;
   rollDir: string;
   dryRun?: boolean;
+  force?: boolean;
 }
 
 export interface PublishPrResult {
@@ -55,6 +56,19 @@ function commandRunner(command: string, args: string[], opts: CommandOptions = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function formatRollAge(createdAt: string, now = Date.now()): string {
+  const elapsed = Math.max(0, now - Date.parse(createdAt));
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 60) return `${minutes}m old`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h old`;
+  return `${Math.floor(hours / 24)}d old`;
+}
+
+function shortSha(sha: string): string {
+  return sha.slice(0, 7);
 }
 
 function resolveBlobToken(exec: CommandRunner): string | null {
@@ -142,6 +156,24 @@ function requireSuccess(result: CommandResult, label: string): void {
   throw new Error(`${label} failed: ${detail}`);
 }
 
+function resolvePrHeadSha(pr: string, exec: CommandRunner): string {
+  const viewed = exec("gh", ["pr", "view", pr, "--json", "headRefOid"]);
+  if (viewed.status !== 0 || viewed.error) {
+    const detail = viewed.error?.message ?? viewed.stderr.trim();
+    throw new Error(`Unable to resolve PR head SHA with gh${detail ? `: ${detail}` : "."} Install GitHub CLI if needed, then run \`gh auth login\`.`);
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(viewed.stdout);
+  } catch {
+    throw new Error("Unable to resolve PR head SHA with gh: response was not JSON. Run `gh auth login` and try again.");
+  }
+  if (!isRecord(payload) || typeof payload.headRefOid !== "string" || payload.headRefOid.length === 0) {
+    throw new Error("Unable to resolve PR head SHA with gh: response did not include headRefOid. Run `gh auth login` and try again.");
+  }
+  return payload.headRefOid;
+}
+
 function postStickyComment(pr: string, markdown: string, exec: CommandRunner): boolean {
   const viewed = exec("gh", ["pr", "view", pr, "--json", "comments"]);
   requireSuccess(viewed, "Reading PR comments");
@@ -170,7 +202,7 @@ export async function publishPr(
   const fetcher = dependencies.fetch ?? globalThis.fetch;
   const rollName = basename(options.rollDir);
   const pr = options.pr === undefined ? "<n>" : String(options.pr);
-  const reproCommand = `pnpm --dir evals run publish:pr -- --pr ${pr} --roll ${rollName}`;
+  const reproCommand = `pnpm evals --publish --pr ${pr} --roll ${rollName}`;
 
   if (options.dryRun) {
     const markdown = renderPrMarkdown(roll, {}, {
@@ -182,13 +214,32 @@ export async function publishPr(
   }
   if (options.pr === undefined) throw new Error("Publishing requires --pr <n>.");
 
+  if (!roll.gitSha) {
+    throw new Error(`Refusing to publish ${rollName}: roll.json has no gitSha (${formatRollAge(roll.createdAt)}).`);
+  }
+  const prHeadSha = resolvePrHeadSha(String(options.pr), exec);
+  const stale = roll.gitSha.toLowerCase() !== prHeadSha.toLowerCase();
+  if (stale && !options.force) {
+    throw new Error(`Refusing stale evidence: roll SHA ${roll.gitSha}, PR head SHA ${prHeadSha} (${formatRollAge(roll.createdAt)}). Use --force to publish it anyway.`);
+  }
+  const staleNotice = stale
+    ? `⚠ evidence from ${shortSha(roll.gitSha)}, PR head is ${shortSha(prHeadSha)}`
+    : undefined;
+
   const token = resolveBlobToken(exec);
   const urls = token
-    ? await uploadImages(options.rollDir, rollName, roll.frames.map((frame) => frame.fileName), token, fetcher)
+    ? await uploadImages(
+      options.rollDir,
+      rollName,
+      [...new Set(roll.frames.map((frame) => frame.fileName).filter((fileName) => fileName.length > 0))],
+      token,
+      fetcher,
+    )
     : {};
+  const uploadNotice = token ? undefined : "screenshots not uploaded (no BLOB_READ_WRITE_TOKEN)";
   const markdown = renderPrMarkdown(roll, urls, {
     reproCommand,
-    notice: token ? undefined : "screenshots not uploaded (no BLOB_READ_WRITE_TOKEN)",
+    notice: [staleNotice, uploadNotice].filter((notice) => notice !== undefined).join(" · ") || undefined,
   });
   const updated = postStickyComment(String(options.pr), markdown, exec);
   return { markdown, posted: true, updated, urls };

@@ -75,6 +75,7 @@ import { createDenTypeId } from "@openwork-ee/utils/typeid"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
+import { cache } from "../../cache.js"
 import { db } from "../../db.js"
 import { completeLinearIssue, createLinearIssue, type LinearIssue } from "../../linear.js"
 import { orgRoleRoute } from "../../middleware/index.js"
@@ -470,7 +471,12 @@ export function registerDeleteOrganizationRoutes<T extends { Variables: OrgRoute
           await tx.delete(LlmProviderAccessTable).where(inArray(LlmProviderAccessTable.llmProviderId, llmProviderIds))
         }
 
+        const affectedSessions = await tx
+          .select({ token: AuthSessionTable.token })
+          .from(AuthSessionTable)
+          .where(eq(AuthSessionTable.activeOrganizationId, organizationId))
         await tx.update(AuthSessionTable).set({ activeOrganizationId: null }).where(eq(AuthSessionTable.activeOrganizationId, organizationId))
+        await Promise.all(affectedSessions.map((session) => cache.auth.deleteSession(session.token)))
 
         await tx.delete(OrganizationBrandAssetTable).where(eq(OrganizationBrandAssetTable.organizationId, organizationId))
         await tx.delete(WorkspaceClaimTable).where(eq(WorkspaceClaimTable.organizationId, organizationId))

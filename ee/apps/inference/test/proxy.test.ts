@@ -201,7 +201,7 @@ test("rewrites approved model aliases before forwarding JSON requests", async ()
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers: authHeaders("application/json; charset=utf-8"),
-    body: JSON.stringify({ model: "openwork/openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "openwork/z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 200)
@@ -215,12 +215,12 @@ test("rewrites approved model aliases before forwarding JSON requests", async ()
   assert.equal(upstream.headers.get("authorization"), "Bearer provider-key")
   assert.equal(upstream.headers.get("content-type"), "application/json")
   const body = parseJsonObject(requireBodyText(upstream.body))
-  assert.equal(body.model, "openrouter/fusion")
+  assert.equal(body.model, "z-ai/glm-5.2")
   assert.equal(body.user, "member_123")
   assert.equal(body.session_id, upstream.headers.get("x-openwork-request-id"))
   const trace = body.trace
   assert.ok(isRecord(trace))
-  assert.equal(trace.generation_name, "openrouter/fusion")
+  assert.equal(trace.generation_name, "z-ai/glm-5.2")
 
   const report = requireRequestReport(reports)
   assert.equal(report.organizationId, "organization_123")
@@ -228,8 +228,8 @@ test("rewrites approved model aliases before forwarding JSON requests", async ()
   assert.equal(report.openworkRequestId, upstream.headers.get("x-openwork-request-id"))
   assert.equal(report.route, "/api/v1/chat/completions")
   assert.equal(report.method, "POST")
-  assert.equal(report.incomingModel, "openwork/openrouter/fusion")
-  assert.equal(report.resolvedUpstreamModel, "openrouter/fusion")
+  assert.equal(report.incomingModel, "openwork/z-ai/glm-5.2")
+  assert.equal(report.resolvedUpstreamModel, "z-ai/glm-5.2")
 })
 
 test("returns model_not_found for unknown JSON model aliases", async () => {
@@ -256,7 +256,7 @@ test("summarizes ordinary organization payload shape without message content or 
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       stream: true,
       api_key: "payload-secret-key",
       metadata: { password: "payload-password" },
@@ -301,7 +301,7 @@ test("logs full debug organization payload with recursive credential redaction",
     method: "POST",
     headers: authHeaders("application/json"),
     body: JSON.stringify({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       api_key: "payload-secret-key",
       key: "generic-key-secret",
       private_key: "private-key-secret",
@@ -383,7 +383,7 @@ test("redacts credential-like incoming headers without redacting non-secret IDs"
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers,
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 200)
@@ -443,7 +443,7 @@ test("reports handled upstream errors with searchable request context", async ()
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 503)
@@ -455,8 +455,8 @@ test("reports handled upstream errors with searchable request context", async ()
   assert.equal(errorReport.openworkRequestId, requestReport.openworkRequestId)
   assert.equal(errorReport.route, "/api/v1/chat/completions")
   assert.equal(errorReport.method, "POST")
-  assert.equal(errorReport.incomingModel, "openrouter/fusion")
-  assert.equal(errorReport.resolvedUpstreamModel, "openrouter/fusion")
+  assert.equal(errorReport.incomingModel, "z-ai/glm-5.2")
+  assert.equal(errorReport.resolvedUpstreamModel, "z-ai/glm-5.2")
   assert.equal(errorReport.status, 503)
 })
 
@@ -470,7 +470,7 @@ test("reports caught upstream fetch exceptions with the original Error object", 
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 502)
@@ -517,7 +517,7 @@ test("accepts application/*+json media types", async () => {
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers: authHeaders("application/vnd.openwork.request+json; charset=utf-8"),
-    body: JSON.stringify({ model: "openwork/openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "openwork/z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 200)
@@ -525,7 +525,7 @@ test("accepts application/*+json media types", async () => {
   const upstream = upstreamRequests[0]
   assert.ok(upstream)
   const body = parseJsonObject(requireBodyText(upstream.body))
-  assert.equal(body.model, "openrouter/fusion")
+  assert.equal(body.model, "z-ai/glm-5.2")
 })
 
 test("does not forward caller headers or session IDs that can affect routing", async () => {
@@ -536,7 +536,7 @@ test("does not forward caller headers or session IDs that can affect routing", a
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers,
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [], session_id: "caller-session" }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [], session_id: "caller-session" }),
   }))
 
   assert.equal(response.status, 200)
@@ -556,7 +556,7 @@ for (const [field, value] of [
 ] satisfies [string, unknown][]) {
   test(`rejects the top-level ${field} selector when present`, async () => {
     await expectUnsupportedModelSelection({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       messages: [],
       [field]: value,
     })
@@ -565,7 +565,7 @@ for (const [field, value] of [
 
 test("rejects the Fusion plugin", async () => {
   await expectUnsupportedModelSelection({
-    model: "openrouter/fusion",
+    model: "z-ai/glm-5.2",
     messages: [],
     plugins: [{ id: "fusion" }],
   })
@@ -574,7 +574,7 @@ test("rejects the Fusion plugin", async () => {
 for (const field of ["model", "analysis_models", "allowed_models"]) {
   test(`rejects ${field} in an OpenRouter plugin context`, async () => {
     await expectUnsupportedModelSelection({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       messages: [],
       plugins: [{ id: "web", [field]: null }],
     })
@@ -582,7 +582,7 @@ for (const field of ["model", "analysis_models", "allowed_models"]) {
 
   test(`rejects parameters.${field} in an OpenRouter plugin context`, async () => {
     await expectUnsupportedModelSelection({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       messages: [],
       plugins: [{ id: "web", parameters: { [field]: null } }],
     })
@@ -597,7 +597,7 @@ for (const type of [
 ]) {
   test(`rejects the ${type} server tool`, async () => {
     await expectUnsupportedModelSelection({
-      model: "openrouter/fusion",
+      model: "z-ai/glm-5.2",
       messages: [],
       tools: [{ type }],
     })
@@ -621,7 +621,7 @@ test("allows ordinary function tools with a model property in their JSON Schema"
   const response = await app.fetch(inferenceRequest({
     method: "POST",
     headers: authHeaders("application/json"),
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [], tools }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [], tools }),
   }))
 
   assert.equal(response.status, 200)
@@ -727,7 +727,7 @@ test("blocks chat completion query parameters locally", async () => {
     method: "POST",
     headers: authHeaders("application/json"),
     path: "/api/v1/chat/completions?model=attacker/random-model",
-    body: JSON.stringify({ model: "openrouter/fusion", messages: [] }),
+    body: JSON.stringify({ model: "z-ai/glm-5.2", messages: [] }),
   }))
 
   assert.equal(response.status, 400)

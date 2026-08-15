@@ -135,6 +135,20 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
       };
     },
   },
+  recovery: {
+    recordHealthy() {
+      return ipcRenderer.invoke("openwork:recovery:recordHealthy");
+    },
+    list(policy) {
+      return ipcRenderer.invoke("openwork:recovery:list", policy);
+    },
+    restorePrevious() {
+      return ipcRenderer.invoke("openwork:recovery:restorePrevious");
+    },
+    use(id) {
+      return ipcRenderer.invoke("openwork:recovery:use", id);
+    },
+  },
   browser: {
     show(bounds) { return ipcRenderer.invoke("openwork:browser:show", bounds); },
     hide() { return ipcRenderer.invoke("openwork:browser:hide"); },
@@ -193,8 +207,23 @@ contextBridge.exposeInMainWorld("__OPENWORK_ELECTRON__", {
     initialDeepLinks: [],
     platform: normalizePlatform(process.platform),
     version: process.versions.electron,
+    evalFatalBootstrapFailure: process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE ?? null,
   },
 });
+
+if (
+  process.env.OPENWORK_EVAL_FATAL_DESKTOP_BOOTSTRAP_FAILURE
+  && (process.env.OPENWORK_EVAL_RECOVERY_CANDIDATES || process.env.OPENWORK_EVAL_RECOVERY_RELEASES)
+) {
+  contextBridge.exposeInMainWorld("__openworkRecoveryControl", {
+    snapshot() {
+      return ipcRenderer.invoke("openwork:recovery:evalSnapshot");
+    },
+    select(id) {
+      return ipcRenderer.invoke("openwork:recovery:use", id);
+    },
+  });
+}
 
 ipcRenderer.on(NATIVE_DEEP_LINK_EVENT, (_event, urls) => {
   if (typeof window === "undefined") return;

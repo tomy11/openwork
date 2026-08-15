@@ -18,6 +18,11 @@ describe("Electron distribution configs", () => {
     );
     const config = await readConfig("electron-builder.base.yml");
     assert.equal(packageMetadata.desktopName, "com.differentai.openwork");
+    assert.equal(config.npmRebuild, false);
+    assert.deepEqual(config.files.at(-1), {
+      from: ".electron-runtime/node_modules",
+      to: "node_modules",
+    });
     assert.equal(config.linux.syncDesktopName, true);
     assert.equal(config.linux.icon, "resources/icons/linux");
     assert.deepEqual(config.linux.extraResources[0], {

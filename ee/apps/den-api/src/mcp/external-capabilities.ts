@@ -27,6 +27,10 @@ import {
   type ExternalMcpDiagnostic,
 } from "../capability-sources/external-mcp-diagnostics.js"
 import { getConnectedAccount } from "../capability-sources/oauth-credentials.js"
+import {
+  evaluateToolPolicy,
+  isToolDisabled,
+} from "../capability-sources/external-mcp-tool-policy.js"
 import { db } from "../db.js"
 import { listTeamsForMember } from "../orgs.js"
 import { openworkOrganizationConnectionsUrl, openworkYourConnectionsUrl } from "./connection-navigation.js"
@@ -37,6 +41,12 @@ import {
 } from "./external-mcp-tool-arguments.js"
 import { compareCapabilityMatches, tokenize } from "./search.js"
 import type { CapabilityMatch } from "./search.js"
+import {
+  CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT,
+  codemodeScriptPath,
+  resolveCodemodeConnectionNamespaceContext,
+  type CodemodeConnectionNamespaceContext,
+} from "./codemode-namespaces.js"
 
 /**
  * Merges org-level External MCP Connections (capability-sources/) into the
@@ -57,7 +67,7 @@ import type { CapabilityMatch } from "./search.js"
  */
 
 const EXTERNAL_CAPABILITY_PREFIX = "mcp:"
-export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = 16
+export const EXTERNAL_MCP_SEARCH_CONNECTION_LIMIT = CODEMODE_EXTERNAL_MCP_CONNECTION_LIMIT
 export const EXTERNAL_MCP_SEARCH_CONCURRENCY = 4
 export const EXTERNAL_MCP_SEARCH_MATCH_LIMIT = 20
 
@@ -190,6 +200,13 @@ export type ExternalConnectionStatus = {
     retry: "search_capabilities"
     url?: string
   }
+}
+
+type ConnectionStatusIdentity = {
+  id: string
+  name: string
+  authType: ExternalConnectionStatus["authType"]
+  credentialMode: ExternalConnectionStatus["credentialMode"]
 }
 
 const ERROR_MESSAGE_LIMIT = 300
@@ -413,7 +430,7 @@ function providerAuthorizationConnectionStatus(input: {
 }
 
 export function buildExternalConnectionStatus(input: {
-  connection: Pick<ExternalMcpConnectionRow, "id" | "name" | "authType" | "credentialMode">
+  connection: ConnectionStatusIdentity
   state: ExternalConnectionStatus["state"]
   errorCode: ExternalConnectionStatus["errorCode"]
   message: string
@@ -618,12 +635,14 @@ async function probeExternalMcpConnection(input: {
   redirectUriBase: string
   limit: number
   deadline: ExternalMcpLifecycleDeadline
+  scriptNamespace?: string
 }): Promise<ExternalCapabilityMatch[]> {
   const matches: ExternalCapabilityMatch[] = []
   const add = (match: ExternalCapabilityMatch) => {
     mergeBoundedExternalCapabilityMatches(matches, [match], input.limit)
   }
   const connection = input.connection
+  if (connection.toolPolicy?.allDisabled) return matches
   if (connection.oauthIssuerReviewRequiredAt) {
     const nameTokens = tokenize(connection.name)
     const score = scoreText(nameTokens, nameTokens, input.queryTokens)
@@ -735,6 +754,7 @@ async function probeExternalMcpConnection(input: {
   }
 
   for (const tool of tools) {
+    if (isToolDisabled(connection.toolPolicy, tool.name)) continue
     const summary = tool.description ?? tool.title ?? tool.name
     const nameTokens = tokenize(`${connection.name} ${tool.name}`)
     const summaryTokens = tokenize(summary)
@@ -752,6 +772,7 @@ async function probeExternalMcpConnection(input: {
       argumentsSchema: tool.inputSchema,
       schemaDigest: externalMcpToolSchemaDigest(tool.inputSchema),
       invocation: { argumentsField: "body" },
+      ...(input.scriptNamespace ? { scriptPath: codemodeScriptPath(input.scriptNamespace, tool.name) } : {}),
     })
   }
   return matches
@@ -769,6 +790,8 @@ export async function searchExternalCapabilities(input: {
   query: string
   redirectUriBase: string
   limit?: number
+  includeScriptPaths?: boolean
+  namespaceContext?: CodemodeConnectionNamespaceContext
   reportCoverage?: (coverage: ExternalMcpSearchCoverage) => void
 }): Promise<ExternalCapabilityMatch[]> {
   if (!input.member) return []
@@ -778,11 +801,18 @@ export async function searchExternalCapabilities(input: {
   if (!Number.isFinite(requestedLimit) || requestedLimit <= 0) return []
   const limit = Math.min(Math.max(1, Math.trunc(requestedLimit)), EXTERNAL_MCP_SEARCH_MATCH_LIMIT)
   const deadline = createExternalMcpLifecycleDeadline()
-  const connections = await listUsableExternalMcpConnections({
+  const namespaceContext = input.includeScriptPaths
+    ? input.namespaceContext ?? await resolveCodemodeConnectionNamespaceContext({
+      organizationId: input.organizationId,
+      member: input.member,
+    })
+    : input.namespaceContext
+  const connections = namespaceContext?.externalMcpConnections ?? await listUsableExternalMcpConnections({
     organizationId: normalizeDenTypeId("organization", input.organizationId),
     orgMembershipId: input.member.orgMembershipId,
     teamIds: input.member.teamIds,
   })
+  const scriptNamespaces = input.includeScriptPaths ? namespaceContext?.namespaces.externalMcp : undefined
   const selectedConnections = selectExternalMcpSearchConnections(connections, queryTokens)
   input.reportCoverage?.({
     eligibleConnections: connections.length,
@@ -800,6 +830,7 @@ export async function searchExternalCapabilities(input: {
       redirectUriBase: input.redirectUriBase,
       limit,
       deadline: sharedDeadline,
+      scriptNamespace: scriptNamespaces?.get(connection.id),
     }),
   })
 }
@@ -847,6 +878,7 @@ export type ExternalCapabilityExecuteResult =
         | "connection_failed"
         | "provider_error"
         | "invalid_capability_arguments"
+        | "policy_blocked"
       message: string
       referenceId?: string
       retryable?: boolean
@@ -948,6 +980,10 @@ export async function executeExternalCapability(input: {
   args: unknown
   schemaDigest?: string
   redirectUriBase: string
+  /** Fail closed unless the live provider catalog still marks this exact tool read-only. */
+  requireReadOnly?: boolean
+  /** Fail closed when the live input schema no longer matches schemaDigest. */
+  requireSchemaMatch?: boolean
 }): Promise<ExternalCapabilityExecuteResult> {
   if (!input.member) {
     return { ok: false, error: "forbidden", message: "No active org membership for this token." }
@@ -971,6 +1007,9 @@ export async function executeExternalCapability(input: {
   if (!connection) {
     return { ok: false, error: "unknown_capability", message: `No external MCP connection "${input.connectionId}" in this organization.` }
   }
+  if (connection.kind !== "external_mcp") {
+    return { ok: false, error: "unknown_capability", message: `Connection "${input.connectionId}" is a native provider connector and does not expose MCP tools.` }
+  }
 
   const canUse = await memberCanUseExternalMcpConnection({
     connectionId,
@@ -979,6 +1018,18 @@ export async function executeExternalCapability(input: {
   })
   if (!canUse) {
     return { ok: false, error: "forbidden", message: `You have not been granted access to "${connection.name}".` }
+  }
+
+  const policyDecision = evaluateToolPolicy(connection.toolPolicy, input.toolName)
+  if (policyDecision.blocked) {
+    return {
+      ok: false,
+      error: "policy_blocked",
+      capability: buildExternalCapabilityName(connectionId, input.toolName),
+      message: `${input.toolName} is disabled for your organization${policyDecision.disabledBy ? ` by ${policyDecision.disabledBy}` : ""}.`,
+      sameArgumentsRetryable: false,
+      retry: { action: "search_capabilities", searchRequired: true },
+    }
   }
 
   if (connection.oauthIssuerReviewRequiredAt) {
@@ -1056,8 +1107,29 @@ export async function executeExternalCapability(input: {
       }
     }
 
+    if (input.requireReadOnly && (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true)) {
+      return {
+        ok: false,
+        error: "policy_blocked",
+        capability: buildExternalCapabilityName(connection.id, input.toolName),
+        message: `${input.toolName} is no longer advertised as strictly read-only, so OpenWork blocked the Remote MCP App call.`,
+        sameArgumentsRetryable: false,
+        retry: { action: "search_capabilities", searchRequired: true },
+      }
+    }
+
     const schemaDigest = externalMcpToolSchemaDigest(tool.inputSchema)
     currentSchemaDigest = schemaDigest
+    if (input.requireSchemaMatch && input.schemaDigest && input.schemaDigest !== schemaDigest) {
+      return {
+        ok: false,
+        error: "policy_blocked",
+        capability: buildExternalCapabilityName(connection.id, input.toolName),
+        message: `${input.toolName} now advertises a different input schema, so OpenWork blocked the Remote MCP App call until its cached revision is refreshed.`,
+        sameArgumentsRetryable: false,
+        retry: { action: "search_capabilities", searchRequired: true },
+      }
+    }
     const schemaWarnings: ExternalMcpSchemaWarning[] = []
     if (input.schemaDigest && input.schemaDigest !== schemaDigest) {
       schemaWarnings.push({

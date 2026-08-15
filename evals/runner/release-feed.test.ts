@@ -11,7 +11,6 @@ import {
   resolveAllowedUpdate,
   simulateBrowserRenamedFileName,
 } from "./labs/release-feed.ts";
-import { resolveBootstrapPrecedence } from "./journeys/update.ts";
 
 describe("release feed catalog resolution", () => {
   test("selects highest allowed instead of latest and treats empty allowlist as unrestricted", () => {
@@ -106,25 +105,5 @@ describe("release feed fault knobs", () => {
     } finally {
       await feed.stop();
     }
-  });
-});
-
-describe("bootstrap precedence helper", () => {
-  test("drives workspace-store precedence so an installed organization URL outranks a newer hosted bundle", async () => {
-    const organizationUrl = "https://openwork.organization.internal.example";
-    const result = await resolveBootstrapPrecedence({
-      before: {
-        serverUrl: organizationUrl,
-        bundleServerUrl: "https://app.openworklabs.com",
-        installedPath: "canonical",
-      },
-      after: { serverUrl: organizationUrl },
-    });
-
-    assert.equal(result.importedBeforeRead, false);
-    assert.equal(result.importedAfterRestart, false);
-    assert.equal(result.firstBaseUrl, organizationUrl);
-    assert.equal(result.restartedBaseUrl, organizationUrl);
-    assert.equal(result.persistedBaseUrl, organizationUrl);
   });
 });

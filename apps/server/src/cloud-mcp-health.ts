@@ -2264,6 +2264,26 @@ export async function reconcileOpenworkCloudMcp(input: {
     return healthWithFailure(await readHealth(), connectedFailure);
   }
 
+  // The Cloud control connection publishes a normal MCP resource describing
+  // the member-authorized Connect servers. Reconcile each one as its own MCP
+  // endpoint so standard MCP Apps retain exact tool names, resource URIs, and
+  // the same-server UI execution boundary. Older Cloud deployments simply do
+  // not expose the index and remain compatible.
+  const { reconcileOpenWorkConnectMcpServers } = await import("./connect-mcp-server-catalog.js");
+  const connectServers = await reconcileOpenWorkConnectMcpServers({
+    config: input.config,
+    workspace: input.workspace,
+    cloudMcp: desiredConfig,
+  }).catch(() => ({ status: "unavailable" as const, names: [], removedNames: [] }));
+  if (connectServers.status === "synced") {
+    for (const name of connectServers.removedNames) {
+      await opencode.mcp.disconnect({ name, ...locationParams(input.directory) }).catch(() => undefined);
+    }
+  }
+  if (connectServers.status === "synced" && connectServers.names.length > 0) {
+    await input.registerRuntimeMcp(input.config, input.workspace, connectServers.names, { throwOnFailure: false });
+  }
+
   const health = await readHealth();
 
   if (health.firstFailure) {

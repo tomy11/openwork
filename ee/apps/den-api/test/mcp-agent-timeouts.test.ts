@@ -455,7 +455,7 @@ test("capability discovery is marked read-only while generic execution remains g
   })
 })
 
-test("connection status ranks above unrelated callable tools without distorting relevance scores", () => {
+test("connection status only outranks equally relevant callable tools", () => {
   type ConnectionStatusMatch = CapabilityMatch & { kind: "connection_status" }
   const callableMatch: CapabilityMatch = {
     name: "slack_search_emojis",
@@ -482,6 +482,12 @@ test("connection status ranks above unrelated callable tools without distorting 
 
   matches.sort(compareCapabilityMatches)
 
+  expect(matches[0]?.name).toBe("slack_search_emojis")
+  expect(matches[0]?.score).toBe(20)
+
+  statusMatch.score = callableMatch.score
+  matches.sort(compareCapabilityMatches)
+
   expect(matches[0]?.kind).toBe("connection_status")
-  expect(matches[0]?.score).toBe(7)
+  expect(matches[0]?.score).toBe(20)
 })

@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   compareDaytonaSnapshotPin,
+  main,
   updateDaytonaSnapshotPin,
 } from "./update-daytona-snapshot-pin.mjs"
 
@@ -206,4 +207,30 @@ test("compare mode fails with a clear diff when drift is detected", async () => 
     }),
     /expected DAYTONA_SNAPSHOT=openwork-0\.18\.10, found DAYTONA_SNAPSHOT=openwork-0\.18\.9/,
   )
+})
+
+test("read mode prints the current pin without writing", async () => {
+  const originalFetch = globalThis.fetch
+  const originalLog = console.log
+  const calls = []
+  const messages = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options })
+    return jsonResponse({ key: "DAYTONA_SNAPSHOT", value: snapshotName })
+  }
+  console.log = (message) => messages.push(message)
+
+  try {
+    const result = await main(["--env-group-id", envGroupId, "--read"], {
+      RENDER_API_KEY: apiKey,
+    })
+
+    assert.deepEqual(result, { status: "read", current: snapshotName })
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].options.method, "GET")
+    assert.deepEqual(messages, [snapshotName])
+  } finally {
+    globalThis.fetch = originalFetch
+    console.log = originalLog
+  }
 })

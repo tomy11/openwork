@@ -37,9 +37,8 @@ export function parseAdminCapabilityName(name: string): string | null {
   return toolName.length > 0 ? toolName : null
 }
 
-export async function searchAdminCapabilities(query: string, limit = 5): Promise<CapabilityMatch[]> {
-  const queryTokens = tokenize(query)
-  const boundedLimit = Math.max(1, Math.min(20, Math.trunc(limit) || 5))
+async function listAdminCapabilityMatches(query?: string): Promise<CapabilityMatch[]> {
+  const queryTokens = query === undefined ? undefined : tokenize(query)
   const { tools } = await withAdminClient((client) => client.listTools())
 
   return tools
@@ -49,12 +48,14 @@ export async function searchAdminCapabilities(query: string, limit = 5): Promise
         name: `${ADMIN_CAPABILITY_PREFIX}${tool.name}`,
         method: "MCP",
         path: "/mcp/admin",
-        score: scoreText(
-          tokenize(tool.name),
-          tokenize(tool.description ?? ""),
-          queryTokens,
-          ["admin", "platform"],
-        ),
+        score: queryTokens
+          ? scoreText(
+            tokenize(tool.name),
+            tokenize(tool.description ?? ""),
+            queryTokens,
+            ["admin", "platform"],
+          )
+          : 1,
         summary: `[OpenWork Admin] ${tool.description ?? tool.name}`,
         pathParams: [],
         queryParams: [],
@@ -62,8 +63,17 @@ export async function searchAdminCapabilities(query: string, limit = 5): Promise
         ...(hasBody ? { argumentsSchema: tool.inputSchema, invocation: ADMIN_ARGUMENT_INVOCATION } : {}),
       }
     })
-    .filter((match) => match.score > 0)
+    .filter((match) => queryTokens === undefined || match.score > 0)
     .sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name))
+}
+
+export async function listAvailableAdminCapabilities(platformAdmin: boolean): Promise<CapabilityMatch[]> {
+  return platformAdmin ? listAdminCapabilityMatches() : []
+}
+
+export async function searchAdminCapabilities(query: string, limit = 5): Promise<CapabilityMatch[]> {
+  const boundedLimit = Math.max(1, Math.min(20, Math.trunc(limit) || 5))
+  return (await listAdminCapabilityMatches(query))
     .slice(0, boundedLimit)
 }
 

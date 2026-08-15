@@ -61,6 +61,8 @@ describe("Daytona OpenWork checkpoint start command", () => {
     expect(command).toContain("tar -C / -xf")
     expect(command).not.toContain("tar -h")
     expect(command).not.toContain("tar -ch")
+    expect(command).toContain("--approval auto")
+    expect(command).not.toContain("--approval manual")
 
     const hydrateCall = command.indexOf("\nhydrate_checkpoint\n")
     const serverStart = command.indexOf(" openwork-server --workspace")

@@ -261,13 +261,23 @@ if (!viteReady) {
 
 const resolvedStartUrl = await waitForVite(startUrl);
 
+// Native dependencies installed for the host Node ABI must be rebuilt before
+// Electron loads the embedded server and terminal runtime.
+if (process.env.OPENWORK_ELECTRON_SKIP_NATIVE_REBUILD === "1") {
+  console.log("[electron-dev] Using prebuilt Electron native dependencies.");
+} else {
+  console.log("[electron-dev] Rebuilding native dependencies for Electron...");
+  runSync(pnpmCmd, ["--filter", "@openwork/desktop", "run", "rebuild:electron-native"], { cwd: repoRoot });
+}
+
 // Optional Electron CDP for external debugging / raw CDP clients.
 // NOT required for the built-in browser (uses native webContents APIs).
 // Set OPENWORK_ELECTRON_REMOTE_DEBUG_PORT=9823 to enable.
 const cdpPortRaw = process.env.OPENWORK_ELECTRON_REMOTE_DEBUG_PORT?.trim() ?? "";
 const cdpPort = cdpPortRaw === "" || cdpPortRaw === "0" ? "" : cdpPortRaw;
 
-electronChild = run(pnpmCmd, ["exec", "electron", "./electron/main.mjs"], {
+const blankSlateArgs = process.argv.includes("--blank-slate") ? ["--blank-slate"] : [];
+electronChild = run(pnpmCmd, ["exec", "electron", "./electron/main.mjs", ...blankSlateArgs], {
   cwd: desktopRoot,
   env: {
     ...process.env,

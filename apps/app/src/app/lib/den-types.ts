@@ -30,7 +30,8 @@ export type DenPluginConfigObjectType =
   | "mcp"
   | "hook"
   | "context"
-  | "custom";
+  | "custom"
+  | "script";
 
 export type DenPluginConfigObjectVersion = {
   id: string;
@@ -117,7 +118,7 @@ export type DenOrgPluginResolved = {
 
 export type DenAssignedMarketplaceCapability = {
   configObjectId: string;
-  marketplaceId: string;
+  marketplaceId: string | null;
   objectType: DenPluginConfigObjectType;
   pluginId: string;
 };

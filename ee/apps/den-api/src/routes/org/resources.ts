@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, or } from "@openwork-ee/den-db/drizzle"
+import { and, desc, eq, inArray, isNull } from "@openwork-ee/den-db/drizzle"
 import {
   ConfigObjectTable,
   LlmProviderAccessTable,
@@ -22,6 +22,7 @@ import {
   resolveMemberTeamsMiddleware,
 } from "../../middleware/index.js"
 import { jsonResponse, unauthorizedSchema } from "../../openapi.js"
+import { listAccessibleLlmProviderAccess } from "./llm-provider-access.js"
 import { resolvePluginArchResourceRole, type PluginArchActorContext } from "./plugin-system/access.js"
 import type { OrgRouteVariables } from "./shared.js"
 
@@ -56,7 +57,7 @@ const resourceSnapshotResponseSchema = z.object({
 const assignedMarketplaceCapabilitiesResponseSchema = z.object({
   items: z.array(z.object({
     configObjectId: z.string(),
-    marketplaceId: z.string(),
+    marketplaceId: z.string().nullable(),
     objectType: z.string(),
     pluginId: z.string(),
   })),
@@ -102,27 +103,22 @@ async function listAccessibleLlmProviders(input: {
   organizationId: OrganizationId
   teamIds: TeamId[]
 }) {
-  const accessWhere = input.teamIds.length > 0
-    ? and(
-        eq(LlmProviderTable.organizationId, input.organizationId),
-        or(
-          eq(LlmProviderAccessTable.orgMembershipId, input.currentMemberId),
-          inArray(LlmProviderAccessTable.teamId, input.teamIds),
-        ),
-      )
-    : and(
-        eq(LlmProviderTable.organizationId, input.organizationId),
-        eq(LlmProviderAccessTable.orgMembershipId, input.currentMemberId),
-      )
+  const access = await listAccessibleLlmProviderAccess(input)
+  const providerIds = [...new Set(access.map((entry) => entry.llmProviderId))]
+  if (providerIds.length === 0) {
+    return {}
+  }
 
   const rows = await db
     .select({
       id: LlmProviderTable.id,
       updatedAt: LlmProviderTable.updatedAt,
     })
-    .from(LlmProviderAccessTable)
-    .innerJoin(LlmProviderTable, eq(LlmProviderAccessTable.llmProviderId, LlmProviderTable.id))
-    .where(accessWhere)
+    .from(LlmProviderTable)
+    .where(and(
+      eq(LlmProviderTable.organizationId, input.organizationId),
+      inArray(LlmProviderTable.id, providerIds),
+    ))
     .orderBy(desc(LlmProviderTable.updatedAt), desc(LlmProviderTable.id))
 
   const providers: Record<string, string> = {}
@@ -276,7 +272,7 @@ export function registerOrgResourceRoutes<T extends { Variables: OrgRouteVariabl
         c.get("memberTeams"),
         organizationContext.organization.id,
       ).map((team) => team.id)
-      const items = (await listAccessibleMarketplaceCapabilityReferences({
+      const items = await listAccessibleMarketplaceCapabilityReferences({
         organizationId: organizationContext.organization.id,
         member: {
           orgMembershipId: organizationContext.currentMember.id,
@@ -285,7 +281,7 @@ export function registerOrgResourceRoutes<T extends { Variables: OrgRouteVariabl
         enabled: memberFacingMcpConnectionsEnabled(organizationContext.organization.metadata, {
           gatingEnabled: env.mcpConnectionsGatingEnabled,
         }),
-      })).filter((item) => item.marketplaceId !== null)
+      })
       return c.json({ items })
     },
   )

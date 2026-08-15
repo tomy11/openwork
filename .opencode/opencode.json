@@ -10,6 +10,12 @@
       "environment": {
         "MEMORY_FILE_PATH": "{env:HOME}/.openwork-memory.json"
       }
+    },
+    "openwork": {
+      "type": "remote",
+      "enabled": true,
+      "url": "https://api.openworklabs.com/mcp/agent",
+      "oauth": {}
     }
   }
 }

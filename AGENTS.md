@@ -1,100 +1,73 @@
 # AGENTS.md
 
-OpenWork helps users run agents, skills, and MCP. It is an open-source alternative to Claude Cowork/Codex as a desktop app.
+OpenWork is a free, open-source desktop app (macOS, Windows, Linux) for doing
+work with AI agents on your own files — an open-source alternative to Claude
+Cowork and Codex, built on OpenCode, running any model from 50+ providers.
+Desktop mode keeps files local; cloud is optional. Three surfaces live in this
+repo:
 
-## What OpenWork Is
+- **Desktop app** (`apps/`, `packages/`) — local-first agent workspace: chat on
+  files, skills, browser automation, scheduled automations, Anthropic-compatible
+  plugins.
+- **OpenWork MCP gateway** (`ee/apps/den-api`) — one URL
+  (`api.openworklabs.com/mcp/agent`) that brings org-assigned skills, plugins,
+  and connections (Google Workspace, Microsoft 365, MCPs) into Codex, Claude
+  Code, Cursor, or any MCP client via `search_capabilities` /
+  `execute_capability`.
+- **OpenWork Den** (`ee/apps/den-*`) — the org control plane: provision
+  inference, manage teams and access, set desktop policies, publish skills and
+  plugins through marketplaces.
 
-OpenWork is a practical control surface for agentic work:
+The app consumes OpenWork server surfaces (self-hosted or hosted) rather than
+inventing parallel behavior. Anything OpenCode can do is available in OpenWork,
+even before a dedicated UI exists.
 
-* Run local and remote agent workflows from one place.
-* Use OpenCode capabilities directly through OpenWork.
-* Compose desktop app, server, and messaging connectors without lock-in.
-* Treat the OpenWork app as a client of the OpenWork server API surface.
-* Connect to hosted workers through a simple user flow: `Add a worker` -> `Connect remote`.
+## Verification (every change)
 
-## Core Philosophy
+- The only proof path is `evals/specs/**/*.test.ts` with `test` from
+  `@openwork/testkit`; app-driving specs use `.slow.test.ts`. Prose, screenshots,
+  and recordings never decide pass/fail — the testkit tape does.
+- Skills own the mechanics: `prove-a-pr` → `write-a-spec` → `run-tests` →
+  `diagnose-a-red-run` when red → `publish-evidence`. Evidence is ambient; never
+  create or pass roll handles.
+- Verdicts: `Passed` only when every claim has an observable assertion in the
+  tape; otherwise `Incomplete` or `Failed` with repro steps. Skips are never
+  passed.
+- Prefer Daytona when credentials are available; local fallback is an expected
+  OSS path, not a failure. Report which lane ran.
+- Docs/comments, types-only, and inert agent config may skip runtime proof — say so.
 
-* **Local-first, cloud-ready**: OpenWork runs on your machine in one click and can connect to cloud workflows when needed.
-* **Server-consumption first**: the app should consume OpenWork server surfaces (self-hosted or hosted), not invent parallel behavior.
-* **Composable**: use the desktop app, WhatsApp/Slack/Telegram connectors, or server mode based on the task.
-* **Ejectable**: OpenWork is powered by OpenCode, so anything OpenCode can do is available in OpenWork, even before a dedicated UI exists.
-* **Sharing is caring**: start solo, then share quickly; one CLI or desktop command can spin up an instantly shareable instance.
+## Pull requests
 
+- Do not default to draft PRs. A request to create or make a PR means a
+  ready-for-review PR once the required proof is published. Use a draft only
+  when the requester explicitly asks for one or the current verdict is
+  `Incomplete` or `Failed`, and state exactly what proof is missing.
+- Run tests and report commands + results. A runtime-observable change is not
+  done until its testkit tape is visible on the PR. If validation cannot run,
+  say why and give exact repro steps.
+- Feature work is demo-driven: `/voiceover <feature>` — no code until the script
+  is approved — then a fresh worktree (never the user's checkout), spec from the
+  narration, PR against `dev` with the tape. The `voiceover` skill owns the
+  journey.
 
-## Pull Request Expectations (Fast Merge)
+## Local headless web (agents)
 
-If you open a PR, you must run tests and report what you ran (commands + result).
+- `pnpm dev:headless-web --detach` launches an isolated browser UI + local
+ `openwork-server` without Electron, detached from the invoking shell. Read
+ `tmp/dev-headless-web.json` for `webUrl`, tokens, logs, and Den proxy URLs.
+ It does not use `~/.config/openwork/server.json`. Re-running reuses a healthy
+ instance; `--replace` restarts it with fresh tokens (`--keep-tokens` to
+ keep the previous ones). Cloud sign-in is copy/paste handoff (Den cannot
+ redirect grants to localhost): Account → Sign in → copy OpenWork link on Den
+ → Paste sign-in code in Settings.
 
-To maximize merge speed, include evidence of the end-to-end flow:
+## Coding
 
-* Ideally: attach a short video/screen recording showing the flow running successfully.
-* Otherwise: screenshots are acceptable, but video is preferred.
-
-If you cannot run tests or capture the video, say so explicitly and explain why, and include the exact commands/steps for the reviewer to reproduce.
-
-## Validate Every Experience
-
-Almost everything we change has an effect on the outside world — the
-filesystem, the runtime DB, server API responses, provisioning, sessions,
-or config. So the default is not "write code and hope"; it is **propose a
-flow, then drive it as the end user and validate it against reality until
-it actually holds.**
-
-A change is an *experience*: it might be a persistent feature, a single new
-button, or an entirely new screen. Every experience gets validated the same
-way — by producing **fraimz**, the frame-by-frame proof
-(`evals/results/<run-id>/fraimz.html`) where each frame binds a claim, the user
-action, an observable assertion, and a validated screenshot.
-
-The deliverable and the full loop (frame → coded flow → drive the real app via
-CDP → validate/repair → verdict) live in the **`fraimz` skill** — load it
-whenever a task asks you to "create a fraimz" / "prove it works", or whenever a
-change touches anything observable outside the process. Run it via the
-`/fraimz` command or `pnpm fraimz --flow <id>`.
-
-Report `Passed` only when `fraimz.html` exists and every claim is backed by an
-observable assertion; otherwise `Incomplete` / `Failed`, stated honestly with
-repro steps. Pure docs/comments and types-only changes with no runtime path may
-skip — but say so explicitly. For changes you expect to be inert, the `fraimz`
-skill's canonical core flow proves the core experience is unchanged.
-
-## Demo-Driven Development (the paved path)
-
-Feature work starts with the demo, not a PRD:
-
-1. `/voiceover <feature>` — align on the demo script; **no code until it is approved** (`voiceover` skill).
-2. Build on a fresh worktree/branch (`git worktree add ...`), never on the user's checkout.
-3. Prove it with fraimz until every frame holds (`fraimz` skill).
-4. Open a PR against `dev` and post the proof on it: `pnpm fraimz --flow <id> --pr`.
-
-## Coding Guidelines
-
-### TypeScript
-
-- Never use `any`, typecasts, or `as`, unless 100% necessary or specifically instructed.
-
-### Package Managers
-
-- Use pnpm.
-- Never use npm or yarn.
-
-### UI and UX
-
-- Use components from @/components when possible.
-- When creating new components, we prefer using shadcn/ui with (Base UI).
-- Assume most end users of OpenWork are non-technical.
-
-### Tech Stack Preferences
-
-When uncertain, prefer: Tailwind, TypeScript, React, shadcn/ui (Base UI), TanStack Query, Zustand, Zod, Drizzle, Better-Auth.
-
-### Code Style
-
-- Always strive for concise, simple solutions.
-- If a problem can be solved in a simpler way, propose it.
-- Use the smallest possible diff to make a change. Then think of how to make it smaller and do that again.
-- Avoid fallback expressions when types or control flow already guarantee a value.
-
-### Workflow
-
-- If asked to do too much work at once, stop and state that clearly.
+- pnpm only, never npm/yarn. TypeScript: never `any`, typecasts, or `as` unless
+  100% necessary or instructed.
+- Prefer Tailwind, React, shadcn/ui (Base UI), TanStack Query, Zustand, Zod,
+  Drizzle, Better-Auth. Reuse `@/components`; end users are non-technical.
+- Smallest possible diff, then make it smaller. Propose the simpler solution. No
+  fallback expressions when types or control flow already guarantee a value.
+- If asked to do too much at once, stop and say so.

@@ -124,6 +124,7 @@ test("buildNukeManifest includes default macOS state roots and preserves bootstr
   assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/runtime.sqlite-wal"));
   assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/runtime.sqlite-shm"));
   assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/runtime-opencode-config.json"));
+  assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/engine-instances.json"));
   assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/tokens.json"));
   assert.ok(manifest.deletePaths.includes("/Users/alice/.config/openwork/env.json"));
   assert.ok(manifest.deletePaths.includes("/Users/alice/.local/share/opencode"));

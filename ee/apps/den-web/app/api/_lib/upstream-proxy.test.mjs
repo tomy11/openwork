@@ -45,6 +45,28 @@ describe("Den upstream proxy", () => {
           return new Response("upstream unavailable", { status: 502 });
         }
 
+        if (url.pathname === "/v1/internal-headers") {
+          const upstreamOrigin = new URL(request.url).origin;
+          return new Response("sanitized", {
+            headers: {
+              "access-control-expose-headers": "Content-Length, X-Request-Id, X-Origin-Host",
+              "content-location": `${upstreamOrigin}/v1/internal-headers/body`,
+              "link": `<${upstreamOrigin}/v1/internal-headers/next>; rel="next"`,
+              "location": `${upstreamOrigin}/v1/internal-headers/redirect?next=1`,
+              "refresh": `0; url=${upstreamOrigin}/v1/internal-headers/login`,
+              "rndr-id": "render-request",
+              "server": "internal-origin",
+              "via": "internal-proxy",
+              "x-cache-key": "cache:key",
+              "x-content-type-options": "nosniff",
+              "x-origin-host": "den-api.internal",
+              "x-render-origin-server": "Render",
+              "x-request-id": "req_internal",
+              "x-upstream-result": "ok",
+            },
+          });
+        }
+
         return new Response("proxied", {
           status: 207,
           headers: {
@@ -195,7 +217,7 @@ describe("Den upstream proxy", () => {
       tracestate: null,
     });
     expect(response.status).toBe(207);
-    expect(response.headers.get("x-upstream-result")).toBe("ok");
+    expect(response.headers.get("x-upstream-result")).toBeNull();
     expect(response.headers.get("set-cookie")).toContain("sid=abc");
     expect(await response.text()).toBe("proxied");
     expect(logs).toHaveLength(1);
@@ -215,6 +237,33 @@ describe("Den upstream proxy", () => {
     expect(serializedLog).not.toContain("tok_test");
     expect(serializedLog).not.toContain("sess_test");
     expect(serializedLog).not.toContain(JSON.stringify({ ok: true }));
+  });
+
+  test("strips internal upstream response headers and rewrites upstream URLs", async () => {
+    const { proxyUpstream } = await import("./upstream-proxy.ts");
+    const request = new NextRequest("https://app.example.com/api/den/v1/internal-headers");
+
+    const response = await proxyUpstream(request, [], { routePrefix: "/api/den" });
+
+    expect(response.headers.get("access-control-expose-headers")).toBe("Content-Length");
+    for (const header of [
+      "rndr-id",
+      "server",
+      "via",
+      "x-cache-key",
+      "x-origin-host",
+      "x-render-origin-server",
+      "x-request-id",
+      "x-upstream-result",
+    ]) {
+      expect(response.headers.get(header)).toBeNull();
+    }
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-location")).toBe("https://app.example.com/api/den/v1/internal-headers/body");
+    expect(response.headers.get("link")).toBe("<https://app.example.com/api/den/v1/internal-headers/next>; rel=\"next\"");
+    expect(response.headers.get("location")).toBe("https://app.example.com/api/den/v1/internal-headers/redirect?next=1");
+    expect(response.headers.get("refresh")).toBe("0; url=https://app.example.com/api/den/v1/internal-headers/login");
+    expect(await response.text()).toBe("sanitized");
   });
 
   test("drops content-encoding after upstream fetch decompresses the body", async () => {

@@ -12,7 +12,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useShellConfig } from "../../shell/shell-config";
-import { OrganizationServerAffordance } from "../settings/cloud/organization-server-affordance";
 
 type WelcomePageProps = {
   onGetStarted: () => void;
@@ -25,10 +24,6 @@ type WelcomePageProps = {
   showManualFolder?: boolean;
   onTeamSignIn?: () => void;
   onJoinOrganization: () => void;
-  organizationServerBusy: boolean;
-  organizationServerError: string | null;
-  organizationServerUrl: string;
-  onOrganizationServerSave: (url: string) => Promise<boolean>;
 };
 
 export function WelcomePage({
@@ -42,10 +37,6 @@ export function WelcomePage({
   showManualFolder,
   onTeamSignIn,
   onJoinOrganization,
-  organizationServerBusy,
-  organizationServerError,
-  organizationServerUrl,
-  onOrganizationServerSave,
 }: WelcomePageProps) {
   const { config: shellConfig } = useShellConfig();
   const appName = shellConfig.appName;
@@ -59,12 +50,12 @@ export function WelcomePage({
   }, [markRouteReady]);
 
   return (
-    <Page className="min-h-screen">
+    <Page className="min-h-dvh">
       <PageTitlebarRegion />
 
       <ScrollArea className="relative z-10">
         <ScrollAreaViewport>
-          <div className="relative flex min-h-screen items-center justify-center px-6 py-16">
+          <div className="relative flex min-h-dvh items-center justify-center px-6 py-16">
             {/* Paper first-load spec: subtle black pixel-dither mosaic over a
                 near-white ground. `dark:invert` flips the pixels to white so
                 the texture survives dark mode. */}
@@ -149,13 +140,6 @@ export function WelcomePage({
                     </span>
                   </button>
                 </div>
-
-                <OrganizationServerAffordance
-                  busy={organizationServerBusy}
-                  error={organizationServerError}
-                  onSave={onOrganizationServerSave}
-                  url={organizationServerUrl}
-                />
 
                 {error ? (
                   <p className="text-center text-xs text-destructive">{error}</p>

@@ -2,6 +2,7 @@
 import { useEffect, useReducer, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import {
   BookOpen,
+  ArrowUpRight,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -45,15 +46,18 @@ import {
   matchesExtensionFilter,
   taxonomyForDirectoryEntry,
   type ExtensionInventoryFilter,
+  type ExtensionInventoryState,
 } from "../extension-taxonomy";
 import { SettingsGroupHeader } from "../settings-section";
 import { SettingsListSearchInput } from "../settings-list";
 import {
+  openDesktopUrl,
   openDesktopPath,
   readOpencodeConfig,
   revealDesktopItemInDir,
   type OpencodeConfigFile,
 } from "../../../../app/lib/desktop";
+import { readDenSettings } from "../../../../app/lib/den";
 import {
   getMcpIdentityKey,
   normalizeMcpSlug,
@@ -65,6 +69,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmModal } from "../../../design-system/modals/confirm-modal";
 import { AddMcpModal } from "../../connections/modals/add-mcp-modal";
+import type { McpConnectResult } from "../../connections/store";
 import { ClaudePluginImportModal } from "../../connections/modals/claude-plugin-import-modal";
 import {
   canDisconnectMemberConnection,
@@ -87,6 +92,12 @@ import {
   type ConfigScope,
   type McpViewLocalState,
 } from "./mcp-view-state";
+import { useCloudSession } from "../cloud/cloud-session-provider";
+import {
+  openInDenLibraryUrl,
+  shouldShowOpenInDenAction,
+  type DenLibraryTarget,
+} from "../open-in-den";
 
 export type ReactMcpStatus =
   | "connected"
@@ -129,7 +140,6 @@ export type McpViewProps = {
   /** Read skill content by name. */
   readSkill?: (name: string) => Promise<{ content: string } | null>;
   readConfigFile?: (scope: "project" | "global") => Promise<OpencodeConfigFile | null>;
-  showHeader?: boolean;
   mcpServers: McpServerEntry[];
   mcpStatus: string | null;
   mcpLastUpdatedAt: number | null;
@@ -138,7 +148,7 @@ export type McpViewProps = {
   selectedMcp: string | null;
   setSelectedMcp: (name: string | null) => void;
   quickConnect: McpDirectoryInfo[];
-  connectMcp: (entry: McpDirectoryInfo) => void;
+  connectMcp: (entry: McpDirectoryInfo) => Promise<McpConnectResult>;
   authorizeMcp: (entry: McpServerEntry) => void;
   logoutMcpAuth: (name: string) => Promise<void> | void;
   removeMcp: (name: string) => void;
@@ -157,6 +167,8 @@ export type McpViewProps = {
   installClaudePlugin?: (url: string) => Promise<{ ok: boolean; message: string }>;
   /** Connected org-level External MCP Connections rendered in My Extensions. */
   orgMcpItems?: ExtensionItem[];
+  organizationName?: string | null;
+  orgMcpError?: string | null;
   orgMcpConnectingId?: string | null;
   connectOrgMcp?: (connectionId: string) => void;
   reconnectOrgMcp?: (connectionId: string) => void;
@@ -164,6 +176,8 @@ export type McpViewProps = {
   disconnectOrgMcp?: (connectionId: string) => void;
   initialFilter?: ExtensionInventoryFilter;
   onFilterChange?: (filter: ExtensionInventoryFilter) => void;
+  initialState?: ExtensionInventoryState;
+  onStateChange?: (state: ExtensionInventoryState, filter: ExtensionInventoryFilter) => void;
   /** Stable extension detail id from `/extensions/:id`. */
   detailId?: string | null;
   /** Navigate when detail opens/closes. When set, detail renders as a page. */
@@ -343,7 +357,8 @@ function resolveExtensionDetailTarget(
 }
 
 export function McpView(props: McpViewProps) {
-  const showHeader = props.showHeader !== false;
+  const cloudSession = useCloudSession();
+  const denBaseUrl = readDenSettings().baseUrl;
   const skillCount = props.installedSkills?.length ?? 0;
   const useRoutedDetail = typeof props.onDetailIdChange === "function";
   const [detailTarget, setDetailTarget] = useState<ExtensionDetailTarget | null>(null);
@@ -358,6 +373,12 @@ export function McpView(props: McpViewProps) {
   const [computerUseMcpCommand, setComputerUseMcpCommand] = useState<string[] | null>(null);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<ExtensionInventoryFilter>(props.initialFilter ?? "all");
+  const [inventoryState, setInventoryState] = useState<ExtensionInventoryState>(props.initialState ?? "all");
+  const [inventoryStateCounts, setInventoryStateCounts] = useState<InventoryStateCounts>({
+    needs_signin: 0,
+    needs_admin_setup: 0,
+    ready: 0,
+  });
   const [showHidden, setShowHidden] = useState(false);
   const [layout, setLayout] = useState<ExtensionLayout>(readExtensionLayout);
   const [claudeImportOpen, setClaudeImportOpen] = useState(false);
@@ -405,9 +426,29 @@ export function McpView(props: McpViewProps) {
   const installedPlugins = props.installedPlugins ?? [];
   const orgMcpItems = props.orgMcpItems ?? [];
   const detailPresentation = useRoutedDetail ? "page" : "dialog";
+  const openInDenAction = (target: DenLibraryTarget): ReactNode => {
+    if (!shouldShowOpenInDenAction(denBaseUrl, cloudSession.isSignedIn, target)) return null;
+    const url = openInDenLibraryUrl(denBaseUrl, target);
+    if (!url) return null;
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        className="w-fit"
+        onClick={() => void openDesktopUrl(url)}
+      >
+        {t("extensions.open_in_den")}
+        <ArrowUpRight size={13} />
+      </Button>
+    );
+  };
   const setInventoryFilter = (nextFilter: ExtensionInventoryFilter) => {
     setFilter(nextFilter);
     props.onFilterChange?.(nextFilter);
+  };
+  const setInventoryStateFilter = (nextState: ExtensionInventoryState) => {
+    setInventoryState(nextState);
+    props.onStateChange?.(nextState, filter);
   };
 
   const closeDetail = () => {
@@ -434,8 +475,12 @@ export function McpView(props: McpViewProps) {
   };
 
   useEffect(() => {
-    setFilter(props.initialFilter ?? "all");
-  }, [props.initialFilter]);
+    const nextState = props.initialState ?? "all";
+    setInventoryState(nextState);
+    if (nextState === "all") {
+      setFilter(props.initialFilter ?? "all");
+    }
+  }, [props.initialFilter, props.initialState]);
 
   useEffect(() => {
     if (!useRoutedDetail) return;
@@ -591,12 +636,14 @@ export function McpView(props: McpViewProps) {
 
   // Auto-configured built-ins like openwork-cloud remain active but hidden from
   // Your apps until Show hidden reveals the row for disable/remove.
-  const visibleMcpServers = showHidden
-    ? props.mcpServers
-    : props.mcpServers.filter((entry) => {
-        const match = resolveQuickConnectMatch(entry.name);
-        return !match || !isOpenWorkExtensionHidden(match);
-      });
+  const visibleMcpServers = inventoryState === "all" && (filter === "all" || filter === "mcp")
+    ? showHidden
+      ? props.mcpServers
+      : props.mcpServers.filter((entry) => {
+          const match = resolveQuickConnectMatch(entry.name);
+          return !match || !isOpenWorkExtensionHidden(match);
+        })
+    : [];
 
   const displayName = (name: string) => resolveQuickConnectMatch(name)?.name ?? name;
 
@@ -634,7 +681,7 @@ export function McpView(props: McpViewProps) {
   };
 
   const supportsOauth = (entry: McpServerEntry) =>
-    entry.config.type === "remote" && entry.config.oauth !== false;
+    Boolean(entry.managedOAuth) || (entry.config.type === "remote" && entry.config.oauth !== false);
 
   const resolveStatus = (entry: McpServerEntry): ReactMcpStatus => {
     if (entry.config.enabled === false) return "disabled";
@@ -642,9 +689,6 @@ export function McpView(props: McpViewProps) {
     return resolved?.status ?? "disconnected";
   };
 
-  const connectedCount = props.mcpServers.filter(
-    (entry) => resolveStatus(entry) === "connected",
-  ).length;
   const hiddenCount = quickConnectList.filter((entry) => isOpenWorkExtensionHidden(entry)).length +
     (props.installedSkills ?? []).filter((skill) => isOpenWorkExtensionHidden(getSkillHiddenId(skill))).length +
     (props.installedPlugins ?? []).filter((plugin) => isOpenWorkExtensionHidden(`plugin:${plugin.pluginId}`)).length;
@@ -786,6 +830,7 @@ export function McpView(props: McpViewProps) {
             path={detailSkill.origin === "openwork-connect" ? undefined : detailSkill.path}
             trigger={detailSkill.trigger}
             contentPreview={detailSkillContent ?? undefined}
+            configSlot={openInDenAction({ id: detailSkill.path })}
             onReveal={detailSkill.path && detailSkill.origin !== "openwork-connect" ? () => {
               void revealDesktopItemInDir(detailSkill.path);
             } : undefined}
@@ -820,6 +865,7 @@ export function McpView(props: McpViewProps) {
           url={detailConnectMcp.config.type === "remote" ? detailConnectMcp.config.url : undefined}
           oauth={detailConnectMcp.config.type === "remote"}
           showEnablementCard
+          configSlot={openInDenAction({ id: detailConnectMcp.id ?? detailConnectMcp.name })}
         />
       ) : null}
 
@@ -836,6 +882,7 @@ export function McpView(props: McpViewProps) {
             taxonomy="plugin"
             connected={true}
             hidden={hidden}
+            configSlot={openInDenAction({ id: `marketplace:installed:${detailPlugin.pluginId}`, pluginId: detailPlugin.pluginId })}
             onUninstall={props.removeCloudPlugin ? () => {
               void props.removeCloudPlugin?.(detailPlugin.pluginId);
               closeDetail();
@@ -867,6 +914,7 @@ export function McpView(props: McpViewProps) {
             connecting={connectingBusy || disconnectingBusy}
             connectingLabel={disconnectingBusy ? t("mcp.org_connection_disconnecting_action") : t("mcp.org_connection_waiting_browser")}
             beta
+            errorInfo={props.orgMcpError}
             url={connection.url}
             oauth={connection.authType === "oauth"}
             connectLabel={orgMcpConnectionActionLabel(connection)}
@@ -878,9 +926,12 @@ export function McpView(props: McpViewProps) {
             closeOnUninstall={false}
             showEnablementCard={false}
             configSlot={(
-              <div className="flex flex-wrap gap-2">
-                <span className="rounded-full border border-dls-border bg-dls-hover px-2 py-1 text-xs text-dls-secondary">Shared by your organization</span>
-                <span className="rounded-full border border-dls-border bg-dls-hover px-2 py-1 text-xs text-dls-secondary">{connection.credentialMode === "shared" ? "Org account" : "Your account"}</span>
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap gap-2">
+                  <span className="rounded-full border border-dls-border bg-dls-hover px-2 py-1 text-xs text-dls-secondary">Shared by your organization</span>
+                  <span className="rounded-full border border-dls-border bg-dls-hover px-2 py-1 text-xs text-dls-secondary">{connection.credentialMode === "shared" ? "Org account" : "Your account"}</span>
+                </div>
+                {openInDenAction({ id: detailOrgMcpItem.id })}
               </div>
             )}
           />
@@ -904,17 +955,13 @@ export function McpView(props: McpViewProps) {
           <ChevronLeft size={16} />
           {t("extensions.title")}
         </Button>
-        <p className="text-sm text-dls-secondary">This extension is not available in the current workspace.</p>
+        <p className="text-sm text-dls-secondary">This library item is not available in the current workspace.</p>
       </div>
     );
   }
 
   return (
     <section className="space-y-8 max-w-3xl w-full animate-in fade-in duration-300">
-      {showHeader ? (
-        <McpViewHeader connectedCount={connectedCount} />
-      ) : null}
-
       {props.mcpStatus ? (
         <div className="whitespace-pre-wrap wrap-break-word rounded-xl border border-dls-border bg-dls-hover px-4 py-3 text-xs text-dls-secondary">
           {props.mcpStatus}
@@ -927,11 +974,19 @@ export function McpView(props: McpViewProps) {
         </div>
       ) : null}
 
-      {/* Search + filter */}
+      <ExtensionStateTabs
+        state={inventoryState}
+        needsSigninCount={inventoryStateCounts.needs_signin}
+        needsAdminSetupCount={inventoryStateCounts.needs_admin_setup}
+        readyCount={inventoryStateCounts.ready}
+        onChange={setInventoryStateFilter}
+      />
+
+      {/* Search + kind filter */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="flex-1">
           <SettingsListSearchInput
-            placeholder="Search extensions..."
+            placeholder="Search library..."
             value={search}
             onChange={(e) => setSearch(e.currentTarget.value)}
           />
@@ -969,7 +1024,11 @@ export function McpView(props: McpViewProps) {
         entries={
           quickConnectList.filter((entry) => {
             if (!showHidden && (isOpenWorkExtensionHidden(entry) || (props.builtInExtensionsDisabled && isBuiltInOpenWorkExtension(entry)))) return false;
-            if (!matchesExtensionFilter(filter, taxonomyForDirectoryEntry(entry))) return false;
+            if (!matchesExtensionFilter(
+              filter,
+              taxonomyForDirectoryEntry(entry),
+              entry.kind === "mcp" ? "mcp" : null,
+            )) return false;
             if (!search.trim()) return true;
             const q = search.toLowerCase();
             return entry.name.toLowerCase().includes(q) || entry.description.toLowerCase().includes(q);
@@ -986,7 +1045,7 @@ export function McpView(props: McpViewProps) {
         }
         availableConnectMcpServers={
           availableConnectMcpServers.filter((entry) => {
-            if (!matchesExtensionFilter(filter, "connection")) return false;
+            if (!matchesExtensionFilter(filter, "connection", "mcp")) return false;
             if (!search.trim()) return true;
             const query = search.toLowerCase();
             return [
@@ -1000,6 +1059,8 @@ export function McpView(props: McpViewProps) {
         loading={props.inventoryLoading === true}
         layout={layout}
         filter={filter}
+        state={inventoryState}
+        onStateCountsChange={setInventoryStateCounts}
         installedPlugins={
           installedPlugins.filter((plugin) => {
             if (!showHidden && isOpenWorkExtensionHidden(`plugin:${plugin.pluginId}`)) return false;
@@ -1015,12 +1076,17 @@ export function McpView(props: McpViewProps) {
         orgMcpItems={
           orgMcpItems.filter((item) => {
             if (!isOrgMcpConnectionItem(item)) return false;
-            if (!matchesExtensionFilter(filter, "connection")) return false;
+            if (!matchesExtensionFilter(
+              filter,
+              "connection",
+              item.orgMcpConnection.nativeProviderKey == null ? "mcp" : "native",
+            )) return false;
             if (!search.trim()) return true;
             const q = search.toLowerCase();
             return [item.name, item.description ?? "", item.orgMcpConnection.url].join(" ").toLowerCase().includes(q);
           })
         }
+        organizationName={props.organizationName}
         busy={props.busy}
         connectingName={props.mcpConnectingName}
         isEntryHidden={(entry) => isOpenWorkExtensionHidden(entry)}
@@ -1034,7 +1100,9 @@ export function McpView(props: McpViewProps) {
         isConfigured={isEntryConfigured}
         enablementForEntry={props.enablementContext ? enablementForEntry : undefined}
         statusForEntry={quickConnectStatus}
-        onConnect={props.connectMcp}
+        onConnect={(entry) => {
+          void props.connectMcp(entry);
+        }}
         onDetail={(entry) => openDetail({ kind: "entry", entry })}
         onSkillDetail={(skill) => openDetail({ kind: "skill", skill })}
         onConnectMcpDetail={(entry) => openDetail({ kind: "connect-mcp", entry })}
@@ -1126,7 +1194,7 @@ export function McpView(props: McpViewProps) {
       <AddMcpModal
         open={addMcpModalOpen}
         onClose={() => setAddMcpModalOpen(false)}
-        onAdd={(entry) => props.connectMcp(entry)}
+        onAdd={props.connectMcp}
         busy={props.busy}
         isRemoteWorkspace={props.isRemoteWorkspace}
       />
@@ -1142,23 +1210,6 @@ export function McpView(props: McpViewProps) {
 
       {detailPanels}
     </section>
-  );
-}
-
-function McpViewHeader(props: { connectedCount: number }) {
-  return (
-    <div>
-      <h2 className="text-3xl font-semibold text-dls-text">{t("mcp.apps_title")}</h2>
-      <p className="mt-1.5 text-sm text-dls-secondary">{t("mcp.apps_subtitle")}</p>
-      {props.connectedCount > 0 ? (
-        <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-green-3 px-3 py-1">
-          <div className="size-2 rounded-full bg-green-9" />
-          <span className="text-xs font-medium text-green-11">
-            {props.connectedCount} {props.connectedCount === 1 ? t("mcp.app_connected") : t("mcp.apps_connected")}
-          </span>
-        </div>
-      ) : null}
-    </div>
   );
 }
 
@@ -1185,11 +1236,109 @@ function inventoryGroupLabel(group: ExtensionInventoryGroup) {
   }
 }
 
+function connectMcpInventoryGroup(entry: McpServerEntry, statuses: McpStatusMap): ExtensionInventoryGroup {
+  return statuses[entry.id ?? entry.name]?.status === "connected" ? "ready" : "needs_signin";
+}
+
+type InventoryStateCounts = Record<Exclude<ExtensionInventoryState, "all">, number>;
+
+export function countInventoryCardGroups(groups: ExtensionInventoryGroup[]): InventoryStateCounts {
+  return {
+    needs_signin: groups.filter((group) => group === "needs_signin").length,
+    needs_admin_setup: groups.filter((group) => group === "needs_admin_setup").length,
+    ready: groups.filter((group) => group === "ready").length,
+  };
+}
+
+export function filterInventoryCardsByState<T extends { group: ExtensionInventoryGroup }>(
+  cards: T[],
+  state: Exclude<ExtensionInventoryState, "all">,
+) {
+  return cards.filter((card) => card.group === state);
+}
+
+export function ExtensionStateTabs(props: {
+  state: ExtensionInventoryState;
+  needsSigninCount: number;
+  needsAdminSetupCount: number;
+  readyCount: number;
+  onChange: (state: ExtensionInventoryState) => void;
+}) {
+  const tabs = [
+    { state: "all", label: t("extensions.state_all"), count: null, countClassName: "" },
+    {
+      state: "needs_signin",
+      label: t("extensions.state_needs_signin"),
+      count: props.needsSigninCount,
+      countClassName: "bg-amber-3 text-amber-11",
+    },
+    {
+      state: "needs_admin_setup",
+      label: t("extensions.state_needs_admin_setup"),
+      count: props.needsAdminSetupCount,
+      countClassName: "bg-red-3 text-red-11",
+    },
+    {
+      state: "ready",
+      label: t("connect.group_ready"),
+      count: props.readyCount,
+      countClassName: "bg-gray-3 text-gray-11",
+    },
+  ] satisfies Array<{
+    state: ExtensionInventoryState;
+    label: string;
+    count: number | null;
+    countClassName: string;
+  }>;
+
+  return (
+    <div className="flex flex-wrap gap-5 border-b border-dls-border" role="tablist" aria-label="Library state">
+      {tabs.filter((tab) => tab.state === "all" || tab.count !== 0).map((tab) => {
+        const active = props.state === tab.state;
+        return (
+          <button
+            key={tab.state}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            className={`-mb-px inline-flex items-center gap-2 border-b-2 px-0.5 pb-2.5 text-sm font-medium transition-colors ${
+              active
+                ? "border-dls-text text-dls-text"
+                : "border-transparent text-dls-secondary hover:text-dls-text"
+            }`}
+            onClick={() => props.onChange(tab.state)}
+          >
+            <span>{tab.label}</span>
+            {tab.count === null ? null : (
+              <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ${tab.countClassName}`}>
+                {tab.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 type InventoryCard = {
   key: string;
   group: ExtensionInventoryGroup;
   node: ReactNode;
 };
+
+const orgConnectionSigninBoilerplate = "Available from your organization. Connect your own account to use it.";
+
+function orgMcpCardDescription(item: ExtensionItem, state: ExtensionInventoryState) {
+  const description = item.description?.trim() ?? "";
+  if (state !== "needs_signin" || !description.includes(orgConnectionSigninBoilerplate)) {
+    return description || "Shared by your organization.";
+  }
+  return description
+    .replace(orgConnectionSigninBoilerplate, "")
+    .replace(/\s+—\s*$/, "")
+    .trim() || "Shared connection";
+}
 
 function ExtensionLayoutToggle(props: {
   layout: ExtensionLayout;
@@ -1227,6 +1376,8 @@ function McpQuickConnectSection(props: {
   loading: boolean;
   layout: ExtensionLayout;
   filter: ExtensionInventoryFilter;
+  state: ExtensionInventoryState;
+  onStateCountsChange: (counts: InventoryStateCounts) => void;
   installedPlugins?: CloudImportedPlugin[];
   orgMcpItems?: ExtensionItem[];
   organizationName?: string | null;
@@ -1322,7 +1473,7 @@ function McpQuickConnectSection(props: {
     const ready = status === "connected";
     cards.push({
       key: `connect-mcp:${entry.id ?? entry.name}`,
-      group: ready ? "ready" : "needs_signin",
+      group: connectMcpInventoryGroup(entry, props.availableConnectMcpStatuses),
       node: (
         <ExtensionCard
           layout={props.layout}
@@ -1381,7 +1532,7 @@ function McpQuickConnectSection(props: {
           <ExtensionCard
             layout={props.layout}
             name={item.name}
-            description={item.description ?? "Shared by your organization."}
+            description={orgMcpCardDescription(item, props.state)}
             taxonomy="connection"
             url={connection.url}
             connected={group === "ready"}
@@ -1408,13 +1559,32 @@ function McpQuickConnectSection(props: {
     });
   }
 
+  const stateCounts = countInventoryCardGroups(cards.map((card) => card.group));
+  useEffect(() => {
+    props.onStateCountsChange(stateCounts);
+  }, [props.onStateCountsChange, stateCounts.needs_signin, stateCounts.needs_admin_setup, stateCounts.ready]);
+
   const grouped = inventoryGroupOrder
     .map((group) => ({ group, cards: cards.filter((card) => card.group === group) }))
     .filter((entry) => entry.cards.length > 0);
+  const stateCards = props.state === "all"
+    ? []
+    : filterInventoryCardsByState(cards, props.state);
+  const hasCards = props.state === "all" ? grouped.length > 0 : stateCards.length > 0;
+  const organizationName = props.organizationName?.trim() || "your organization";
+  const stateCaption = props.state === "needs_signin"
+    ? t("extensions.state_needs_signin_caption", { org: organizationName })
+    : props.state === "needs_admin_setup"
+      ? t("extensions.state_needs_admin_setup_caption", { org: organizationName })
+      : null;
+  const cardContainerClassName = props.layout === "list"
+    ? "overflow-hidden rounded-xl border border-dls-border bg-dls-surface [&>div+div]:border-t [&>div+div]:border-dls-border/60"
+    : "grid grid-cols-[repeat(auto-fill,minmax(min(100%,20rem),1fr))] gap-3";
 
   return (
     <div className="space-y-6">
-      {grouped.length === 0 && props.loading ? (
+      {stateCaption ? <p className="text-sm text-dls-secondary">{stateCaption}</p> : null}
+      {!hasCards && props.loading ? (
         <div className={props.layout === "list" ? "flex flex-col gap-2" : "grid grid-cols-[repeat(auto-fill,minmax(min(100%,20rem),1fr))] gap-3"}>
           {[0, 1, 2].map((index) => (
             <Skeleton
@@ -1423,19 +1593,21 @@ function McpQuickConnectSection(props: {
             />
           ))}
         </div>
-      ) : grouped.length === 0 ? (
+      ) : !hasCards ? (
         <div className="rounded-xl border border-dashed border-dls-border px-5 py-10 text-center">
           <Unplug size={24} className="mx-auto mb-3 text-dls-secondary/30" />
-          <div className="text-sm font-medium text-dls-secondary">No extensions found</div>
+          <div className="text-sm font-medium text-dls-secondary">No library items found</div>
           <div className="mt-1 text-xs text-dls-secondary/60">
             {props.filter === "connection"
               ? props.organizationName?.trim()
                 ? t("extensions.empty_connections", { org: props.organizationName.trim() })
                 : t("extensions.empty_connections_signed_out")
-              : "Try a different search or filter, or add an MCP server."}
+              : props.filter === "mcp"
+                ? "MCP-backed connections appear here too. Try a different search or add an MCP server."
+                : "Try a different search or filter, or add an MCP server."}
           </div>
         </div>
-      ) : (
+      ) : props.state === "all" ? (
         grouped.map(({ group, cards: groupCards }) => (
           <div key={group} className="space-y-4">
             <SettingsGroupHeader
@@ -1444,19 +1616,19 @@ function McpQuickConnectSection(props: {
               hint={group === "available" ? t("extensions.group_ready_to_set_up_hint") : undefined}
             />
             {/* List mode: one quiet container per readiness group, rows divided by hairlines. */}
-            <div
-              className={
-                props.layout === "list"
-                  ? "overflow-hidden rounded-xl border border-dls-border bg-dls-surface [&>div+div]:border-t [&>div+div]:border-dls-border/60"
-                  : "grid grid-cols-[repeat(auto-fill,minmax(min(100%,20rem),1fr))] gap-3"
-              }
-            >
+            <div className={cardContainerClassName}>
               {groupCards.map((card) => (
-                <div key={card.key}>{card.node}</div>
+                <div key={card.key} data-inventory-group={card.group}>{card.node}</div>
               ))}
             </div>
           </div>
         ))
+      ) : (
+        <div className={cardContainerClassName}>
+          {stateCards.map((card) => (
+            <div key={card.key} data-inventory-group={card.group}>{card.node}</div>
+          ))}
+        </div>
       )}
     </div>
   );

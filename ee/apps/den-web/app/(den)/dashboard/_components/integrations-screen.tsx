@@ -56,7 +56,6 @@ export function IntegrationsScreen() {
   return (
     <DashboardPageTemplate
       icon={Cable}
-      badgeLabel="Alpha"
       title="Sources"
       description="Connect to GitHub or Bitbucket. Once an account is linked, plugins and skills from those repositories show up on the Plugins page."
       colors={["#E0F2FE", "#0C4A6E", "#0284C7", "#7DD3FC"]}

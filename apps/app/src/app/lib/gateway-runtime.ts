@@ -2,6 +2,7 @@
 // so low-level clients can choose same-origin gateway behavior without cycles.
 export type OpenworkGatewayMarker = {
   version?: number;
+  build?: string;
 };
 
 declare global {
@@ -14,6 +15,12 @@ const DEN_AUTH_TOKEN_STORAGE_KEY = "openwork.den.authToken";
 
 export function isOpenworkGatewayRuntime() {
   return typeof window !== "undefined" && window.__OPENWORK_GATEWAY__?.version === 1;
+}
+
+export function getOpenworkGatewayBuild(): string | null {
+  if (!isOpenworkGatewayRuntime()) return null;
+  const build = window.__OPENWORK_GATEWAY__?.build?.trim() ?? "";
+  return build || null;
 }
 
 export function getOpenworkGatewayOrigin() {

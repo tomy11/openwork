@@ -114,7 +114,7 @@ function toWebRequest(nodeReq: IncomingMessage, hostname: string, port: number):
 /**
  * Write a Web API Response to a Node.js ServerResponse.
  */
-async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
+export async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
   const headersObj: Record<string, string | string[]> = {};
   webRes.headers.forEach((value, key) => {
     const existing = headersObj[key];
@@ -135,16 +135,27 @@ async function writeWebResponse(webRes: Response, nodeRes: ServerResponse): Prom
   }
 
   const reader = webRes.body.getReader();
+  let completed = false;
+  const cancelOnDisconnect = () => {
+    void reader.cancel(new Error("Response client disconnected")).catch(() => undefined);
+  };
+  nodeRes.once("close", cancelOnDisconnect);
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       if (!isResponseWritable(nodeRes)) break;
       if (!nodeRes.write(value)) {
         await waitForDrainOrClose(nodeRes);
+        if (!isResponseWritable(nodeRes)) break;
       }
     }
   } finally {
+    nodeRes.off("close", cancelOnDisconnect);
+    if (!completed) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
     endResponse(nodeRes);
   }
@@ -208,7 +219,11 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
       }
       reject(error);
     });
-    server.listen(port, hostname, () => {
+    // A standing "listening" listener, not the listen() callback: Node keeps
+    // the callback-registered once("listening") listener alive across the
+    // EADDRINUSE retry, but Bun does not — under Bun the fallback re-bind
+    // succeeded while this promise hung forever.
+    server.on("listening", () => {
       const addr = server.address();
       if (addr && typeof addr === "object") {
         boundPort = addr.port;
@@ -236,5 +251,6 @@ export function serve(options: ServeOptions): Promise<ServeResult> {
         },
       });
     });
+    server.listen(port, hostname);
   });
 }

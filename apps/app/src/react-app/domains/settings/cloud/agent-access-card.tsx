@@ -8,6 +8,7 @@ import type {
   OpenworkCloudMcpEngineRefresh,
   OpenworkCloudMcpHealth,
   OpenworkCloudMcpProviderModelContext,
+  OpenworkConnectState,
   OpenworkServerClient,
 } from "@/app/lib/openwork-server";
 import { Button } from "@/components/ui/button";
@@ -32,6 +33,7 @@ import {
   cloudMcpProbeTraceLines,
 } from "@/react-app/domains/connections/cloud-mcp-diagnostics";
 import { readCloudMcpUserState } from "@/react-app/domains/connections/cloud-mcp-user-state";
+import { resolveOpenWorkConnectStateSummary } from "@/react-app/domains/connections/openwork-connect-status";
 import { t } from "@/i18n";
 
 const CLOUD_MCP_REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000;
@@ -76,6 +78,16 @@ function buildCloudMcpContext(input: {
   };
 }
 
+function missingCloudMcpContextMessage(input: {
+  client: OpenworkServerClient | null;
+  workspaceId: string | null;
+}): string {
+  if (!input.workspaceId?.trim()) return "Select a workspace before running agent access diagnostics.";
+  if (!input.client?.baseUrl.trim()) return "Connect to the workspace server before running agent access diagnostics.";
+  if (!readDenSettings().activeOrgId?.trim()) return "Select an organization before running agent access diagnostics.";
+  return "Agent access diagnostics are unavailable for the current workspace.";
+}
+
 export function readyCloudMcpToolIds(health: OpenworkCloudMcpHealth | null): string[] {
   if (!health?.usable) return [];
   return health.tools.present.filter((tool) => OPENWORK_CLOUD_EXPECTED_TOOLS.some((expected) => expected === tool));
@@ -89,6 +101,7 @@ export function AgentAccessCard(props: {
 }) {
   const cloudSession = useCloudSession();
   const [health, setHealth] = useState<OpenworkCloudMcpHealth | null>(null);
+  const [connectState, setConnectState] = useState<OpenworkConnectState | null>(null);
   const [busy, setBusy] = useState<"test" | "repair" | "refresh" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -97,14 +110,44 @@ export function AgentAccessCard(props: {
   const context = buildCloudMcpContext(props);
   const userState = context ? readCloudMcpUserState(context) : null;
   const signedIn = cloudSession.isSignedIn && Boolean(cloudSession.authToken.trim());
-  const orgSelected = Boolean(context?.orgId.trim());
-  const summary = cloudMcpDisplaySummary({
-    signedIn,
-    orgSelected,
-    connecting: busy !== null,
-    userState,
-    health,
-  });
+  const orgSelected = Boolean(readDenSettings().activeOrgId?.trim());
+  const missingContextSummary = signedIn && busy === null && !context
+    ? !props.workspaceId?.trim()
+      ? {
+          status: "not_checked" as const,
+          statusLabel: "Not checked",
+          tone: "neutral" as const,
+          stageLabel: "Select a workspace",
+          recommendedAction: "Choose the workspace agents should use.",
+        }
+      : !props.client?.baseUrl.trim()
+        ? {
+            status: "not_checked" as const,
+            statusLabel: "Not checked",
+            tone: "neutral" as const,
+            stageLabel: "Connect the workspace server",
+            recommendedAction: "Restore the workspace server connection.",
+          }
+        : !orgSelected
+          ? {
+              status: "degraded" as const,
+              statusLabel: "Degraded",
+              tone: "error" as const,
+              stageLabel: "Select an organization",
+              recommendedAction: "Choose the organization agents should use.",
+            }
+          : null
+    : null;
+  const connectStateSummary = connectState && (connectState.status !== "available" || !connectState.connectEnabled)
+    ? resolveOpenWorkConnectStateSummary(connectState.status, connectState.connectEnabled)
+    : null;
+  const summary = missingContextSummary ?? connectStateSummary ?? cloudMcpDisplaySummary({
+      signedIn,
+      orgSelected,
+      connecting: busy !== null,
+      userState,
+      health,
+    });
 
   const updateHealth = (next: OpenworkCloudMcpHealth | null) => {
     setHealth(next);
@@ -112,7 +155,10 @@ export function AgentAccessCard(props: {
   };
 
   const testNow = async () => {
-    if (!props.client || !context) return;
+    if (!props.client || !context) {
+      setError(missingCloudMcpContextMessage(props));
+      return;
+    }
     setBusy("test");
     setError(null);
     try {
@@ -136,7 +182,10 @@ export function AgentAccessCard(props: {
   };
 
   const refreshEngineConnection = async () => {
-    if (!props.client || !context) return;
+    if (!props.client || !context) {
+      setError(missingCloudMcpContextMessage(props));
+      return;
+    }
     setBusy("refresh");
     setError(null);
     try {
@@ -181,7 +230,10 @@ export function AgentAccessCard(props: {
   };
 
   const repairAndTest = async () => {
-    if (!props.client || !context) return;
+    if (!props.client || !context) {
+      setError(missingCloudMcpContextMessage(props));
+      return;
+    }
     setBusy("repair");
     setError(null);
     try {
@@ -204,6 +256,24 @@ export function AgentAccessCard(props: {
       setBusy(null);
     }
   };
+
+  useEffect(() => {
+    if (!props.client) {
+      setConnectState(null);
+      return;
+    }
+    let cancelled = false;
+    void props.client.getConnectState(props.workspaceId)
+      .then((state) => {
+        if (!cancelled) setConnectState(state);
+      })
+      .catch(() => {
+        if (!cancelled) setConnectState(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [health, props.client, props.workspaceId, signedIn]);
 
   useEffect(() => {
     if (!props.client || !context || !signedIn) {
@@ -276,7 +346,7 @@ export function AgentAccessCard(props: {
   const canRun = Boolean(props.client && context && signedIn);
   const readyTools = readyCloudMcpToolIds(health);
 
-  if (health?.usable) {
+  if (health?.usable && !connectStateSummary) {
     return (
       <SettingsInset className="flex flex-col gap-3 bg-dls-surface sm:flex-row sm:items-center sm:justify-between" data-testid="agent-access-card">
         <div className="space-y-2">
@@ -321,7 +391,7 @@ export function AgentAccessCard(props: {
         </div>
       </div>
 
-      {health?.usable ? (
+      {health?.usable && !connectStateSummary ? (
         <div className="space-y-2 rounded-xl border border-green-6/30 bg-green-2 p-3 text-sm text-green-11">
           <div className="font-medium">Cloud tools verified for this workspace</div>
           <div className="flex flex-wrap gap-2 font-mono text-xs">
@@ -447,4 +517,3 @@ function AgentAccessAdvanced(props: {
     </div>
   );
 }
-

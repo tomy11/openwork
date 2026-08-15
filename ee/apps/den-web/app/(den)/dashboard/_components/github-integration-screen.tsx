@@ -39,6 +39,7 @@ import {
   useIntegrations,
   useRemoveConnectorInstance,
   useSetConnectorInstanceAutoImport,
+  useSyncConnectorInstanceNow,
 } from "./integration-data";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 
@@ -79,7 +80,6 @@ export function GithubIntegrationScreen() {
   return (
     <DashboardPageTemplate
       icon={Github}
-      badgeLabel="GitHub"
       title="Connect GitHub"
       description="Choose a connected account from the Integrations page to continue."
       colors={["#E2E8F0", "#0F172A", "#111827", "#94A3B8"]}
@@ -115,7 +115,6 @@ function GithubInstallCompletionRedirect({ installationId, state }: { installati
   return (
     <DashboardPageTemplate
       icon={Github}
-      badgeLabel="GitHub"
       title="Finishing GitHub connection"
       description="OpenWork is finalizing the GitHub App installation for this organization."
       colors={["#E2E8F0", "#0F172A", "#111827", "#94A3B8"]}
@@ -191,7 +190,6 @@ function ConfigurationLoadingState() {
   return (
     <DashboardPageTemplate
       icon={Puzzle}
-      badgeLabel="Repository"
       title="Loading…"
       description="OpenWork is loading this repository's connector configuration."
       colors={["#DBEAFE", "#0F172A", "#1D4ED8", "#BFDBFE"]}
@@ -231,6 +229,7 @@ function GithubConnectorInstanceManagePhase({
   const { orgSlug } = useOrgDashboard();
   const removeMutation = useRemoveConnectorInstance();
   const autoImportMutation = useSetConnectorInstanceAutoImport();
+  const syncNowMutation = useSyncConnectorInstanceNow();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [autoImportChecked, setAutoImportChecked] = useState(configuration.autoImportNewPlugins);
 
@@ -264,10 +263,14 @@ function GithubConnectorInstanceManagePhase({
     }
   }
 
+  async function handleSyncNow() {
+    syncNowMutation.reset();
+    await syncNowMutation.mutateAsync(configuration.connectorInstanceId);
+  }
+
   return (
     <DashboardPageTemplate
       icon={Puzzle}
-      badgeLabel="Repository"
       title={repoName}
       description="Manage which plugins OpenWork imports from this repository."
       colors={["#DBEAFE", "#0F172A", "#1D4ED8", "#BFDBFE"]}
@@ -281,10 +284,32 @@ function GithubConnectorInstanceManagePhase({
           <ArrowLeft className="h-4 w-4" />
           Back
         </button>
-        <DenButton variant="secondary" size="sm" icon={RefreshCw} onClick={handleRediscover}>
-          Re-run discovery
-        </DenButton>
+        <div className="flex items-center gap-2">
+          <DenButton
+            variant="secondary"
+            size="sm"
+            icon={RefreshCw}
+            disabled={syncNowMutation.isPending}
+            loading={syncNowMutation.isPending}
+            onClick={() => void handleSyncNow()}
+          >
+            Sync now
+          </DenButton>
+          <DenButton variant="secondary" size="sm" icon={RefreshCw} onClick={handleRediscover}>
+            Re-run discovery
+          </DenButton>
+        </div>
       </div>
+
+      {syncNowMutation.isSuccess ? (
+        <div className="mb-4 rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-[12.5px] text-emerald-800">
+          Sync queued for {syncNowMutation.data} target{syncNowMutation.data === 1 ? "" : "s"}.
+        </div>
+      ) : syncNowMutation.error ? (
+        <div className="mb-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-[12.5px] text-red-700">
+          {syncNowMutation.error instanceof Error ? syncNowMutation.error.message : "Failed to sync this repository."}
+        </div>
+      ) : null}
 
       <div className="space-y-8">
         <section>
@@ -653,7 +678,6 @@ function GithubConnectedAccountSelectionPhase({ connectorAccountId }: { connecto
   return (
     <DashboardPageTemplate
       icon={Github}
-      badgeLabel="GitHub"
       title="Add a repository"
       description={ownerLogin
         ? `Pick one of the repositories the @${ownerLogin} installation can already read.`
@@ -978,7 +1002,6 @@ function GithubDiscoveryPhase({ connectorInstanceId, onBack }: { connectorInstan
   return (
     <DashboardPageTemplate
       icon={Sparkles}
-      badgeLabel="Discovery"
       title={repoName ?? "Discover repository"}
       description="Pick which plugins OpenWork should import from this repository."
       colors={["#DBEAFE", "#0F172A", "#1D4ED8", "#BFDBFE"]}

@@ -23,6 +23,7 @@ import {
   DEN_SESSION_UPDATE_AGE_IN_SECONDS,
 } from "./session-lifetime.js";
 import { DEN_ACCOUNT_CONFIG } from "./account-linking-policy.js";
+import { cache } from "./cache.js";
 import { SCIM_TOKEN_STORAGE_STRATEGY } from "./scim-token-storage.js";
 import { syncDenSignupContact } from "./loops.js";
 import { sendEmail } from "./utils/email/send-email.js";
@@ -329,6 +330,34 @@ function readStringProperty(value: unknown, propertyName: string) {
   return typeof property === "string" && property.trim() ? property.trim() : null;
 }
 
+function readRequestQueryParam(request: Request | undefined, propertyName: string) {
+  if (!request) {
+    return null;
+  }
+
+  const value = new URL(request.url).searchParams.get(propertyName)?.trim() ?? "";
+  return value || null;
+}
+
+async function hasPendingInvitationForEmail(input: { invitationIdOrToken: string | null; email: string | null }) {
+  if (!input.invitationIdOrToken || !input.email) {
+    return false;
+  }
+
+  const [invitation] = await db
+    .select({ inviteToken: schema.InvitationTable.inviteToken })
+    .from(schema.InvitationTable)
+    .where(and(
+      sql`(${schema.InvitationTable.id} = ${input.invitationIdOrToken} or ${schema.InvitationTable.inviteToken} = ${input.invitationIdOrToken})`,
+      eq(schema.InvitationTable.status, "pending"),
+      gt(schema.InvitationTable.expiresAt, new Date()),
+      sql`lower(${schema.InvitationTable.email}) = ${input.email.trim().toLowerCase()}`,
+    ))
+    .limit(1);
+
+  return Boolean(invitation);
+}
+
 function normalizeRawRoleValue(roleValue: string) {
   return splitOrganizationRoles(roleValue)
     .map((role) => normalizeOrganizationRoleName(role))
@@ -548,6 +577,15 @@ export const auth = betterAuth({
     freshAge: 15 * 60,
   },
   databaseHooks: {
+    user: {
+      update: {
+        after: async (user) => {
+          if (typeof user.id === "string") {
+            await cache.auth.deleteSessionsForUser(normalizeDenTypeId("user", user.id));
+          }
+        },
+      },
+    },
     member: {
       delete: {
         before: async (member: AuthMemberHookRow) => {
@@ -592,6 +630,20 @@ export const auth = betterAuth({
           };
         },
       },
+      update: {
+        after: async (session) => {
+          if (typeof session.token === "string") {
+            await cache.auth.deleteSession(session.token);
+          }
+        },
+      },
+      delete: {
+        after: async (session) => {
+          if (typeof session.token === "string") {
+            await cache.auth.deleteSession(session.token);
+          }
+        },
+      },
     },
   },
   hooks: {
@@ -631,7 +683,8 @@ export const auth = betterAuth({
 
         if (ctx.path === "/organization/leave") {
           const organizationId = readStringProperty(ctx.body, "organizationId");
-          const session = await ctx.context.getSession(ctx).catch(() => null);
+          const token = await ctx.getSignedCookie(ctx.context.authCookies.sessionToken.name, ctx.context.secret).catch(() => null);
+          const session = typeof token === "string" ? await cache.auth.session(token) : null;
           if (organizationId && session?.user.id) {
             const member = await getOrganizationMemberRole({
               organizationId,
@@ -646,7 +699,8 @@ export const auth = betterAuth({
         }
 
         if (ctx.path === "/organization/add-member") {
-          const session = await ctx.context.getSession(ctx).catch(() => null);
+          const token = await ctx.getSignedCookie(ctx.context.authCookies.sessionToken.name, ctx.context.secret).catch(() => null);
+          const session = typeof token === "string" ? await cache.auth.session(token) : null;
           const organizationId = readStringProperty(ctx.body, "organizationId")
             ?? (typeof session?.session.activeOrganizationId === "string" ? session.session.activeOrganizationId : null);
           if (organizationId && session?.user.id) {
@@ -668,7 +722,8 @@ export const auth = betterAuth({
         }
 
         if (ctx.path === "/organization/invite-member") {
-          const session = await ctx.context.getSession(ctx).catch(() => null);
+          const token = await ctx.getSignedCookie(ctx.context.authCookies.sessionToken.name, ctx.context.secret).catch(() => null);
+          const session = typeof token === "string" ? await cache.auth.session(token) : null;
           const organizationId = readStringProperty(ctx.body, "organizationId")
             ?? (typeof session?.session.activeOrganizationId === "string" ? session.session.activeOrganizationId : null);
           if (organizationId && session?.user.id) {
@@ -696,7 +751,11 @@ export const auth = betterAuth({
 
       const email = getAuthBodyEmail(ctx.body);
       if (ctx.path === "/sign-up/email") {
-        const violation = await getSingleOrgEmailSignupPolicyViolation(email);
+        const invitationAllowsSignup = await hasPendingInvitationForEmail({
+          invitationIdOrToken: readRequestQueryParam(ctx.request, "invite") ?? readStringProperty(ctx.query, "invite") ?? readStringProperty(ctx.body, "invite"),
+          email,
+        });
+        const violation = invitationAllowsSignup ? null : await getSingleOrgEmailSignupPolicyViolation(email);
         if (violation) {
           throw new APIError("FORBIDDEN", { message: violation.message });
         }
@@ -742,6 +801,7 @@ export const auth = betterAuth({
       }
 
       await ctx.context.internalAdapter.deleteSession(newSession.session.token);
+      await cache.auth.deleteSession(newSession.session.token);
       deleteSessionCookie(ctx);
       throw ctx.redirect(getEnterpriseAuthRedirectUrl({
         signInPath: requirement.signInPath,
@@ -777,6 +837,15 @@ export const auth = betterAuth({
             return createDenTypeId("oauthRefreshToken");
           case "oauthConsent":
             return createDenTypeId("oauthConsent");
+          // better-auth 1.7 oauth-provider models with no den typeid: without
+          // an id the drizzle adapter emits `insert ... values (default, ...)`
+          // and MySQL rejects it (no default on `id`) — the oauthResource seed
+          // storm of 2026-08-07. oauthClientResource/oauthClientAssertion use
+          // forceAllowId, but cover them for any future non-forced create.
+          case "oauthResource":
+          case "oauthClientResource":
+          case "oauthClientAssertion":
+            return crypto.randomUUID();
           case "rateLimit":
             return createDenTypeId("rateLimit");
           case "organization":
@@ -994,12 +1063,23 @@ export const auth = betterAuth({
       consentPage: `${env.betterAuthUrl}/mcp/select-organization`,
       scopes: [...DEN_MCP_SCOPES],
       validAudiences: DEN_MCP_OAUTH_VALID_AUDIENCES,
+      // better-auth 1.7 gates every token-request `resource` parameter on the
+      // oauthResource registry (invalid_target "is not configured" otherwise;
+      // validAudiences no longer whitelists issuance). Seed all accepted MCP
+      // resource aliases at startup — seeding is idempotent (insertOnly).
+      resources: [...DEN_MCP_RESOURCES],
+      // 1.7 defaults to requiring an oauthClientResource link per client per
+      // resource. Dynamically registered MCP clients never request resources
+      // at registration, so enforcement would invalid_target every DCR client.
+      // Keep pre-1.7 behavior: registry + audience validation, no per-client ACL.
+      enforcePerClientResources: false,
       allowPublicClientPrelogin: true,
       allowDynamicClientRegistration: true,
       allowUnauthenticatedClientRegistration: true,
       accessTokenExpiresIn: DEN_MCP_ACCESS_TOKEN_EXPIRES_IN_SECONDS,
       m2mAccessTokenExpiresIn: DEN_MCP_ACCESS_TOKEN_EXPIRES_IN_SECONDS,
       refreshTokenExpiresIn: DEN_MCP_REFRESH_TOKEN_EXPIRES_IN_SECONDS,
+      refreshTokenReuseInterval: 30,
       storeTokens: { hash: hashOAuthProviderToken },
       clientRegistrationDefaultScopes: [...DEN_MCP_DEFAULT_CLIENT_SCOPES],
       clientRegistrationAllowedScopes: [...DEN_MCP_SCOPES],
@@ -1037,8 +1117,9 @@ export const auth = betterAuth({
           return normalizeDenTypeId("organization", activeOrganizationId);
         },
       },
-      customAccessTokenClaims: ({ referenceId, resource, scopes }) => {
+      customAccessTokenClaims: ({ referenceId, resources, scopes }) => {
         const claims: Record<string, string> = {};
+        const resource = resources?.[0];
         const mcpResource = typeof resource === "string" ? normalizeMcpOAuthResource(resource) : null;
         if (hasMcpScope(scopes) || mcpResource) {
           claims[DEN_MCP_TOKEN_USE_CLAIM] = "mcp";

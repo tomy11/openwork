@@ -81,6 +81,8 @@ export interface ApprovalConfig {
   timeoutMs: number;
 }
 
+export type LocalManagedMcpVaultKeyProvider = () => Promise<Uint8Array>;
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -101,21 +103,30 @@ export interface ServerConfig {
   hostTokenSource: "cli" | "env" | "file" | "generated";
   logFormat: LogFormat;
   logRequests: boolean;
+  /**
+   * Roll the managed engine over instead of disposing it when a reload is
+   * needed while sessions are live: a standby engine takes new work and the
+   * old one is closed once its runs finish. Off by default (alpha).
+   */
+  engineRollover?: boolean;
+  /** In-memory secure key custody supplied by an embedding host such as OpenWork Desktop. */
+  localManagedMcpVaultKey?: LocalManagedMcpVaultKeyProvider;
 }
 
 export interface Capabilities {
   schemaVersion: number;
   serverVersion: string;
   opencodeVersion: string;
+  providerSync: true;
   skills: { read: boolean; write: boolean; source: "openwork" | "opencode" };
   plugins: { read: boolean; write: boolean };
   mcp: { read: boolean; write: boolean };
   commands: { read: boolean; write: boolean };
   config: { read: boolean; write: boolean };
+  engine: { rollover: boolean };
 
   approvals: { mode: ApprovalMode; timeoutMs: number };
   sandbox: { enabled: boolean; backend: SandboxBackend };
-  ui: { toy: boolean };
   tokens: { scoped: boolean; scopes: TokenScope[] };
   proxy: {
     opencode: boolean;

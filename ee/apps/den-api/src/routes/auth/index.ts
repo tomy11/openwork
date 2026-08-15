@@ -1,19 +1,22 @@
 import { oauthProviderAuthServerMetadata, oauthProviderOpenIdConfigMetadata } from "@better-auth/oauth-provider"
 import { createHash } from "node:crypto"
-import { eq, sql } from "@openwork-ee/den-db/drizzle"
-import { AuthAccountTable, AuthUserTable, OAuthClientTable } from "@openwork-ee/den-db/schema"
+import { and, eq, gt, sql } from "@openwork-ee/den-db/drizzle"
+import { AuthAccountTable, AuthUserTable, InvitationTable, OAuthClientTable } from "@openwork-ee/den-db/schema"
 import type { Hono } from "hono"
+import type { Context } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { auth, DEN_MCP_OAUTH_RESOURCE, normalizeMcpOAuthResource } from "../../auth.js"
 import { normalizeLoginEmail, resolveLoginOptionKind } from "../../auth-login-options.js"
 import { verifyBotProtection } from "../../bot-protection.js"
 import {
+  EMAIL_PASSWORD_SIGN_UP_PATH,
   getBreachedPasswordResponse,
   getEmailPasswordLockoutResponse,
-  getShortPasswordResponse,
-  readEmailPasswordSignInAttempt,
-  recordEmailPasswordSignInResult,
+  getPasswordPolicyResponse,
+  getWeakPasswordResponse,
+  readEmailSignInAttempt,
+  recordEmailSignInResult,
 } from "../../auth-protection.js"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
@@ -23,9 +26,10 @@ import { normalizeMcpOAuthClientScope } from "../../mcp/scopes.js"
 import { publicRoute, queryValidator, tokenRoute } from "../../middleware/index.js"
 import { emptyResponse, jsonResponse } from "../../openapi.js"
 import { getSingletonSsoStatus } from "../../orgs.js"
+import { cache } from "../../cache.js"
 import { getAuthRequestEmail, getSingleOrgEmailSignupPolicyViolation, type SingleOrgEmailSignupPolicyViolation } from "../../single-org-signup-policy.js"
 import { samlResponsePolicyMiddleware } from "../../sso-saml-response-middleware.js"
-import { revokeBearerSession, type AuthContextVariables } from "../../session.js"
+import { getRequestSession, readSignedSessionCookieToken, revokeBearerSession, type AuthContextVariables } from "../../session.js"
 import { checkRateLimit } from "../../utils/rate-limit.js"
 import { registerDesktopAuthRoutes } from "./desktop-handoff.js"
 import { normalizeOAuthAuthorizeRedirect } from "./oauth-redirect.js"
@@ -35,6 +39,11 @@ function rewriteAuthRequest(request: Request, path: string) {
   const url = new URL(request.url)
   url.pathname = path
   return new Request(url, request)
+}
+
+function normalizedPath(request: Request) {
+  const path = new URL(request.url).pathname
+  return path !== "/" ? path.replace(/\/+$/, "") : path
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -296,13 +305,13 @@ async function readSetActiveOrganizationBody(request: Request) {
   }
 }
 
-async function getCurrentActiveOrganizationId(request: Request) {
-  const session = await auth.api.getSession({ headers: request.headers })
+async function getCurrentActiveOrganizationId(request: Request, context: Context) {
+  const session = await getRequestSession(request.headers, context)
   const activeOrganizationId = session?.session.activeOrganizationId
   return typeof activeOrganizationId === "string" ? activeOrganizationId : null
 }
 
-async function getSingleOrgAuthGuardResponse(request: Request) {
+async function getSingleOrgAuthGuardResponse(request: Request, context: Context, options?: { invitationSignupAllowed?: boolean }) {
   if (env.orgMode !== "single_org") {
     return null
   }
@@ -312,7 +321,9 @@ async function getSingleOrgAuthGuardResponse(request: Request) {
   }
 
   if (isBetterAuthEmailSignupRequest(request)) {
-    const violation = await getSingleOrgEmailSignupPolicyViolation(await getAuthRequestEmail(request))
+    const violation = options?.invitationSignupAllowed
+      ? null
+      : await getSingleOrgEmailSignupPolicyViolation(await getAuthRequestEmail(request))
     if (violation) {
       return singleOrgEmailSignupPolicyResponse(violation)
     }
@@ -334,7 +345,7 @@ async function getSingleOrgAuthGuardResponse(request: Request) {
     return null
   }
 
-  const activeOrganizationId = await getCurrentActiveOrganizationId(request)
+  const activeOrganizationId = await getCurrentActiveOrganizationId(request, context)
   return canSetActiveOrganizationInSingleOrgMode({
     activeOrganizationId,
     singleOrganizationSlug: env.singleOrg.slug,
@@ -444,6 +455,7 @@ const authPasswordScreeningUnavailableSchema = z.object({
 
 const loginOptionsQuerySchema = z.object({
   email: z.string().trim().email().transform(normalizeLoginEmail),
+  invite: z.string().trim().min(1).optional(),
 })
 
 const loginOptionKindSchema = z.union([
@@ -458,6 +470,7 @@ const loginOptionsResponseSchema = z.object({
   email: z.string().email(),
   nextStep: loginOptionKindSchema,
   allowPublicSignup: z.boolean().optional(),
+  allowInvitationSignup: z.boolean().optional(),
   organizationSlug: z.string().optional(),
   signInPath: z.string().optional(),
   signInUrl: z.string().url().optional(),
@@ -473,6 +486,20 @@ const loginOptionsRateLimitedSchema = z.object({
   message: z.string(),
 }).meta({ ref: "LoginOptionsRateLimitedError" })
 
+const LOGIN_OPTIONS_IDENTITY_RATE_LIMIT_MAX = 20
+const LOGIN_OPTIONS_RATE_LIMIT_WINDOW_MS = 60_000
+// Domain buckets deliberately use a LONG window instead of a bigger per-minute
+// count. Coworkers need burst tolerance (a whole team signing in at once);
+// enumeration is bounded by SUSTAINED throughput. Against the previous flat
+// 20/min domain bucket both sustained rates are strictly lower: 120 per 10 min
+// = 12/min overall, and 30 misses per 10 min = 3/min for the account-discovery
+// path that actually leaks which addresses exist.
+const LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_WINDOW_MS = 600_000
+const LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_MAX = 120
+const LOGIN_OPTIONS_DOMAIN_MISS_RATE_LIMIT_MAX = 30
+// A generous domain bucket bounds distributed enumeration without recreating coworker lockouts;
+// only unresolved addresses pay the tighter miss bucket.
+
 function readRequestAddress(headers: Headers) {
   const forwarded = headers.get("x-forwarded-for")?.split(",")[0]?.trim()
   return forwarded || headers.get("x-real-ip")?.trim() || "unknown"
@@ -482,27 +509,31 @@ function sha256Hex(value: string) {
   return createHash("sha256").update(value).digest("hex")
 }
 
-function readEmailDomain(email: string) {
-  const atIndex = email.lastIndexOf("@")
-  return atIndex > 0 && atIndex < email.length - 1 ? email.slice(atIndex + 1) : "unknown"
+export function loginOptionsRateLimitKeys(headers: Headers, email: string) {
+  const domainHash = sha256Hex(email.slice(email.lastIndexOf("@") + 1).trim().toLowerCase())
+  return {
+    ip: `auth-login-options:ip:${sha256Hex(readRequestAddress(headers))}`,
+    email: `auth-login-options:email:${sha256Hex(email)}`,
+    domain: `auth-login-options:domain:${domainHash}`,
+    domainMiss: `auth-login-options:domain-miss:${domainHash}`,
+  }
 }
 
-async function checkLoginOptionsRateLimit(headers: Headers, email: string) {
+async function checkLoginOptionsRateLimit(keys: ReturnType<typeof loginOptionsRateLimitKeys>) {
   const now = Date.now()
-  const keys = [
-    `auth-login-options:ip:${sha256Hex(readRequestAddress(headers))}`,
-    `auth-login-options:email:${sha256Hex(email)}`,
-    `auth-login-options:domain:${sha256Hex(readEmailDomain(email))}`,
-  ]
 
-  for (const key of keys) {
-    const retryAfter = await checkRateLimit(key, 20, 60_000, now)
+  for (const key of [keys.ip, keys.email]) {
+    const retryAfter = await checkRateLimit(key, LOGIN_OPTIONS_IDENTITY_RATE_LIMIT_MAX, LOGIN_OPTIONS_RATE_LIMIT_WINDOW_MS, now)
     if (retryAfter !== null) {
       return retryAfter
     }
   }
 
-  return null
+  return checkRateLimit(keys.domain, LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_MAX, LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_WINDOW_MS, now)
+}
+
+function checkLoginOptionsMissRateLimit(key: string) {
+  return checkRateLimit(key, LOGIN_OPTIONS_DOMAIN_MISS_RATE_LIMIT_MAX, LOGIN_OPTIONS_DOMAIN_RATE_LIMIT_WINDOW_MS, Date.now())
 }
 
 async function getLoginOptionAccounts(email: string) {
@@ -521,27 +552,68 @@ async function getLoginOptionAccounts(email: string) {
   }))
 }
 
-async function handleAuthRequest(request: Request) {
+async function hasPendingInvitationForEmail(invitationIdOrToken: string | undefined, email: string) {
+  if (!invitationIdOrToken) {
+    return false
+  }
+
+  const [invitation] = await db
+    .select({ inviteToken: InvitationTable.inviteToken })
+    .from(InvitationTable)
+    .where(and(
+      sql`(${InvitationTable.id} = ${invitationIdOrToken} or ${InvitationTable.inviteToken} = ${invitationIdOrToken})`,
+      eq(InvitationTable.status, "pending"),
+      gt(InvitationTable.expiresAt, new Date()),
+      sql`lower(${InvitationTable.email}) = ${email}`,
+    ))
+    .limit(1)
+
+  return Boolean(invitation)
+}
+
+async function isInvitationSignupAllowed(request: Request) {
+  if (request.method !== "POST" || normalizedPath(request) !== EMAIL_PASSWORD_SIGN_UP_PATH) {
+    return false
+  }
+
+  const invite = new URL(request.url).searchParams.get("invite")?.trim() ?? ""
+  if (!invite) {
+    return false
+  }
+
+  const email = await getAuthRequestEmail(request)
+  return email ? hasPendingInvitationForEmail(invite, normalizeLoginEmail(email)) : false
+}
+
+async function handleAuthRequest(c: Context) {
+  const request = c.req.raw
   const authRequest = await normalizeMcpOAuthRequest(request)
   if (authRequest instanceof Response) {
     return authRequest
   }
-  const singleOrgAuthGuardResponse = await getSingleOrgAuthGuardResponse(authRequest)
-  if (singleOrgAuthGuardResponse) {
-    return singleOrgAuthGuardResponse
-  }
+  const invitationSignupAllowed = await isInvitationSignupAllowed(authRequest)
 
-  const emailPasswordAttempt = await readEmailPasswordSignInAttempt(authRequest)
-  if (emailPasswordAttempt) {
-    const lockoutResponse = await getEmailPasswordLockoutResponse(emailPasswordAttempt)
+  const emailSignInAttempt = await readEmailSignInAttempt(authRequest)
+  if (emailSignInAttempt) {
+    const lockoutResponse = await getEmailPasswordLockoutResponse(emailSignInAttempt)
     if (lockoutResponse) {
       return lockoutResponse
     }
   }
 
-  const shortPasswordResponse = await getShortPasswordResponse(authRequest)
-  if (shortPasswordResponse) {
-    return shortPasswordResponse
+  const singleOrgAuthGuardResponse = await getSingleOrgAuthGuardResponse(authRequest, c, { invitationSignupAllowed })
+  if (singleOrgAuthGuardResponse) {
+    return singleOrgAuthGuardResponse
+  }
+
+  const passwordPolicyResponse = await getPasswordPolicyResponse(authRequest)
+  if (passwordPolicyResponse) {
+    return passwordPolicyResponse
+  }
+
+  const weakPasswordResponse = await getWeakPasswordResponse(authRequest)
+  if (weakPasswordResponse) {
+    return weakPasswordResponse
   }
 
   const breachedPasswordResponse = await getBreachedPasswordResponse(authRequest)
@@ -555,12 +627,16 @@ async function handleAuthRequest(request: Request) {
   // runs to preserve its normal idempotent response and cookie cleanup for
   // browser callers.
   if (isBetterAuthSignOutRequest(authRequest)) {
+    const cookieToken = await readSignedSessionCookieToken(c)
+    if (cookieToken) {
+      await cache.auth.deleteSession(cookieToken)
+    }
     await revokeBearerSession(authRequest.headers)
   }
 
   const response = await auth.handler(authRequest)
-  if (emailPasswordAttempt) {
-    await recordEmailPasswordSignInResult(emailPasswordAttempt, response)
+  if (emailSignInAttempt) {
+    await recordEmailSignInResult(emailSignInAttempt, response)
   }
   return response
 }
@@ -605,7 +681,7 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
     publicRoute,
     queryValidator(loginOptionsQuerySchema),
     async (c) => {
-      const { email } = c.req.valid("query")
+      const { email, invite } = c.req.valid("query")
       const botProtection = await verifyBotProtection()
       if (!botProtection.ok) {
         return c.json({
@@ -614,7 +690,8 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
         }, botProtection.status)
       }
 
-      const retryAfter = await checkLoginOptionsRateLimit(c.req.raw.headers, email)
+      const rateLimitKeys = loginOptionsRateLimitKeys(c.req.raw.headers, email)
+      const retryAfter = await checkLoginOptionsRateLimit(rateLimitKeys)
       if (retryAfter !== null) {
         c.header("Retry-After", String(retryAfter))
         return c.json({
@@ -632,21 +709,33 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
         : null
       const requirement = singletonSsoRequirement ?? await findEnterpriseAuthRequirementForEmailDomain(email)
       const accounts = requirement ? [] : await getLoginOptionAccounts(email)
+      if (!requirement && accounts.length === 0) {
+        const missRetryAfter = await checkLoginOptionsMissRateLimit(rateLimitKeys.domainMiss)
+        if (missRetryAfter !== null) {
+          c.header("Retry-After", String(missRetryAfter))
+          return c.json({
+            error: "rate_limited",
+            message: "Too many sign-in option attempts. Try again later.",
+          }, 429)
+        }
+      }
       const allowPublicSignup = env.orgMode !== "single_org" || env.singleOrg.allowPublicSignup
-      const nextStep = resolveLoginOptionKind({ requireSso: Boolean(requirement), accounts, allowNewAccount: allowPublicSignup })
+      const allowInvitationSignup = !requirement && await hasPendingInvitationForEmail(invite, email)
+      const nextStep = resolveLoginOptionKind({ requireSso: Boolean(requirement), accounts, allowNewAccount: allowPublicSignup || allowInvitationSignup })
 
       if (nextStep === "sso" && requirement) {
         return c.json({
           email,
           nextStep,
           allowPublicSignup,
+          allowInvitationSignup,
           organizationSlug: requirement.organizationSlug,
           signInPath: requirement.signInPath,
           signInUrl: new URL(requirement.signInPath, env.betterAuthTrustedOrigins[0] ?? env.betterAuthUrl).toString(),
         })
       }
 
-      return c.json({ email, nextStep, allowPublicSignup })
+      return c.json({ email, nextStep, allowPublicSignup, allowInvitationSignup })
     },
   )
 
@@ -661,14 +750,14 @@ export function registerAuthRoutes<T extends { Variables: AuthContextVariables }
       responses: {
         200: emptyResponse("Better Auth handled the request successfully."),
         302: emptyResponse("Better Auth redirected the user to continue the auth flow."),
-        400: emptyResponse("Better Auth rejected the request as invalid. Password creation, password change, or reset is also rejected when the proposed password is too short or is known to be compromised."),
+        400: emptyResponse("Better Auth rejected the request as invalid. Password creation, password change, or reset is also rejected when the proposed password fails Den password policy or is known to be compromised."),
         401: emptyResponse("Better Auth rejected the request because authentication failed."),
         429: jsonResponse("Email/password sign-in is temporarily locked after too many failed attempts. The response includes a Retry-After header.", authLoginLockedSchema),
         503: jsonResponse("Password breach screening is temporarily unavailable, so password creation or reset should be retried later.", authPasswordScreeningUnavailableSchema),
       },
     }),
     publicRoute,
-    (c) => handleAuthRequest(c.req.raw),
+    (c) => handleAuthRequest(c),
   )
   registerDesktopAuthRoutes(app)
 }

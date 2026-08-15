@@ -10,6 +10,8 @@ export type EnterpriseMcpErrorCode =
   | "MCP_PROTOCOL_INITIALIZE_FAILED"
   | "MCP_TOOL_DISCOVERY_FAILED"
   | "MCP_TOOL_EXECUTION_FAILED"
+  | "MCP_RESOURCE_DISCOVERY_FAILED"
+  | "MCP_RESOURCE_READ_FAILED"
   | "MCP_SHUTDOWN_FAILED"
 
 const errorCodeByPhase: Record<EnterpriseMcpOperationPhase, EnterpriseMcpErrorCode> = {
@@ -20,6 +22,8 @@ const errorCodeByPhase: Record<EnterpriseMcpOperationPhase, EnterpriseMcpErrorCo
   "protocol-initialize": "MCP_PROTOCOL_INITIALIZE_FAILED",
   "tool-discovery": "MCP_TOOL_DISCOVERY_FAILED",
   "tool-execution": "MCP_TOOL_EXECUTION_FAILED",
+  "resource-discovery": "MCP_RESOURCE_DISCOVERY_FAILED",
+  "resource-read": "MCP_RESOURCE_READ_FAILED",
   shutdown: "MCP_SHUTDOWN_FAILED",
 }
 
@@ -31,6 +35,8 @@ const phaseLabel: Record<EnterpriseMcpOperationPhase, string> = {
   "protocol-initialize": "MCP protocol initialization",
   "tool-discovery": "MCP tool discovery",
   "tool-execution": "MCP tool execution",
+  "resource-discovery": "MCP resource discovery",
+  "resource-read": "MCP resource read",
   shutdown: "MCP client shutdown",
 }
 
@@ -44,6 +50,8 @@ const requestPhaseLabel: Record<EnterpriseMcpRequestPhase, string> = {
   "mcp-initialize": "the MCP initialize request",
   "mcp-tool-discovery": "the MCP tools/list request",
   "mcp-tool-execution": "the MCP tools/call request",
+  "mcp-resource-discovery": "the MCP resource catalog request",
+  "mcp-resource-read": "the MCP resources/read request",
   "unknown-request": "an MCP provider request",
 }
 
@@ -193,6 +201,7 @@ export type EnterpriseMcpCatalogErrorCode =
   | "MCP_CATALOG_PAGE_LIMIT"
   | "MCP_CATALOG_ITEM_LIMIT"
   | "MCP_CATALOG_DUPLICATE_TOOL"
+  | "MCP_CATALOG_DUPLICATE_RESOURCE"
   | "MCP_CATALOG_TOOL_NAME_LIMIT"
   | "MCP_CATALOG_TOOL_DESCRIPTION_LIMIT"
   | "MCP_CATALOG_TOOL_TITLE_LIMIT"
@@ -201,12 +210,15 @@ export type EnterpriseMcpCatalogErrorCode =
   | "MCP_CATALOG_SCHEMA_CYCLE"
   | "MCP_CATALOG_CURSOR_SIZE_LIMIT"
   | "MCP_CATALOG_BYTE_LIMIT"
+  | "MCP_RESOURCE_URI_LIMIT"
+  | "MCP_RESOURCE_DESCRIPTOR_LIMIT"
+  | "MCP_RESOURCE_RESULT_LIMIT"
 
 export class EnterpriseMcpCatalogError extends Error {
   readonly code: EnterpriseMcpCatalogErrorCode
 
   constructor(code: EnterpriseMcpCatalogErrorCode) {
-    super("The MCP tool catalog exceeded an enterprise client contract limit.")
+    super("The MCP catalog or resource exceeded an enterprise client contract limit.")
     this.name = "EnterpriseMcpCatalogError"
     this.code = code
   }

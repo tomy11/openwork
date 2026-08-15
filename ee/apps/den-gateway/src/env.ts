@@ -5,6 +5,8 @@ const EnvSchema = z.object({
   PORT: z.string().optional(),
   DEN_API_BASE: z.string().optional(),
   DEN_GATEWAY_KEY: z.string().optional(),
+  DEN_GATEWAY_VERSION: z.string().optional(),
+  RENDER_GIT_COMMIT: z.string().optional(),
   DEN_GATEWAY_WEB_ROOT: z.string().optional(),
   DEN_GATEWAY_RESOLVE_TTL_MS: z.string().optional(),
   DEN_GATEWAY_LOG_REQUESTS: z.string().optional(),
@@ -15,6 +17,11 @@ const parsed = EnvSchema.parse(process.env)
 function optionalString(value: string | undefined) {
   const trimmed = value?.trim()
   return trimmed ? trimmed : undefined
+}
+
+// GH Actions builds pass DEN_GATEWAY_VERSION; Render repo builds rely on RENDER_GIT_COMMIT.
+export function resolveGatewayBuildVersion(input: { denGatewayVersion?: string; renderGitCommit?: string }): string | undefined {
+  return optionalString(input.denGatewayVersion) ?? optionalString(input.renderGitCommit)
 }
 
 function parsePort(value: string | undefined) {
@@ -66,6 +73,10 @@ export const env = {
   port: parsePort(parsed.PORT),
   denApiBase: normalizeHttpBaseUrl("DEN_API_BASE", optionalString(parsed.DEN_API_BASE) ?? "http://127.0.0.1:8790"),
   gatewayKey: optionalString(parsed.DEN_GATEWAY_KEY),
+  buildVersion: resolveGatewayBuildVersion({
+    denGatewayVersion: parsed.DEN_GATEWAY_VERSION,
+    renderGitCommit: parsed.RENDER_GIT_COMMIT,
+  }),
   webRoot: optionalString(parsed.DEN_GATEWAY_WEB_ROOT),
   resolveTtlMs: parsePositiveInteger("DEN_GATEWAY_RESOLVE_TTL_MS", parsed.DEN_GATEWAY_RESOLVE_TTL_MS, 15_000),
   logRequests: parseBoolean(parsed.DEN_GATEWAY_LOG_REQUESTS, true),

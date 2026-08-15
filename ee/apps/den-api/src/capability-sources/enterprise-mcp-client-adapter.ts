@@ -36,6 +36,9 @@ function toEnterpriseConnection(
   connection: ExternalMcpConnectionRow,
   member?: ExternalMcpMemberContext,
 ): EnterpriseMcpConnection {
+  if (connection.kind !== "external_mcp") {
+    throw new Error("Native provider connectors do not expose an MCP server.")
+  }
   if (connection.authType === "oauth") {
     const metadataUrl = externalMcpClientMetadataUrl()
     return {
@@ -87,10 +90,12 @@ function diagnosticPhase(event: EnterpriseMcpDiagnosticEvent): ExternalMcpDiagno
   if (event.requestPhase === "mcp-initialize") return "MCP_INITIALIZE"
   if (event.requestPhase === "mcp-tool-discovery") return "MCP_TOOL_DISCOVERY"
   if (event.requestPhase === "mcp-tool-execution") return "MCP_TOOL_EXECUTION"
+  if (event.requestPhase === "mcp-resource-discovery" || event.requestPhase === "mcp-resource-read") return "MCP_TOOL_DISCOVERY"
   if (event.operationPhase === "configuration") return "CONFIGURATION"
   if (event.operationPhase === "authorization-callback") return "AUTH_TOKEN_ACQUISITION"
   if (event.operationPhase === "tool-discovery") return "MCP_TOOL_DISCOVERY"
   if (event.operationPhase === "tool-execution") return "MCP_TOOL_EXECUTION"
+  if (event.operationPhase === "resource-discovery" || event.operationPhase === "resource-read") return "MCP_TOOL_DISCOVERY"
   if (event.operationPhase === "shutdown") return "SHUTDOWN"
   return "MCP_INITIALIZE"
 }
@@ -158,7 +163,7 @@ function translateEnterpriseMcpError(
     return catalogDiagnosticError({
       tracker,
       code: catalog.code,
-      operatorAction: "Reduce or repair the provider tool catalog to satisfy the named enterprise MCP catalog limit.",
+      operatorAction: "Reduce or repair the provider MCP catalog or resource to satisfy the named enterprise client limit.",
     })
   }
   const toolResult = chain.find((cause) => cause instanceof EnterpriseMcpToolResultError)
@@ -342,6 +347,78 @@ function runExternalMcpToolCall(
 
 export function callExternalMcpTool(input: ExternalMcpToolCallInput) {
   return runExternalMcpToolCall(input)
+}
+
+export function callExternalMcpToolRaw(input: ExternalMcpToolCallInput) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operationTimeoutMs: EXTERNAL_MCP_TOOL_CALL_TIMEOUT_MS,
+    operation: (client) => client.callToolRaw({
+      connection: toEnterpriseConnection(input.connection, input.member),
+      redirectUri: input.redirectUri,
+      toolName: input.toolName,
+      arguments: input.args,
+    }),
+  })
+}
+
+type ExternalMcpResourceInput = {
+  connection: ExternalMcpConnectionRow
+  redirectUri: string
+  member?: ExternalMcpMemberContext
+  diagnosticReferenceId?: string
+  lifecycleDeadline?: ExternalMcpLifecycleDeadline
+}
+
+export function describeExternalMcpServer(input: ExternalMcpResourceInput) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operation: (client) => client.describeServer({
+      connection: toEnterpriseConnection(input.connection, input.member),
+      redirectUri: input.redirectUri,
+    }),
+  })
+}
+
+export function listExternalMcpResources(input: ExternalMcpResourceInput) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operation: (client) => client.listResources({
+      connection: toEnterpriseConnection(input.connection, input.member),
+      redirectUri: input.redirectUri,
+    }),
+  })
+}
+
+export function listExternalMcpResourceTemplates(input: ExternalMcpResourceInput) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operation: (client) => client.listResourceTemplates({
+      connection: toEnterpriseConnection(input.connection, input.member),
+      redirectUri: input.redirectUri,
+    }),
+  })
+}
+
+export function readExternalMcpResource(input: ExternalMcpResourceInput & { uri: string }) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operation: (client) => client.readResource({
+      connection: toEnterpriseConnection(input.connection, input.member),
+      redirectUri: input.redirectUri,
+      uri: input.uri,
+    }),
+  })
 }
 
 export function inspectExternalMcpToolCall(input: ExternalMcpToolCallInput) {

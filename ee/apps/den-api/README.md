@@ -56,8 +56,44 @@ Builds generate source maps. Sentry source maps are uploaded only when `DEN_OBSE
 - `src/routes/admin/`: admin-only reporting endpoints
 - `src/routes/workers/`: worker lifecycle, billing, runtime, and heartbeat endpoints
 - `src/middleware/`: reusable Hono middleware for auth context, org context, teams, and validation
+- `src/cache.ts`: shared Redis-backed read-through cache. Add expensive read helpers here, keyed as `cache:${cacheParent}:${cacheChild}:${id}`; for example `cache.auth.session(token)` and `cache.org.members(orgId)`. Redis is optional, so every helper must fall back to the DB loader.
 
 Each major folder also has its own `README.md` so future agents can inspect one area in isolation.
+
+## Shared query cache
+
+Use `src/cache.ts` for Den API read-through Redis caching. Do not create ad-hoc Redis calls in route handlers or domain modules.
+
+Current public helpers:
+
+```ts
+const session = await cache.auth.session(token)
+const members = await cache.org.members(orgId)
+```
+
+Cache key format:
+
+```txt
+cache:${cacheParent}:${cacheChild}:${id}
+```
+
+Example key:
+
+```txt
+cache:auth:session:<token>
+cache:org:members:org_...
+```
+
+Rules for adding cache helpers:
+
+- Add helpers under the exported `cache` namespace in `src/cache.ts`.
+- Keep each helper as a read-through function: check Redis, run the DB loader on miss, write Redis, then return the loaded value.
+- Redis is optional. Helpers must work when `DATABASE_REDIS_URL` is unset.
+- Non-local Redis should use `rediss://`. Set `DATABASE_REDIS_ALLOW_INSECURE_INTERNAL=1` only when the `redis://` endpoint is private, non-public, and restricted to a trusted internal network.
+- Use short TTLs unless invalidation is explicit and tested.
+- Auth sessions are DB-authoritative and cached for at most one hour. Any session delete or identity-changing update must invalidate `cache.auth.deleteSession(token)`.
+- Do not add new security-critical cache helpers without explicit invalidation and tests.
+- Prefer names that read like domain calls, for example `cache.auth.session(token)` or `cache.org.members(orgId)`.
 
 ## TypeID validation
 

@@ -6,7 +6,7 @@ import { useSearchParams } from "next/navigation";
 import { AlertTriangle, Check, Loader2, Plug, Wrench } from "lucide-react";
 import { buttonVariants, DenButton } from "../../_components/ui/button";
 import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
-import { getOrgAccessFlags } from "../../_lib/den-org";
+import { getOrgAccessFlags, getToolTesterRoute } from "../../_lib/den-org";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
 import { IntegrationIcon } from "./integration-icon";
 import {
@@ -25,7 +25,6 @@ import {
   useMcpConnections,
   useMcpConnectionPresets,
 } from "./mcp-connections-data";
-import { McpToolRunner } from "./mcp-tool-runner";
 import { usePlugin } from "./plugin-data";
 import { useMcpAccountAuthorization } from "./use-mcp-account-authorization";
 
@@ -41,7 +40,7 @@ import { useMcpAccountAuthorization } from "./use-mcp-account-authorization";
 export function YourConnectionsScreen() {
   const { data: connections = [], isLoading, error, refetch } = useMcpConnections("usable");
   const { data: presets = [] } = useMcpConnectionPresets();
-  const { orgContext } = useOrgDashboard();
+  const { orgContext, orgSlug } = useOrgDashboard();
   const searchParams = useSearchParams();
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
@@ -65,14 +64,14 @@ export function YourConnectionsScreen() {
     focusedRowRef.current.focus({ preventScroll: true });
   }, [focusConnectionId, visibleConnections.length]);
 
-  async function handleDisconnectMyAccount(connectionId: string) {
+  async function handleDisconnectMyAccount(connection: ExternalMcpConnection) {
     setRowError(null);
     try {
-      await disconnectProvider.mutateAsync(connectionId);
+      await disconnectProvider.mutateAsync(connection);
       void refetch();
     } catch (disconnectError) {
       setRowError({
-        connectionId,
+        connectionId: connection.id,
         message: disconnectError instanceof Error ? disconnectError.message : "Failed to disconnect account.",
       });
     }
@@ -82,7 +81,6 @@ export function YourConnectionsScreen() {
     <DashboardPageTemplate
       icon={Plug}
       title="Your Connections"
-      badgeLabel="Beta"
       description="Tools your organization has made available to you. Connect your own account where needed; workspace admins can test tools directly, and your AI coworker uses them with your permissions."
       colors={["#DBEAFE", "#1E3A8A", "#2563EB", "#93C5FD"]}
     >
@@ -117,7 +115,7 @@ export function YourConnectionsScreen() {
               rowRef={focusConnectionId === connection.id ? focusedRowRef : undefined}
               polling={authorization.pollingConnectionId === connection.id}
               connecting={authorization.connectingConnectionId === connection.id}
-              disconnecting={disconnectProvider.isPending && disconnectProvider.variables === connection.id}
+              disconnecting={disconnectProvider.isPending && disconnectProvider.variables?.id === connection.id}
               errorMessage={
                 rowError?.connectionId === connection.id
                   ? rowError.message
@@ -126,7 +124,8 @@ export function YourConnectionsScreen() {
                     : null
               }
               onConnect={() => void authorization.connect(connection.id)}
-              onDisconnect={() => void handleDisconnectMyAccount(connection.id)}
+              onDisconnect={() => void handleDisconnectMyAccount(connection)}
+              toolTesterRoute={getToolTesterRoute(orgSlug)}
             />;
           })}
         </div>
@@ -158,6 +157,7 @@ function YourConnectionRow({
   rowRef,
   onConnect,
   onDisconnect,
+  toolTesterRoute,
 }: {
   connection: ExternalMcpConnection;
   isAdmin: boolean;
@@ -173,6 +173,7 @@ function YourConnectionRow({
   errorMessage: string | null;
   onConnect: () => void;
   onDisconnect: () => void;
+  toolTesterRoute: string;
 }) {
   const isPerMember = connection.credentialMode === "per_member";
   const needsAdminRecovery = !needsAdminSetup
@@ -184,10 +185,10 @@ function YourConnectionRow({
   const needsMyConnect = !needsAdminSetup && !needsAdminRecovery && isPerMember && !connection.connectedForMe;
   const needsAdminConnect = !needsAdminSetup && !needsAdminRecovery && isAdmin && !isPerMember && connection.authType === "oauth" && !connection.connectedForMe;
   const canDisconnect = !needsAdminSetup && canDisconnectMyConnectionAccount(connection);
+  const isNativeProvider = isNativeProviderConnectionId(connection.id, connection.nativeProviderKey);
   const canTestTools = !needsAdminSetup && !needsAdminRecovery && isAdmin
-    && !isNativeProviderConnectionId(connection.id) && connection.connectedForMe && !needsReconnect;
-  const [toolRunnerOpen, setToolRunnerOpen] = useState(false);
-  const microsoftScopes = connection.id === "microsoft-365"
+    && !isNativeProvider && connection.connectedForMe && !needsReconnect;
+  const microsoftScopes = (connection.nativeProviderKey === "microsoft-365" || connection.id === "microsoft-365")
     ? (connection.grantedScopes ?? []).filter((scope) => MICROSOFT_365_DISPLAY_SCOPES.has(scope))
     : [];
   const requiredByLabel = formatRequiredBy(connection.requiredBy);
@@ -246,10 +247,13 @@ function YourConnectionRow({
             {requiredByLabel ? (
               <p className="mt-1 text-[12px] font-medium text-gray-700">{requiredByLabel}</p>
             ) : null}
-            {connection.id === "microsoft-365" && connection.tenantId ? (
+            {isNativeProvider && (connection.tenantId || connection.externalAccountId) ? (
               <p className="mt-1 text-[11px] text-gray-500">
-                Tenant <span className="font-mono text-gray-700">{connection.tenantId}</span>
-                {connection.externalAccountId ? <> · {connection.externalAccountId}</> : null}
+                {connection.tenantId ? (
+                  <>Tenant <span className="font-mono text-gray-700">{connection.tenantId}</span>{connection.externalAccountId ? <> · {connection.externalAccountId}</> : null}</>
+                ) : (
+                  <span className="font-mono text-gray-700">{connection.externalAccountId}</span>
+                )}
               </p>
             ) : null}
             {microsoftScopes.length > 0 ? (
@@ -282,17 +286,15 @@ function YourConnectionRow({
             </Link>
           ) : null}
           {canTestTools ? (
-            <DenButton
-              variant="secondary"
-              size="sm"
-              icon={Wrench}
-              onClick={() => setToolRunnerOpen((open) => !open)}
-              aria-expanded={toolRunnerOpen}
+            <Link
+              href={`${toolTesterRoute}?connectionId=${encodeURIComponent(connection.id)}`}
+              className={buttonVariants({ variant: "secondary", size: "sm", className: "h-8 w-8 !px-0" })}
               aria-label={`Test tools for ${connection.name}`}
               title={`Test tools for ${connection.name}`}
-              className="h-8 w-8 !px-0"
               data-testid={`toggle-mcp-tool-runner-${connection.id}`}
-            />
+            >
+              <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
+            </Link>
           ) : null}
           {canDisconnect ? (
             <DenButton variant="destructive" size="sm" loading={disconnecting} onClick={onDisconnect} data-testid={`disconnect-my-mcp-account-${connection.id}`}>
@@ -306,7 +308,6 @@ function YourConnectionRow({
           ) : null}
         </div>
       </div>
-      {toolRunnerOpen && canTestTools ? <McpToolRunner connection={connection} /> : null}
     </div>
   );
 }

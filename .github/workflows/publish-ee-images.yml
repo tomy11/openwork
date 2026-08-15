@@ -14,16 +14,20 @@ on:
         default: ""
         type: string
   push:
+    branches:
+      - "dev"
     tags:
       - "v*"
   pull_request:
     paths:
       - ".github/workflows/publish-ee-images.yml"
       - "packaging/docker/Dockerfile.den"
+      - "packaging/docker/Dockerfile.den-gateway"
       - "packaging/docker/Dockerfile.den-web"
       - "packaging/docker/Dockerfile.inference"
       - "packaging/helm/openwork-ee/**"
       - "ee/apps/den-api/**"
+      - "ee/apps/den-gateway/**"
       - "ee/apps/den-web/**"
       - "ee/apps/inference/**"
       - "ee/packages/**"
@@ -33,6 +37,10 @@ on:
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
       - "package.json"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' }}
 
 permissions:
   contents: read
@@ -68,7 +76,7 @@ jobs:
             chart_version="${GITHUB_REF_NAME#v}"
           fi
 
-          if [ "$publish" = "true" ] && [ -z "$chart_version" ]; then
+          if [ "$publish" = "true" ] && [ -z "$chart_version" ] && [ "${GITHUB_EVENT_NAME}" != "push" ]; then
             echo "chart_version is required when manually publishing from a non-tag ref" >&2
             exit 1
           fi
@@ -108,14 +116,14 @@ jobs:
             --destination dist/charts
 
       - name: Log in to GHCR for Helm
-        if: ${{ needs.artifact-version.outputs.publish == 'true' }}
+        if: ${{ needs.artifact-version.outputs.publish == 'true' && needs.artifact-version.outputs.chart_version != '' }}
         run: |
           printf '%s' "${{ secrets.GITHUB_TOKEN }}" | helm registry login "${{ env.REGISTRY }}" \
             --username "${{ github.actor }}" \
             --password-stdin
 
       - name: Publish chart
-        if: ${{ needs.artifact-version.outputs.publish == 'true' }}
+        if: ${{ needs.artifact-version.outputs.publish == 'true' && needs.artifact-version.outputs.chart_version != '' }}
         run: helm push "dist/charts/openwork-ee-${{ needs.artifact-version.outputs.chart_version }}.tgz" "oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts"
 
   ee-images:
@@ -132,7 +140,6 @@ jobs:
             health_path: /health
             smoke_env: >-
               -e DB_MODE=mysql
-              -e DATABASE_URL=mysql://smoke:smoke@127.0.0.1:3306/smoke
               -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456
               -e BETTER_AUTH_SECRET=ci-better-auth-secret-value-123456
               -e BETTER_AUTH_URL=http://127.0.0.1:8788
@@ -187,6 +194,7 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
           labels: |
             org.opencontainers.image.title=${{ matrix.image }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -234,7 +242,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          platforms: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev') && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           load: ${{ github.event_name == 'pull_request' }}
           push: ${{ needs.artifact-version.outputs.publish == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -243,6 +251,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
           build-args: |
             ${{ matrix.image == 'openwork-den-api' && format('DEN_API_VERSION={0}', needs.artifact-version.outputs.chart_version || github.sha) || '' }}
+            ${{ matrix.image == 'openwork-den-gateway' && format('DEN_GATEWAY_VERSION={0}', needs.artifact-version.outputs.chart_version || github.sha) || '' }}
             ${{ matrix.image == 'openwork-den-api' && 'DEN_UPLOAD_SENTRY_SOURCEMAPS=0' || '' }}
             ${{ matrix.image == 'openwork-den-web' && 'DEN_WEB_UPLOAD_SENTRY_SOURCEMAPS=0' || '' }}
 
@@ -252,7 +261,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev') && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -260,6 +269,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
           build-args: |
             ${{ matrix.image == 'openwork-den-api' && format('DEN_API_VERSION={0}', needs.artifact-version.outputs.chart_version || github.sha) || '' }}
+            ${{ matrix.image == 'openwork-den-gateway' && format('DEN_GATEWAY_VERSION={0}', needs.artifact-version.outputs.chart_version || github.sha) || '' }}
             ${{ matrix.image == 'openwork-den-api' && 'DEN_UPLOAD_SENTRY_SOURCEMAPS=1' || '' }}
             ${{ matrix.image == 'openwork-den-web' && 'DEN_WEB_UPLOAD_SENTRY_SOURCEMAPS=1' || '' }}
             ${{ matrix.image == 'openwork-den-api' && format('DEN_SENTRY_UPLOAD_BUILD_ID={0}-{1}', github.run_id, github.run_attempt) || '' }}
@@ -292,15 +302,95 @@ jobs:
         env:
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          image_tag="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
-          container_id="$(docker run -d --rm -P ${{ matrix.smoke_env }} "$image_tag")"
+          set -euo pipefail
+
+          image_tag="${IMAGE_TAGS%%$'\n'*}"
+          container_name="openwork-smoke-${{ matrix.image }}"
+          mysql_container=""
+          network_name=""
+
+          # shellcheck disable=SC2329 # Invoked by the EXIT trap.
           cleanup() {
-            docker stop "$container_id" >/dev/null || true
+            status=$?
+            trap - EXIT
+            set +e
+
+            if [ "$status" -ne 0 ]; then
+              if docker inspect "$container_name" >/dev/null 2>&1; then
+                echo "Smoke container logs:"
+                docker logs "$container_name" || true
+              fi
+              if [ -n "$mysql_container" ] && docker inspect "$mysql_container" >/dev/null 2>&1; then
+                echo "MySQL container logs:"
+                docker logs "$mysql_container" || true
+              fi
+            fi
+
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            if [ -n "$mysql_container" ]; then
+              docker rm -f "$mysql_container" >/dev/null 2>&1 || true
+            fi
+            if [ -n "$network_name" ]; then
+              docker network rm "$network_name" >/dev/null 2>&1 || true
+            fi
+
+            exit "$status"
           }
           trap cleanup EXIT
 
+          if [ "${{ matrix.image }}" = "openwork-den-api" ]; then
+            network_name="openwork-den-api-smoke"
+            mysql_container="openwork-den-api-smoke-mysql"
+            database_url="mysql://smoke:smoke@${mysql_container}:3306/smoke"
+
+            docker network create "$network_name" >/dev/null
+            docker run -d \
+              --name "$mysql_container" \
+              --network "$network_name" \
+              -e MYSQL_ROOT_PASSWORD=smoke-root-password \
+              -e MYSQL_DATABASE=smoke \
+              -e MYSQL_USER=smoke \
+              -e MYSQL_PASSWORD=smoke \
+              mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb >/dev/null
+
+            mysql_ready="false"
+            for _ in {1..30}; do
+              if docker exec \
+                -e MYSQL_PWD=smoke-root-password \
+                "$mysql_container" \
+                mysqladmin ping --host=127.0.0.1 --user=root --silent >/dev/null 2>&1; then
+                mysql_ready="true"
+                echo "MySQL is ready"
+                break
+              fi
+              sleep 2
+            done
+            if [ "$mysql_ready" != "true" ]; then
+              echo "MySQL did not become ready" >&2
+              exit 1
+            fi
+
+            docker run --rm \
+              --network "$network_name" \
+              -e DATABASE_URL="$database_url" \
+              -e DEN_DB_ENCRYPTION_KEY=ci-den-db-encryption-key-value-123456 \
+              --entrypoint node \
+              "$image_tag" \
+              /app/ee/packages/den-db/dist/scripts/bootstrap.js
+
+            container_id="$(docker run -d \
+              --name "$container_name" \
+              --network "$network_name" \
+              -P \
+              -e DATABASE_URL="$database_url" \
+              ${{ matrix.smoke_env }} \
+              "$image_tag")"
+          else
+            container_id="$(docker run -d --name "$container_name" -P ${{ matrix.smoke_env }} "$image_tag")"
+          fi
+
           host_port=""
-          for attempt in {1..10}; do
+          for _ in {1..10}; do
             host_port="$(docker port "$container_id" "${{ matrix.port }}/tcp" 2>/dev/null | awk -F: 'NR == 1 { print $NF }')"
             if [ -n "$host_port" ]; then
               break
@@ -314,8 +404,9 @@ jobs:
 
           url="http://127.0.0.1:${host_port}${{ matrix.health_path }}"
 
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if node -e "fetch(process.argv[1]).then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))" "$url"; then
+              echo "Health endpoint is ready: $url"
               exit 0
             fi
             sleep 2
@@ -323,3 +414,42 @@ jobs:
 
           docker logs "$container_id" || true
           exit 1
+
+  # The gateway is stateless (it serves the SPA and proxies), so dev CD is safe.
+  # den-api and engine-snapshot dev CD are deliberate follow-ups because they
+  # require migration and sandbox recycle handling.
+  redeploy-den-gateway:
+    needs: [artifact-version, ee-images]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Redeploy den-gateway on Render
+        shell: bash
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_DEN_GATEWAY_SERVICE_ID: ${{ secrets.RENDER_DEN_GATEWAY_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RENDER_DEN_GATEWAY_SERVICE_ID:-}" ] || [ -z "${RENDER_API_KEY:-}" ]; then
+            echo "::notice::Render gateway credentials unavailable; skipping redeploy..."
+            echo "Render gateway redeploy skipped because credentials are unavailable." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          response="$(curl -s -w '\n%{http_code}' -X POST \
+            "https://api.render.com/v1/services/${RENDER_DEN_GATEWAY_SERVICE_ID}/deploys" \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}')"
+          code="$(printf '%s' "$response" | tail -1)"
+          body="$(printf '%s' "$response" | sed '$d')"
+          if [ "$code" -ge 400 ]; then
+            echo "::error::POST /deploys returned HTTP $code: $body"
+            exit 1
+          fi
+
+          {
+            echo
+            echo "Triggered a den-gateway deploy so it pulls the fresh dev image."
+          } >> "$GITHUB_STEP_SUMMARY"

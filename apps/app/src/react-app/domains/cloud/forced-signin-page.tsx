@@ -12,6 +12,7 @@ import {
   readDenSettings,
   resolveDenBaseUrls,
 } from "../../../app/lib/den";
+import { markDesktopSignInInitiated } from "../../../app/lib/den-sign-in-intent";
 import { exchangeHandoffAndSignIn } from "../../../app/lib/den-handoff";
 import {
   denSessionUpdatedEvent,
@@ -111,6 +112,7 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
   const openBrowserAuth = useCallback(
     (mode: "sign-in" | "sign-up") => {
       const url = buildDenAuthUrl(baseUrl, mode);
+      markDesktopSignInInitiated();
       setSigninFallbackUrl(url);
       setStatusMessage(
         mode === "sign-up"
@@ -140,6 +142,8 @@ export function ForcedSigninPage({ developerMode }: ForcedSigninPageProps) {
       const result = await exchangeHandoffAndSignIn(grant, {
         baseUrl: nextBaseUrl,
         client,
+        // Pasted one-time codes are desktop-initiated sign-ins.
+        desktopInitiated: true,
         fallbackErrorMessage: t("den.error_no_token"),
       });
       if (!result.ok) {

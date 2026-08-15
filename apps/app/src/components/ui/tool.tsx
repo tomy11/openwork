@@ -300,7 +300,7 @@ const Tool = ({
             )
           ) : null}
           {isError && toolPart.errorText ? (
-            <pre className="text-destructive whitespace-pre-wrap wrap-break-word">
+            <pre className="text-destructive max-h-60 overflow-auto whitespace-pre-wrap wrap-break-word">
               {toolPart.errorText}
             </pre>
           ) : null}

@@ -160,7 +160,7 @@ test.skipIf(!appSpecsEnabled || !denApiUrl)(title, async () => {
 
   // 6. And it is visible in the app's own extensions surface.
   await go(app, `/workspace/${app.readiness.workspaceId ?? ""}/settings/extensions`).catch(() => undefined);
-  await waitForText(app, "Extensions", { timeoutMs: 60_000 }).catch(() => undefined);
+  await waitForText(app, "Library", { timeoutMs: 60_000 }).catch(() => undefined);
   {
     const shot = await screenshot(app);
     const seen = await validate(shot, [

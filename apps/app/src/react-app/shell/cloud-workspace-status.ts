@@ -130,8 +130,54 @@ export function cloudWorkspaceUpdateAvailable(instance: DenCloudInstance | null)
   return instance.imageVersion === null || instance.imageVersion !== instance.latestVersion;
 }
 
+// Stopped instances already recycle on wake; this only nudges running stale instances,
+// skips while any client-visible run is active, and attempts once per target version so
+// failed or already_current attempts cannot retry-loop.
+export function shouldAutoUpdateCloudWorkspace(input: {
+  gatewayMode: boolean;
+  visible: boolean;
+  status: "provisioning" | "waking" | "ready" | "failed" | null;
+  updateAvailable: boolean;
+  updating: boolean;
+  requestFailed: boolean;
+  hasActiveRun: boolean;
+  latestVersion: string | null;
+  lastAttemptedVersion: string | null;
+}): boolean {
+  return input.gatewayMode
+    && input.visible
+    && input.status === "ready"
+    && input.updateAvailable
+    && !input.updating
+    && !input.requestFailed
+    && !input.hasActiveRun
+    && input.latestVersion !== null
+    && input.latestVersion !== input.lastAttemptedVersion;
+}
+
 export function cloudWorkspaceStatusHasReadyContent(variant: CloudWorkspacePillVariant): boolean {
   return variant === "ready" || variant === "stale";
+}
+
+/**
+ * Gateway boot is owned by the workspace takeover. Showing the generic overlay
+ * at the same time stacks two wait indicators on first load.
+ */
+export function shouldSuppressBootOverlayForGateway(input: {
+  gatewayMode: boolean;
+  signedIn: boolean;
+  variant: CloudWorkspacePillVariant;
+}): boolean {
+  return input.gatewayMode && input.signedIn && !cloudWorkspaceStatusHasReadyContent(input.variant);
+}
+
+export function shouldShowCloudWorkspaceStatusPill(input: {
+  variant: CloudWorkspacePillVariant;
+  hasInstance: boolean;
+  requestFailed: boolean;
+}): boolean {
+  if (!input.hasInstance && !input.requestFailed) return false;
+  return input.variant === "waking" || input.variant === "provisioning" || input.variant === "failed";
 }
 
 export function mapCloudWorkspaceMainContentDecision(input: {

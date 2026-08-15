@@ -12,7 +12,7 @@ function jsonRequest(body: string) {
 async function expectJsonRpcError(response: Response, code: -32700 | -32600, message: "Parse error" | "Invalid Request", referenceId: string) {
   expect(response.status).toBe(400)
   expect(response.headers.get("content-type")).toBe("application/json")
-  expect(response.headers.get("X-Request-Id")).toBe(referenceId)
+  expect(response.headers.get("X-Request-Id")).toBeNull()
   await expect(response.json()).resolves.toMatchObject({
     jsonrpc: "2.0",
     id: null,

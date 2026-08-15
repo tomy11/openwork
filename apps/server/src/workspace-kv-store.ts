@@ -1,5 +1,6 @@
 import { eq } from "drizzle-orm";
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { existsSync } from "node:fs";
 import { openRuntimeSqliteDatabase, runtimeDbPath, type RuntimeSqliteDatabase } from "./runtime-db.js";
 import type { ServerConfig } from "./types.js";
 
@@ -199,12 +200,30 @@ async function workspaceKvDb(path: string, config: WorkspaceKvTableConfig): Prom
   return db;
 }
 
+/**
+ * Reads must never materialize the runtime DB. A fresh install reads stores
+ * before anything is written (startup provider-auth sync is one), and opening
+ * with create:true would grow the state directory and an empty SQLite file
+ * just to learn there is nothing stored. A missing file reads like an empty
+ * one. An already-open connection still wins: a write in flight has the file
+ * on the way even when it is not on disk yet.
+ */
+async function readableWorkspaceKvDb(
+  path: string,
+  config: WorkspaceKvTableConfig,
+): Promise<WorkspaceKvDb | undefined> {
+  const opened = tableDbByPath.get(path)?.get(config.tableName);
+  if (opened) return opened;
+  if (!dbByPath.has(path) && !existsSync(path)) return undefined;
+  return workspaceKvDb(path, config);
+}
+
 export function createWorkspaceKvStore<T>(options: WorkspaceKvStoreOptions<T>) {
   const config = tableConfig(options);
 
   async function getRow(serverConfig: ServerConfig, workspaceId: string): Promise<WorkspaceKvRow<T> | undefined> {
-    const db = await workspaceKvDb(runtimeDbPath(serverConfig), config);
-    const row = db.get(workspaceId);
+    const db = await readableWorkspaceKvDb(runtimeDbPath(serverConfig), config);
+    const row = db?.get(workspaceId);
     return row ? { ...row, value: options.parse(row.valueJson) } : undefined;
   }
 
@@ -225,8 +244,8 @@ export function createWorkspaceKvStore<T>(options: WorkspaceKvStoreOptions<T>) {
       return (await getRow(serverConfig, workspaceId))?.value;
     },
     has: async (serverConfig: ServerConfig, workspaceId: string): Promise<boolean> => {
-      const db = await workspaceKvDb(runtimeDbPath(serverConfig), config);
-      return Boolean(db.get(workspaceId));
+      const db = await readableWorkspaceKvDb(runtimeDbPath(serverConfig), config);
+      return Boolean(db?.get(workspaceId));
     },
     set: async (serverConfig: ServerConfig, workspaceId: string, value: T, updatedAt = Date.now()): Promise<void> => {
       await setSerialized(serverConfig, workspaceId, options.serialize(value), updatedAt);

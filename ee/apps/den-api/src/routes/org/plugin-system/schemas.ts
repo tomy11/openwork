@@ -226,6 +226,7 @@ export const pluginCreateComponentSchema = z.object({
 export const pluginCreateSchema = z.object({
   name: z.string().trim().min(1).max(255),
   description: nullableStringSchema.optional(),
+  sourceRepositoryUrl: z.string().trim().min(1).max(1024).optional(),
   components: z.array(pluginCreateComponentSchema).max(100).optional(),
   orgWide: z.boolean().optional(),
   marketplaceId: marketplaceIdSchema.optional(),
@@ -486,6 +487,108 @@ export const teamPluginAccessSchema = z.object({
   grantId: pluginAccessGrantIdSchema.nullable(),
 }).meta({ ref: "PluginArchTeamPluginAccess" })
 
+const effectiveAccessEdgeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("mine") }),
+  z.object({
+    kind: z.literal("person"),
+    sharedBy: z.object({
+      orgMembershipId: memberIdSchema,
+      name: z.string().trim().min(1).max(255),
+    }).nullable(),
+    grantedAt: z.string().datetime({ offset: true }),
+  }),
+  z.object({
+    kind: z.literal("team"),
+    team: z.object({
+      id: teamIdSchema,
+      name: z.string().trim().min(1).max(255),
+    }),
+  }),
+  z.object({ kind: z.literal("org_wide") }),
+  z.object({
+    kind: z.literal("catalog"),
+    marketplace: z.object({
+      id: marketplaceIdSchema,
+      name: z.string().trim().min(1).max(255),
+    }),
+  }),
+])
+
+export const mePluginAccessSchema = z.object({
+  plugin: z.object({
+    id: pluginIdSchema,
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    componentCount: z.number().int().nonnegative(),
+    sourceRepositoryUrl: z.string().trim().min(1).max(1024).nullable(),
+  }),
+  edges: z.array(effectiveAccessEdgeSchema),
+  role: accessRoleSchema,
+}).meta({ ref: "PluginArchMePluginAccess" })
+
+export const libraryItemSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("plugin"),
+    id: pluginIdSchema,
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    componentCount: z.number().int().nonnegative(),
+    componentKinds: z.array(z.string()),
+    sourceRepositoryUrl: z.string().trim().min(1).max(1024).nullable(),
+    edges: z.array(effectiveAccessEdgeSchema),
+    role: accessRoleSchema,
+  }),
+  z.object({
+    type: z.literal("app"),
+    id: configObjectIdSchema,
+    pluginId: pluginIdSchema,
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    sourceUrl: z.string().url().max(2048),
+    status: z.enum(["active", "retired"]),
+    activeVersionId: configObjectVersionIdSchema.nullable(),
+    state: z.literal("ready"),
+    edges: z.array(effectiveAccessEdgeSchema),
+    role: accessRoleSchema,
+  }),
+  z.object({
+    type: z.literal("connection"),
+    id: z.string().trim().min(1),
+    name: z.string().trim().min(1).max(255),
+    url: z.string(),
+    description: nullableStringSchema,
+    transport: z.enum(["mcp", "native"]),
+    provider: z.string().trim().min(1).nullable(),
+    state: z.enum(["connected", "needs_signin", "needs_admin_setup", "available"]),
+    connectedAt: nullableTimestampSchema,
+    edges: z.array(effectiveAccessEdgeSchema),
+  }),
+  z.object({
+    type: z.literal("program"),
+    id: configObjectIdSchema,
+    plugin: z.object({ id: pluginIdSchema, name: z.string().trim().min(1).max(255) }).nullable(),
+    name: z.string().trim().min(1).max(255),
+    description: nullableStringSchema,
+    role: accessRoleSchema,
+    edges: z.array(effectiveAccessEdgeSchema),
+    state: z.enum(["ready", "needs_signin", "needs_admin_setup"]),
+    resultState: z.enum(["never_run", "fresh", "stale", "needs_attention"]),
+    latestSuccessfulAt: nullableTimestampSchema,
+    viewState: z.enum(["default", "custom_active", "build_failed", "retired"]),
+    activeViewTitle: nullableStringSchema,
+    automationCount: z.number().int().nonnegative(),
+    source: z.object({
+      kind: z.enum(["created", "installed_template"]),
+      templateName: z.string().trim().min(1).max(255).optional(),
+      templateVersion: z.string().trim().min(1).max(100).optional(),
+    }),
+  }),
+]).meta({ ref: "PluginArchLibraryItem" })
+
+export const meLibraryListResponseSchema = z.object({
+  items: z.array(libraryItemSchema),
+}).meta({ ref: "PluginArchMeLibraryListResponse" })
+
 export const configObjectVersionSchema = z.object({
   id: configObjectVersionIdSchema,
   configObjectId: configObjectIdSchema,
@@ -562,6 +665,7 @@ export const pluginSchema = z.object({
   organizationId: denTypeIdSchema("organization"),
   name: z.string().trim().min(1).max(255),
   description: nullableStringSchema,
+  sourceRepositoryUrl: z.string().trim().min(1).max(1024).nullable(),
   status: pluginStatusSchema,
   createdByOrgMembershipId: memberIdSchema,
   createdAt: z.string().datetime({ offset: true }),
@@ -690,6 +794,7 @@ export const connectorSyncSummarySchema = z.object({
 
 export const connectorSyncEventSchema = z.object({
   id: connectorSyncEventIdSchema,
+  attemptCount: z.number().int().nonnegative(),
   connectorInstanceId: connectorInstanceIdSchema,
   connectorTargetId: connectorTargetIdSchema.nullable(),
   connectorType: connectorTypeSchema,
@@ -697,6 +802,7 @@ export const connectorSyncEventSchema = z.object({
   eventType: connectorSyncEventTypeSchema,
   externalEventRef: z.string().trim().min(1).max(255).nullable(),
   sourceRevisionRef: z.string().trim().min(1).max(255).nullable(),
+  nextAttemptAt: nullableTimestampSchema,
   status: connectorSyncStatusSchema,
   summaryJson: connectorSyncSummarySchema.nullable(),
   startedAt: z.string().datetime({ offset: true }),
@@ -966,6 +1072,7 @@ export const marketplacePluginMutationResponseSchema = pluginArchMutationRespons
 export const accessGrantListResponseSchema = pluginArchListResponseSchema("PluginArchAccessGrantListResponse", accessGrantSchema)
 export const accessGrantMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchAccessGrantMutationResponse", accessGrantSchema)
 export const teamPluginAccessListResponseSchema = pluginArchListResponseSchema("PluginArchTeamPluginAccessListResponse", teamPluginAccessSchema).omit({ nextCursor: true })
+export const mePluginAccessListResponseSchema = pluginArchListResponseSchema("PluginArchMePluginAccessListResponse", mePluginAccessSchema).omit({ nextCursor: true })
 export const connectorAccountListResponseSchema = pluginArchListResponseSchema("PluginArchConnectorAccountListResponse", connectorAccountSchema)
 export const connectorAccountDetailResponseSchema = pluginArchDetailResponseSchema("PluginArchConnectorAccountDetailResponse", connectorAccountSchema)
 export const connectorAccountMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchConnectorAccountMutationResponse", connectorAccountSchema)
@@ -1008,6 +1115,10 @@ export const connectorInstanceRemoveResponseSchema = pluginArchMutationResponseS
 export const connectorInstanceListResponseSchema = pluginArchListResponseSchema("PluginArchConnectorInstanceListResponse", connectorInstanceSchema)
 export const connectorInstanceDetailResponseSchema = pluginArchDetailResponseSchema("PluginArchConnectorInstanceDetailResponse", connectorInstanceSchema)
 export const connectorInstanceMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchConnectorInstanceMutationResponse", connectorInstanceSchema)
+export const connectorInstanceSyncNowResponseSchema = pluginArchMutationResponseSchema(
+  "PluginArchConnectorInstanceSyncNowResponse",
+  z.object({ enqueuedCount: z.number().int().nonnegative() }),
+)
 export const connectorTargetListResponseSchema = pluginArchListResponseSchema("PluginArchConnectorTargetListResponse", connectorTargetSchema)
 export const connectorTargetDetailResponseSchema = pluginArchDetailResponseSchema("PluginArchConnectorTargetDetailResponse", connectorTargetSchema)
 export const connectorTargetMutationResponseSchema = pluginArchMutationResponseSchema("PluginArchConnectorTargetMutationResponse", connectorTargetSchema)

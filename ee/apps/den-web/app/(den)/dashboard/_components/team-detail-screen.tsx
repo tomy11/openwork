@@ -132,40 +132,42 @@ export function TeamDetailScreen({ teamId }: { teamId: string }) {
                 message={accessQuery.error instanceof Error ? accessQuery.error.message : "Could not load team access."}
               />
             ) : accessQuery.data?.length ? (
-              <div className="overflow-x-auto rounded-2xl border border-gray-100 bg-white">
-                <div className="min-w-[760px]">
-                  <div className="grid grid-cols-[minmax(0,1fr)_210px_100px_230px_110px] border-b border-gray-100 px-6 py-3 text-[11px] uppercase tracking-[0.14em] text-gray-400">
+              <div className="overflow-hidden rounded-2xl md:border md:border-gray-100 md:bg-white md:overflow-x-auto">
+                <div className="md:min-w-[760px]">
+                  <div className="hidden grid-cols-[minmax(0,1fr)_210px_100px_230px_110px] border-b border-gray-100 px-6 py-3 text-[11px] uppercase tracking-[0.14em] text-gray-400 md:grid">
                     <span>Plugin</span>
                     <span>Access via</span>
                     <span>Role</span>
                     <span>Granted by</span>
                     <span />
                   </div>
-                  <div className="divide-y divide-gray-100">
+                  <div className="space-y-3 md:space-y-0 md:divide-y md:divide-gray-100">
                     {accessQuery.data.map((item) => {
                       const revoking = revokeAccess.isPending && revokeAccess.variables?.grantId === item.grantId;
                       return (
                         <div
                           key={`${item.plugin.id}-${item.edge}-${item.grantId ?? item.marketplace?.id ?? "org"}`}
-                          className={`grid grid-cols-[minmax(0,1fr)_210px_100px_230px_110px] items-center px-6 py-3.5 ${item.role === "editor" ? "bg-amber-50/40" : ""}`}
+                          className={`flex flex-col gap-3 rounded-2xl border border-gray-100 bg-white px-4 py-4 md:grid md:grid-cols-[minmax(0,1fr)_210px_100px_230px_110px] md:items-center md:gap-0 md:rounded-none md:border-0 md:px-6 md:py-3.5 ${item.role === "editor" ? "bg-amber-50/40" : ""}`}
                         >
-                          <div className="min-w-0 pr-4">
+                          <div className="min-w-0 md:pr-4">
                             <p className="truncate text-[14px] font-semibold text-gray-900">{item.plugin.name}</p>
                             <p className="mt-0.5 text-[12px] text-gray-400">
                               {item.plugin.componentCount} {item.plugin.componentCount === 1 ? "component" : "components"}
                             </p>
                           </div>
-                          <div className="pr-4">
-                            <AccessViaBadge item={item} />
+                          <div className="flex flex-wrap items-center gap-2 md:contents">
+                            <div className="md:pr-4">
+                              <AccessViaBadge item={item} />
+                            </div>
+                            <div>
+                              <RoleBadge role={item.role} />
+                            </div>
                           </div>
-                          <div>
-                            <RoleBadge role={item.role} />
-                          </div>
-                          <p className="pr-4 text-[13px] text-gray-500">
+                          <p className="text-[13px] text-gray-500 md:pr-4">
                             {item.grantedBy?.name ?? "—"} · {formatGrantedDate(item.grantedAt)}
                           </p>
-                          <div className="flex justify-end">
-                            {item.edge === "direct_team" ? (
+                          {item.edge === "direct_team" ? (
+                            <div className="flex justify-end border-t border-gray-100 pt-3 md:border-0 md:pt-0">
                               <DenButton
                                 variant="destructive"
                                 size="sm"
@@ -182,7 +184,9 @@ export function TeamDetailScreen({ teamId }: { teamId: string }) {
                               >
                                 Revoke
                               </DenButton>
-                            ) : item.edge === "via_catalog" && item.marketplace ? (
+                            </div>
+                          ) : item.edge === "via_catalog" && item.marketplace ? (
+                            <div className="flex justify-end border-t border-gray-100 pt-3 md:border-0 md:pt-0">
                               <DenButton
                                 href={getMarketplaceRoute(orgSlug, item.marketplace.id)}
                                 variant="secondary"
@@ -190,8 +194,8 @@ export function TeamDetailScreen({ teamId }: { teamId: string }) {
                               >
                                 Open catalog
                               </DenButton>
-                            ) : null}
-                          </div>
+                            </div>
+                          ) : null}
                         </div>
                       );
                     })}

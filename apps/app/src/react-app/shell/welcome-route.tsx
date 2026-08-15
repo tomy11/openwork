@@ -1,6 +1,6 @@
 /** @jsxImportSource react */
 import { useCallback, useEffect, useReducer, useState, useSyncExternalStore } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 
 import { t } from "../../i18n";
 import {
@@ -13,6 +13,7 @@ import {
   type WorkspaceList,
 } from "../../app/lib/desktop";
 import { isDesktopRuntime } from "../../app/utils";
+import { canCreateWorkspaces } from "../../app/lib/workspace-creation-policy";
 import { createClient, unwrap } from "../../app/lib/opencode";
 import { useLocal } from "../kernel/local-provider";
 import { usePlatform } from "../kernel/platform";
@@ -32,15 +33,12 @@ import { JoinOrganizationDialog } from "../domains/cloud/join-organization-dialo
 import { resolveOpenworkConnection } from "./openwork-connection";
 import { captureAnalyticsEvent } from "../../app/lib/analytics";
 import { buildOpenworkWorkspaceBaseUrl, createOpenworkServerClient } from "../../app/lib/openwork-server";
-import { buildDenAuthUrl, clearDenSession, DEFAULT_DEN_BASE_URL, readDenSettings } from "../../app/lib/den";
-import {
-  denSettingsChangedEvent,
-  dispatchDenSessionUpdated,
-} from "../../app/lib/den-session-events";
+import { buildDenAuthUrl, DEFAULT_DEN_BASE_URL, readDenSettings } from "../../app/lib/den";
+import { markDesktopSignInInitiated } from "../../app/lib/den-sign-in-intent";
+import { denSettingsChangedEvent } from "../../app/lib/den-session-events";
 import { writeActiveWorkspaceId, writeLastSessionFor, writeWorkspaceProjectDimension } from "./session-memory";
 import { workspaceSessionRoute } from "./workspace-routes";
 import { ensureDesktopLocalOpenworkConnection } from "./desktop-local-openwork";
-import { saveControlPlaneUrl } from "../domains/settings/cloud/control-plane-url";
 import { shouldHoldWelcomeForDenSession } from "./welcome-den-session";
 
 function subscribeToDenSettings(onStoreChange: () => void) {
@@ -143,9 +141,6 @@ export function WelcomeRoute() {
   const denAuth = useDenAuth();
   const [state, dispatch] = useReducer(welcomeReducer, initialWelcomeState);
   const [manualFolder, setManualFolder] = useState("");
-  const [organizationServerUrl, setOrganizationServerUrl] = useState(() => readDenSettings().baseUrl);
-  const [organizationServerBusy, setOrganizationServerBusy] = useState(false);
-  const [organizationServerError, setOrganizationServerError] = useState<string | null>(null);
   const [joinOrganizationOpen, setJoinOrganizationOpen] = useState(false);
   const showOpenWorkModelsPromo = useOpenWorkModelsPromoEligibility();
   const denAuthTokenSnapshot = useSyncExternalStore(
@@ -175,35 +170,6 @@ export function WelcomeRoute() {
   const markOnboardingComplete = useCallback(() => {
     local.setPrefs((prev) => ({ ...prev, hasCompletedOnboarding: true }));
   }, [local]);
-
-  useEffect(() => {
-    const handleDenSettingsChanged = () => setOrganizationServerUrl(readDenSettings().baseUrl);
-    window.addEventListener(denSettingsChangedEvent, handleDenSettingsChanged);
-    return () => window.removeEventListener(denSettingsChangedEvent, handleDenSettingsChanged);
-  }, []);
-
-  const handleOrganizationServerSave = useCallback(async (url: string) => {
-    setOrganizationServerBusy(true);
-    setOrganizationServerError(null);
-    try {
-      const persisted = await saveControlPlaneUrl(url);
-      if (!persisted) {
-        setOrganizationServerError(t("welcome.organization_server_error"));
-        return false;
-      }
-      clearDenSession({ includeBaseUrls: false });
-      dispatchDenSessionUpdated({ status: "signed_out", baseUrl: persisted.baseUrl });
-      setOrganizationServerUrl(persisted.baseUrl);
-      return true;
-    } catch (error) {
-      setOrganizationServerError(
-        error instanceof Error ? error.message : t("welcome.organization_server_error"),
-      );
-      return false;
-    } finally {
-      setOrganizationServerBusy(false);
-    }
-  }, []);
 
   const handleCreateWorkspace = useCallback(
     async (_preset: string, folder: string | null, options?: CreateWorkspaceOptions) => {
@@ -370,6 +336,7 @@ export function WelcomeRoute() {
 
   const handleGetStarted = useCallback(async () => {
     if (!isDesktopRuntime()) {
+      if (!canCreateWorkspaces()) return;
       // Non-desktop: fall back to the modal for remote workspace creation.
       dispatch({ type: "open" });
       return;
@@ -389,6 +356,7 @@ export function WelcomeRoute() {
   const handleTeamSignIn = useCallback(() => {
     markOnboardingComplete();
     const settings = readDenSettings();
+    markDesktopSignInInitiated();
     platform.openLink(buildDenAuthUrl(settings.baseUrl || DEFAULT_DEN_BASE_URL, "sign-in"));
   }, [markOnboardingComplete, platform]);
 
@@ -433,10 +401,6 @@ export function WelcomeRoute() {
         showManualFolder={import.meta.env.DEV && isDesktopRuntime()}
         onTeamSignIn={handleTeamSignIn}
         onJoinOrganization={() => setJoinOrganizationOpen(true)}
-        organizationServerBusy={organizationServerBusy}
-        organizationServerError={organizationServerError}
-        organizationServerUrl={organizationServerUrl}
-        onOrganizationServerSave={handleOrganizationServerSave}
       />
       <JoinOrganizationDialog
         open={joinOrganizationOpen}

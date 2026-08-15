@@ -26,6 +26,31 @@ function hasUsableConnection(url: string, token: string) {
 }
 
 /**
+ * Stored settings for a desktop-managed local server are snapshots of
+ * ephemeral state: the server mints a fresh loopback port and tokens on every
+ * (re)start. When the live desktop runtime definitively reports that the
+ * server is not ready, any stored loopback connection is from a previous
+ * server lifetime — resolving it would point the route at a dead port and
+ * make a restart look like a broken connection instead of a transient gap.
+ * Stored non-loopback URLs (remote/manual servers) stay usable as fallbacks,
+ * and a failing desktop bridge (no definitive answer) keeps today's fallback
+ * behavior.
+ */
+export function isStaleStoredDesktopConnection(input: {
+  desktopRuntime: boolean;
+  desktopServerReportedNotReady: boolean;
+  storedBaseUrl: string;
+  runtimeReportedBaseUrl: string;
+}): boolean {
+  if (!input.desktopRuntime || !input.desktopServerReportedNotReady) return false;
+  if (!input.storedBaseUrl) return false;
+  return (
+    isLoopbackOpenworkServerUrl(input.storedBaseUrl) ||
+    input.storedBaseUrl === input.runtimeReportedBaseUrl
+  );
+}
+
+/**
  * Resolve the OpenWork server connection for routes that consume the server API.
  *
  * Local desktop-hosted servers expose ephemeral loopback ports and freshly
@@ -46,6 +71,7 @@ export async function resolveOpenworkConnection(): Promise<ResolvedOpenworkConne
   }
 
   let staleDesktopRuntimeBaseUrl = "";
+  let desktopServerReportedNotReady = false;
 
   if (isDesktopRuntime()) {
     try {
@@ -63,6 +89,9 @@ export async function resolveOpenworkConnection(): Promise<ResolvedOpenworkConne
           source: "desktop-runtime",
         };
       }
+      // Definitive live answer: the local server is booting/restarting and
+      // has not republished a usable connection yet.
+      desktopServerReportedNotReady = true;
       staleDesktopRuntimeBaseUrl = normalizedBaseUrl;
     } catch {
       // Fall through to stored settings for remote/manual connections.
@@ -80,11 +109,12 @@ export async function resolveOpenworkConnection(): Promise<ResolvedOpenworkConne
     normalizedBaseUrl && isLoopbackOpenworkServerUrl(normalizedBaseUrl)
       ? settings.hostToken?.trim() ?? ""
       : "";
-  const storedConnectionIsStaleDesktopRuntime = Boolean(
-    isDesktopRuntime() &&
-      staleDesktopRuntimeBaseUrl &&
-      normalizedBaseUrl === staleDesktopRuntimeBaseUrl,
-  );
+  const storedConnectionIsStaleDesktopRuntime = isStaleStoredDesktopConnection({
+    desktopRuntime: isDesktopRuntime(),
+    desktopServerReportedNotReady,
+    storedBaseUrl: normalizedBaseUrl,
+    runtimeReportedBaseUrl: staleDesktopRuntimeBaseUrl,
+  });
   const source =
     !storedConnectionIsStaleDesktopRuntime && hasUsableConnection(normalizedBaseUrl, resolvedToken)
       ? "stored-settings"

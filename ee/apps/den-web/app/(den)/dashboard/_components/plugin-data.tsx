@@ -85,6 +85,24 @@ export type PluginCommand = {
   description: string;
 };
 
+export type PluginProgram = {
+  id: string;
+  name: string;
+  description: string;
+  versionId: string | null;
+  inputSchema: Record<string, unknown> | null;
+  outputSchema: Record<string, unknown> | null;
+  requiredCapabilityCount: number;
+};
+
+export type PluginRemoteMcpApp = {
+  id: string;
+  name: string;
+  description: string;
+  version: string | null;
+  sourceUrl: string | null;
+};
+
 export type PluginSource =
   | { type: "marketplace"; marketplace: string }
   | { type: "github"; repo: string }
@@ -112,6 +130,10 @@ export type DenPlugin = {
   mcps: PluginMcp[];
   agents: PluginAgent[];
   commands: PluginCommand[];
+  programs: PluginProgram[];
+  apps: PluginRemoteMcpApp[];
+  createdAt: string;
+  createdByOrgMembershipId: string | null;
   updatedAt: string;
   /**
    * Opt-in gating: which connected integration provider exposes this plugin.
@@ -138,7 +160,6 @@ export function getPluginCategoryLabel(category: PluginCategory): string {
       return "Infrastructure";
   }
 }
-
 export function formatPluginTimestamp(value: string | null): string {
   if (!value) {
     return "Recently updated";
@@ -156,8 +177,23 @@ export function formatPluginTimestamp(value: string | null): string {
   }).format(date);
 }
 
+export function getPluginComponentCount(plugin: DenPlugin): number {
+  return (
+    plugin.apps.length +
+    plugin.skills.length +
+    plugin.hooks.length +
+    plugin.mcps.length +
+    plugin.agents.length +
+    plugin.commands.length
+    + plugin.programs.length
+  );
+}
+
 export function getPluginPartsSummary(plugin: DenPlugin): string {
   const parts: string[] = [];
+  if (plugin.apps.length > 0) {
+    parts.push(`${plugin.apps.length} ${plugin.apps.length === 1 ? "App" : "Apps"}`);
+  }
   if (plugin.skills.length > 0) {
     parts.push(`${plugin.skills.length} ${plugin.skills.length === 1 ? "Skill" : "Skills"}`);
   }
@@ -172,6 +208,9 @@ export function getPluginPartsSummary(plugin: DenPlugin): string {
   }
   if (plugin.commands.length > 0) {
     parts.push(`${plugin.commands.length} ${plugin.commands.length === 1 ? "Command" : "Commands"}`);
+  }
+  if (plugin.programs.length > 0) {
+    parts.push(`${plugin.programs.length} ${plugin.programs.length === 1 ? "Program" : "Programs"}`);
   }
   return parts.length > 0 ? parts.join(" · ") : "Empty bundle";
 }
@@ -224,6 +263,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     commands: [
       { id: "cmd_gh_pr", name: "/gh:pr", description: "Create a pull request from the current branch." },
     ],
+    programs: [],
+    apps: [],
+    createdAt: "2026-04-10T12:00:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-04-10T12:00:00Z",
     requiresProvider: "github",
   },
@@ -250,6 +293,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
       { id: "cmd_cc_push", name: "/push", description: "Push current branch and track upstream." },
       { id: "cmd_cc_pr", name: "/pr", description: "Open a pull request." },
     ],
+    programs: [],
+    apps: [],
+    createdAt: "2026-04-07T09:00:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-04-07T09:00:00Z",
     requiresProvider: "any",
   },
@@ -284,6 +331,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     ],
     agents: [],
     commands: [],
+    programs: [],
+    apps: [],
+    createdAt: "2026-03-28T16:45:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-03-28T16:45:00Z",
     requiresProvider: "any",
   },
@@ -317,6 +368,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     commands: [
       { id: "cmd_lin_new", name: "/linear:new", description: "File a new issue from the current context." },
     ],
+    programs: [],
+    apps: [],
+    createdAt: "2026-04-02T18:12:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-04-02T18:12:00Z",
     requiresProvider: "any",
   },
@@ -350,6 +405,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     commands: [
       { id: "cmd_ow_release", name: "/release", description: "Run the standardized release workflow." },
     ],
+    programs: [],
+    apps: [],
+    createdAt: "2026-04-14T08:30:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-04-14T08:30:00Z",
     requiresProvider: "github",
   },
@@ -379,6 +438,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     ],
     agents: [],
     commands: [],
+    programs: [],
+    apps: [],
+    createdAt: "2026-03-20T11:00:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-03-20T11:00:00Z",
     requiresProvider: "any",
   },
@@ -405,6 +468,10 @@ const MOCK_PLUGINS: DenPlugin[] = [
     mcps: [],
     agents: [],
     commands: [],
+    programs: [],
+    apps: [],
+    createdAt: "2026-03-12T14:22:00Z",
+    createdByOrgMembershipId: null,
     updatedAt: "2026-03-12T14:22:00Z",
     requiresProvider: "any",
   },
@@ -501,6 +568,7 @@ function parseMembershipConfigObject(entry: unknown) {
   const objectType = asString(configObject.objectType);
   const currentRelativePath = asString(configObject.currentRelativePath);
   const latestVersion = isRecord(configObject.latestVersion) ? configObject.latestVersion : null;
+  const latestVersionId = latestVersion ? asString(latestVersion.id) : null;
   const normalizedPayload = latestVersion && isRecord(latestVersion.normalizedPayloadJson)
     ? latestVersion.normalizedPayloadJson
     : null;
@@ -513,17 +581,18 @@ function parseMembershipConfigObject(entry: unknown) {
     currentRelativePath,
     description,
     id,
+    latestVersionId,
     normalizedPayload,
     objectType,
     title,
   };
 }
 
-function derivePluginCategory(input: { agents: PluginAgent[]; commands: PluginCommand[]; hooks: PluginHook[]; mcps: PluginMcp[]; skills: PluginSkill[] }): PluginCategory {
+function derivePluginCategory(input: { agents: PluginAgent[]; apps: PluginRemoteMcpApp[]; commands: PluginCommand[]; hooks: PluginHook[]; mcps: PluginMcp[]; programs: PluginProgram[]; skills: PluginSkill[] }): PluginCategory {
   if (input.mcps.length > 0 || input.hooks.length > 0) {
     return "integrations";
   }
-  if (input.agents.length > 0 || input.commands.length > 0 || input.skills.length > 0) {
+  if (input.agents.length > 0 || input.apps.length > 0 || input.commands.length > 0 || input.programs.length > 0 || input.skills.length > 0) {
     return "workflows";
   }
   return "output-styles";
@@ -581,6 +650,32 @@ async function fetchResolvedPlugin(id: string): Promise<DenPlugin | null> {
   const commands = membershipItems
     .filter((item) => item.objectType === "command")
     .map((item) => ({ id: item.id, name: item.currentRelativePath?.split("/").pop()?.replace(/\.md$/i, "") ?? item.title, description: item.description } satisfies PluginCommand));
+  const programs = membershipItems
+    .filter((item) => item.objectType === "script")
+    .map((item) => ({
+      id: item.id,
+      name: item.title,
+      description: item.description,
+      versionId: item.latestVersionId,
+      inputSchema: isRecord(item.normalizedPayload?.inputSchema) ? item.normalizedPayload.inputSchema : null,
+      outputSchema: isRecord(item.normalizedPayload?.outputSchema) ? item.normalizedPayload.outputSchema : null,
+      requiredCapabilityCount: Array.isArray(item.normalizedPayload?.requiredCapabilities)
+        ? item.normalizedPayload.requiredCapabilities.length
+        : 0,
+    } satisfies PluginProgram));
+  const apps = membershipItems
+    .filter((item) => item.objectType === "app" && item.normalizedPayload?.kind === "remote_mcp_app")
+    .map((item) => {
+      const metadata = isRecord(item.normalizedPayload?.metadata) ? item.normalizedPayload.metadata : {};
+      const source = isRecord(item.normalizedPayload?.source) ? item.normalizedPayload.source : {};
+      return {
+        id: item.id,
+        name: asString(metadata.name) ?? item.title,
+        description: asString(metadata.description) ?? item.description,
+        version: asString(metadata.version),
+        sourceUrl: asString(source.url),
+      } satisfies PluginRemoteMcpApp;
+    });
   const hooks = membershipItems
     .filter((item) => item.objectType === "hook")
     .map((item) => ({
@@ -605,9 +700,12 @@ async function fetchResolvedPlugin(id: string): Promise<DenPlugin | null> {
 
   return {
     agents,
+    apps,
     author: "Connected repository",
-    category: derivePluginCategory({ agents, commands, hooks, mcps, skills }),
+    category: derivePluginCategory({ agents, apps, commands, hooks, mcps, programs, skills }),
     commands,
+    createdAt: asString(pluginItem.createdAt) ?? new Date().toISOString(),
+    createdByOrgMembershipId: asString(pluginItem.createdByOrgMembershipId),
     description: asString(pluginItem.description) ?? "Imported from a connected repository.",
     hooks,
     id: pluginId,
@@ -616,6 +714,7 @@ async function fetchResolvedPlugin(id: string): Promise<DenPlugin | null> {
     mcps,
     name,
     requiresProvider: "github",
+    programs,
     skills,
     slug: slugifyPluginName(name),
     source: marketplaces[0]
@@ -705,6 +804,37 @@ export function useArchivePlugin() {
     onSuccess: (pluginId) => {
       queryClient.removeQueries({ queryKey: pluginQueryKeys.detail(pluginId) });
       queryClient.invalidateQueries({ queryKey: pluginQueryKeys.list() });
+    },
+  });
+}
+
+export function useAttachProgramToPlugin(pluginId: string) {
+  const queryClient = useQueryClient();
+  const { runReauthableAction } = useOrgDashboard();
+
+  return useMutation({
+    mutationFn: async (programId: string) => {
+      await runReauthableAction("attach-program-to-plugin", async () => {
+        const { response, payload } = await requestJson(
+          `/v1/plugins/${encodeURIComponent(pluginId)}/config-objects`,
+          {
+            method: "POST",
+            body: JSON.stringify({ configObjectId: programId, membershipSource: "manual" }),
+          },
+          15000,
+        );
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Failed to add Program (${response.status}).`);
+        }
+      });
+      return programId;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: pluginQueryKeys.detail(pluginId) }),
+        queryClient.invalidateQueries({ queryKey: pluginQueryKeys.list() }),
+        queryClient.invalidateQueries({ queryKey: ["me", "library"] }),
+      ]);
     },
   });
 }

@@ -7,6 +7,7 @@ import {
   renderHighlightedMarkdownHtml,
   renderMarkdownHtml,
 } from "@/components/markdown/markdown-primitive";
+import { useSelectionStableValue } from "@/components/markdown/selection-stability";
 
 function MarkdownBlockInner(props: {
   text: string;
@@ -36,7 +37,9 @@ function MarkdownBlockInner(props: {
     };
   }, [props.streaming, props.text]);
 
-  const html = !props.streaming && highlightedHtml?.text === props.text ? highlightedHtml.html : syncHtml;
+  const candidateHtml = !props.streaming && highlightedHtml?.text === props.text ? highlightedHtml.html : syncHtml;
+  const html = useSelectionStableValue(rootRef, candidateHtml);
+  const stableInnerHtml = useMemo(() => ({ __html: html }), [html]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -46,15 +49,15 @@ function MarkdownBlockInner(props: {
       if (!rootRef.current || rootRef.current !== root) return;
       applyTextHighlights(root, props.highlightQuery ?? "");
     });
-  });
+  }, [html, props.highlightQuery]);
 
   if (!html) return null;
 
   return (
     <div
       ref={rootRef}
-      className="markdown-content max-w-none text-foreground"
-      dangerouslySetInnerHTML={{ __html: html }}
+      className="markdown-content max-w-none select-text text-foreground"
+      dangerouslySetInnerHTML={stableInnerHtml}
     />
   );
 }

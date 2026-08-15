@@ -1,5 +1,5 @@
 import { createDenTypeId } from "@openwork-ee/utils/typeid"
-import { afterAll, beforeAll, expect, test } from "bun:test"
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test"
 
 const singleOrgSlug = "invite-duplicates-test"
 const future = new Date(Date.now() + 1000 * 60 * 60)
@@ -52,6 +52,17 @@ let db: typeof import("../src/db.js").db | null = null
 let schema: typeof import("@openwork-ee/den-db/schema") | null = null
 let drizzle: typeof import("@openwork-ee/den-db/drizzle") | null = null
 let orgs: typeof import("../src/orgs.js") | null = null
+let restoreCacheDependencies: (() => void) | null = null
+const cacheDeleteCalls: string[] = []
+
+const redis = {
+  get: (_key: string) => Promise.resolve(null),
+  set: (_key: string, _value: string, _mode: "EX", _ttl: number) => Promise.resolve("OK"),
+  del: (key: string) => {
+    cacheDeleteCalls.push(key)
+    return Promise.resolve(1)
+  },
+}
 
 const userIds = [
   ownerUserId,
@@ -156,16 +167,18 @@ async function invitationStatus(invitationId: string) {
 
 beforeAll(async () => {
   seedRequiredEnv()
-  const [dbModule, schemaModule, drizzleModule, orgsModule] = await Promise.all([
+  const [dbModule, schemaModule, drizzleModule, orgsModule, cacheModule] = await Promise.all([
     import("../src/db.js"),
     import("@openwork-ee/den-db/schema"),
     import("@openwork-ee/den-db/drizzle"),
     import("../src/orgs.js"),
+    import("../src/cache.js"),
   ])
   db = dbModule.db
   schema = schemaModule
   drizzle = drizzleModule
   orgs = orgsModule
+  restoreCacheDependencies = cacheModule.setCacheDependenciesForTest({ redis })
 
   await cleanup()
 
@@ -194,11 +207,16 @@ beforeAll(async () => {
   ])
 })
 
+beforeEach(() => {
+  cacheDeleteCalls.length = 0
+})
+
 afterAll(async () => {
+  restoreCacheDependencies?.()
   await cleanup()
 })
 
-test("single-org bootstrap adopts a pending invitation instead of creating a duplicate member", async () => {
+test("single-org bootstrap adopts a pending invitation and invalidates the member cache", async () => {
   if (!orgs) {
     throw new Error("orgs module not initialized")
   }
@@ -233,9 +251,10 @@ test("single-org bootstrap adopts a pending invitation instead of creating a dup
   expect(relatedMembers[0]?.role).toBe("admin")
   expect(relatedMembers[0]?.joinedAt).toBeInstanceOf(Date)
   await expect(invitationStatus(invitationId)).resolves.toBe("accepted")
+  expect(cacheDeleteCalls).toEqual([`cache:org:members:${organizationId}`])
 })
 
-test("single-org bootstrap without a pending invitation keeps the default member insert behavior", async () => {
+test("single-org bootstrap invalidates the member cache after a default member insert", async () => {
   if (!orgs) {
     throw new Error("orgs module not initialized")
   }
@@ -255,6 +274,7 @@ test("single-org bootstrap without a pending invitation keeps the default member
   expect(rows).toHaveLength(1)
   expect(rows[0]?.role).toBe("member")
   expect(rows[0]?.inviteId).toBeNull()
+  expect(cacheDeleteCalls).toEqual([`cache:org:members:${organizationId}`])
 })
 
 test("reconcilePendingInvitationsForUser merges a raw SSO JIT membership with its pending invitation", async () => {

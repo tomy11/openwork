@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -121,6 +122,21 @@ describe("workspace kv store", () => {
       sqlite.close();
     }
     expect(await store.get(config, WORKSPACE_ID)).toEqual({});
+  });
+
+  test("reads leave a never-written runtime DB uncreated", async () => {
+    const { config, dbPath } = await tempWorkspace();
+    const store = recordStore("workspace_kv_read_never_creates");
+
+    expect(await store.get(config, WORKSPACE_ID)).toBeUndefined();
+    expect(await store.has(config, WORKSPACE_ID)).toBe(false);
+    expect(await readRuntimeOpencodeConfig(config, WORKSPACE_ID)).toEqual({});
+    expect(existsSync(dbPath)).toBe(false);
+
+    await store.set(config, WORKSPACE_ID, { enabled: true });
+
+    expect(existsSync(dbPath)).toBe(true);
+    expect(await store.get(config, WORKSPACE_ID)).toEqual({ enabled: true });
   });
 
   test("returns each migrated store's documented defaults for missing and malformed rows", async () => {

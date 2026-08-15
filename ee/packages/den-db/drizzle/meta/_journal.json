@@ -344,6 +344,125 @@
       "when": 1784998956602,
       "tag": "0049_third_caretaker",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "5",
+      "when": 1785678687496,
+      "tag": "0050_familiar_vindicator",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "5",
+      "when": 1785680281912,
+      "tag": "0051_petite_shen",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "5",
+      "when": 1785835576710,
+      "tag": "0052_jazzy_titanium_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "5",
+      "when": 1785844140621,
+      "tag": "0053_huge_albert_cleary",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "5",
+      "when": 1785881659570,
+      "tag": "0054_mighty_scarecrow",
+      "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "5",
+      "when": 1785920406990,
+      "tag": "0055_thick_chamber",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "5",
+      "when": 1786099419482,
+      "tag": "0056_oauth_provider_17_schema_sync",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "5",
+      "when": 1786274133419,
+      "tag": "0057_codemode_scripts",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "5",
+      "when": 1786368354826,
+      "tag": "0058_natural_steel_serpent",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "5",
+      "when": 1786373323261,
+      "tag": "0059_minor_queen_noir",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "5",
+      "when": 1786374191186,
+      "tag": "0060_light_ultimates",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "5",
+      "when": 1786522085194,
+      "tag": "0061_dapper_robbie_robertson",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "5",
+      "when": 1786628815884,
+      "tag": "0062_worried_ultron",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "5",
+      "when": 1786635052864,
+      "tag": "0063_curly_lyja",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "5",
+      "when": 1786637714916,
+      "tag": "0064_minor_blue_blade",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "5",
+      "when": 1786639498908,
+      "tag": "0065_cold_karnak",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "5",
+      "when": 1786661029943,
+      "tag": "0066_lying_rawhide_kid",
+      "breakpoints": true
     }
   ]
 }

@@ -136,9 +136,15 @@ export function DashboardOverviewScreen() {
           connections={connections}
           presets={presets}
           telegramConnected={Boolean(telegramConnection.data)}
+          filter=""
           onSelect={(id) => {
             router.push(`${getMcpConnectionsRoute(activeOrg?.slug)}?quickAdd=${encodeURIComponent(id)}`);
           }}
+          onManage={() => router.push(getMcpConnectionsRoute(activeOrg?.slug))}
+          onInstantAdd={(preset) => {
+            router.push(`${getMcpConnectionsRoute(activeOrg?.slug)}?quickAdd=${encodeURIComponent(preset.presetId)}`);
+          }}
+          instantAddingPresetId={null}
         />
       </section>
     </div>

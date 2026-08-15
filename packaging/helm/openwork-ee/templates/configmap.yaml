@@ -9,6 +9,10 @@ data:
   NODE_ENV: "production"
   OPENWORK_DEV_MODE: {{ .Values.config.openworkDevMode | quote }}
   DEN_API_NODE_OPTIONS: {{ .Values.config.denApiNodeOptions | quote }}
+  # SECURITY: Enables non-local redis:// DATABASE_REDIS_URL values only for
+  # trusted private networks. Keep false for public or cross-network Redis;
+  # prefer rediss:// whenever the provider supports TLS.
+  DATABASE_REDIS_ALLOW_INSECURE_INTERNAL: {{ ternary "1" "0" .Values.redis.allowInsecureInternal | quote }}
   DB_MODE: {{ .Values.config.databaseMode | quote }}
   DEN_ORG_MODE: {{ .Values.config.tenancy.mode | quote }}
   DEN_SINGLE_ORG_NAME: {{ .Values.config.tenancy.singleOrgName | quote }}
@@ -30,6 +34,8 @@ data:
   DEN_WEB_APP_HOSTS: {{ .Values.config.public.webAppHosts | quote }}
   DEN_BOOTSTRAP_ADMIN_EMAILS: {{ .Values.config.public.bootstrapAdminEmails | quote }}
   DEN_INSTALL_LINKS_GATING_ENABLED: {{ .Values.config.public.installLinksGatingEnabled | quote }}
+  DEN_GENERATED_ARTIFACT_VIEWS_ENABLED: {{ .Values.config.public.generatedArtifactViewsEnabled | quote }}
+  DEN_REMOTE_MCP_APPS_ENABLED: {{ .Values.config.public.remoteMcpAppsEnabled | quote }}
   DEN_CONNECT_LINK_MODE: {{ .Values.config.public.connectLinkMode | quote }}
   {{ if .Values.config.public.connectLinkKeyId }}
   DEN_CONNECT_LINK_KEY_ID: {{ .Values.config.public.connectLinkKeyId | quote }}

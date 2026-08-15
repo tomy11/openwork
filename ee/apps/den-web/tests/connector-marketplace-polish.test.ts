@@ -10,34 +10,36 @@ function readDashboardComponent(name: string) {
 }
 
 describe("connector and marketplace polish", () => {
-  test("labels Sources alpha and keeps Marketplace first and Connectors beta", () => {
+  test("labels Sources alpha and keeps Marketplace first with Connectors as MCPs", () => {
     const shell = readDashboardComponent("org-dashboard-shell.tsx");
-    const marketplaceIndex = shell.indexOf('{ href: getMarketplacesRoute(activeOrg.slug), label: "Marketplace" }');
-    const sourcesIndex = shell.indexOf('{ href: getIntegrationsRoute(activeOrg.slug), label: "Sources", badge: "Alpha" }');
-    const pluginsIndex = shell.indexOf('{ href: getPluginsRoute(activeOrg.slug), label: "Plugins" }');
-    const connectorsIndex = shell.indexOf('{ href: getMcpConnectionsRoute(activeOrg.slug), label: "Connectors", badge: "Beta" }');
+    const marketplaceIndex = shell.indexOf('getMarketplacesRoute(activeOrg.slug),\n          label: "Marketplace"');
+    const pluginsIndex = shell.indexOf('getPluginsRoute(activeOrg.slug),\n          label: "Plugin Directory"');
+    const connectorsIndex = shell.indexOf('getMcpConnectionsRoute(activeOrg.slug),\n          label: "Connectors"');
+    const sourcesIndex = shell.indexOf('getIntegrationsRoute(activeOrg.slug),\n          label: "Sources"');
 
     expect(marketplaceIndex).toBeGreaterThan(-1);
-    expect(marketplaceIndex).toBeLessThan(sourcesIndex);
-    expect(sourcesIndex).toBeLessThan(pluginsIndex);
+    expect(marketplaceIndex).toBeLessThan(pluginsIndex);
     expect(pluginsIndex).toBeLessThan(connectorsIndex);
+    expect(connectorsIndex).toBeLessThan(sourcesIndex);
+    expect(shell).toContain('badge: "MCPs"');
+    expect(shell).toContain('badge: "Alpha"');
   });
 
-  test("uses the shared page maturity badge to label Sources alpha", () => {
+  test("keeps the Sources page title free of maturity badges", () => {
     const screen = readDashboardComponent("integrations-screen.tsx");
 
     expect(screen).toContain('title="Sources"');
-    expect(screen).toContain('badgeLabel="Alpha"');
-    expect(screen).not.toContain('badgeLabel="Preview"');
+    expect(screen).not.toContain("badgeLabel");
   });
 
-  test("uses one Add MCP action and the approved connector copy", () => {
+  test("uses the smart connector bar and the approved connector copy", () => {
     const screen = readDashboardComponent("mcp-connections-screen.tsx");
 
     expect(screen).toContain('title="Connectors"');
-    expect(screen).toContain('badgeLabel="Beta"');
+    expect(screen).not.toContain("badgeLabel");
     expect(screen).toContain('description="Connectors is where you can add MCP servers that your whole team can use."');
-    expect(screen).toContain("Add MCP");
+    expect(screen).toContain('data-testid="connector-smart-bar"');
+    expect(screen).not.toMatch(/>\s*Add MCP\s*</);
     expect(screen).not.toContain("<ImportPluginConnectionDialog");
   });
 

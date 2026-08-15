@@ -4,6 +4,7 @@ import {
   attributeChatToolError,
   reconnectActionFromChatToolResult,
 } from "../src/components/tools/error-attribution"
+import { normalizeErrorText } from "../src/lib/error-text"
 
 function reconnectStatus(connectionId = "emc_knowledge", connectionName = "Knowledge Hub") {
   return {
@@ -95,6 +96,26 @@ describe("chat tool error attribution", () => {
 
   test("does not add attribution without useful evidence", () => {
     expect(attributeChatToolError("The tool failed.")).toBeNull()
+  })
+
+  test("bails out quickly on a pathological HTML page", () => {
+    const htmlError = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>${"x".repeat(1_024 * 1_024)}</body></html>`
+    const started = performance.now()
+
+    expect(attributeChatToolError(htmlError)).toBeNull()
+    expect(performance.now() - started).toBeLessThan(1_000)
+  })
+
+  test("keeps JSON-head attribution after surrounding error text is clamped", () => {
+    const diagnostic = JSON.stringify({
+      error: "connection_failed",
+      diagnostic: { code: "MCP_HTTP_504", httpStatus: 504 },
+    })
+    const unclamped = `MCP error: ${diagnostic} (tool execution failed)`
+    const clamped = normalizeErrorText(`${unclamped}\n${"provider detail ".repeat(1_000)}`, { cap: 512 }).display
+
+    expect(clamped).toContain(diagnostic)
+    expect(attributeChatToolError(clamped)).toEqual(attributeChatToolError(unclamped))
   })
 
   test("extracts a trusted reconnect action from a Cloud capability failure", () => {

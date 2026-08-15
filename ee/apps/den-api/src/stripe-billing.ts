@@ -611,7 +611,10 @@ export async function syncInferenceSubscriptionQuantityAfterMemberChange(input: 
   const quantity = Math.max(1, input.memberCount)
   await stripe().subscriptionItems.update(row.stripe_subscription_item_id, {
     quantity,
-    proration_behavior: "always_invoice",
+    // Accrue prorations onto the next monthly invoice instead of charging
+    // (and invoicing) every quantity change immediately. Customers get one
+    // consolidated invoice per cycle; add/remove churn nets out.
+    proration_behavior: "create_prorations",
   })
 }
 
@@ -628,7 +631,9 @@ export async function syncSeatSubscriptionQuantityAfterMemberChange(input: { org
   const seatCounts = await getOrganizationSeatBillingCounts(input)
   await stripe().subscriptionItems.update(row.stripe_subscription_item_id, {
     quantity: seatCounts.chargeable,
-    proration_behavior: "always_invoice",
+    // See syncInferenceSubscriptionQuantityAfterMemberChange: one invoice per
+    // cycle instead of a card charge per seat change.
+    proration_behavior: "create_prorations",
   })
 }
 

@@ -1,4 +1,5 @@
 import * as Sentry from "@sentry/node"
+import { shouldEmitSentryLog } from "./instrumentation.js"
 
 export const DEBUG_PAYLOAD_ORGANIZATION_ID = "org_01krnrcabhe8htwpbnsw0zk0bw"
 
@@ -314,6 +315,10 @@ function reportTags(report: InferenceRequestReport | InferenceHandledErrorReport
 
 export const sentryInferenceReporter: InferenceReporter = {
   request(report) {
+    if (!shouldEmitSentryLog("info")) {
+      return
+    }
+
     Sentry.logger.info("OpenWork chat completions inference request", {
       ...reportAttributes(report),
       payloadMode: report.payloadMode,
@@ -329,7 +334,9 @@ export const sentryInferenceReporter: InferenceReporter = {
       upstreamUrl: report.upstreamUrl,
       error: report.error,
     }
-    Sentry.logger.error("OpenWork inference handled error", attributes)
+    if (shouldEmitSentryLog("error")) {
+      Sentry.logger.error("OpenWork inference handled error", attributes)
+    }
     if (report.exception === undefined) {
       Sentry.captureMessage(`OpenWork inference handled error: ${report.reason}`, {
         level: "error",

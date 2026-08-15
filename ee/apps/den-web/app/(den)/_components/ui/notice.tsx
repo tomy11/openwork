@@ -1,4 +1,5 @@
 import { CircleAlert, Info, TriangleAlert, type LucideIcon } from "lucide-react";
+import type { ReactNode } from "react";
 import { WORKSPACE_REAUTH_SECURITY_MESSAGE } from "../../_lib/den-flow";
 
 export type DenNoticeTone = "error" | "info" | "warning" | "neutral";
@@ -26,12 +27,12 @@ export function DenNotice({
   tone,
   className,
 }: {
-  message: string;
+  message: ReactNode;
   tone?: DenNoticeTone;
   className?: string;
 }) {
   const resolvedTone =
-    tone ?? (ROUTINE_SECURITY_MESSAGES.has(message) ? "info" : "error");
+    tone ?? (typeof message === "string" && ROUTINE_SECURITY_MESSAGES.has(message) ? "info" : "error");
   const Icon = toneIcons[resolvedTone];
 
   return (

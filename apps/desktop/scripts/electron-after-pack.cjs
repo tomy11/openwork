@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const asar = require("@electron/asar");
 
 const computerUseHelperAppName = "OpenWork Computer Use.app";
 
@@ -44,6 +45,51 @@ function resolveMacAppPath(context) {
   return fallback ? path.join(context.appOutDir, fallback) : null;
 }
 
+function resolveAppAsarPath(context) {
+  if (context.electronPlatformName === "darwin") {
+    const appPath = resolveMacAppPath(context);
+    return appPath ? path.join(appPath, "Contents", "Resources", "app.asar") : null;
+  }
+  return path.join(context.appOutDir, "resources", "app.asar");
+}
+
+function verifyRuntimeDependencies(context) {
+  const appAsarPath = resolveAppAsarPath(context);
+  if (!appAsarPath || !fs.existsSync(appAsarPath)) {
+    throw new Error(`Missing packaged app.asar at ${appAsarPath || context.appOutDir}`);
+  }
+  const packagedFiles = new Set(asar.listPackage(appAsarPath));
+  const stagedNodeModules = path.resolve(__dirname, "..", ".electron-runtime", "node_modules");
+  const packageJsonPaths = [];
+  function visitNodeModules(nodeModulesPath, archivePrefix) {
+    for (const entry of fs.readdirSync(nodeModulesPath, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith("@")) {
+        visitNodeModules(path.join(nodeModulesPath, entry.name), `${archivePrefix}/${entry.name}`);
+        continue;
+      }
+      const packagePath = path.join(nodeModulesPath, entry.name);
+      if (!fs.existsSync(path.join(packagePath, "package.json"))) continue;
+      const packageJsonPath = `${archivePrefix}/${entry.name}/package.json`;
+      packageJsonPaths.push(packageJsonPath);
+      const nestedNodeModules = path.join(packagePath, "node_modules");
+      if (fs.existsSync(nestedNodeModules)) {
+        visitNodeModules(nestedNodeModules, `${archivePrefix}/${entry.name}/node_modules`);
+      }
+    }
+  }
+  if (!fs.existsSync(stagedNodeModules)) {
+    throw new Error(`Missing staged MCP runtime at ${stagedNodeModules}`);
+  }
+  visitNodeModules(stagedNodeModules, "/node_modules");
+  if (packageJsonPaths.length === 0) throw new Error("The staged MCP runtime is empty.");
+  for (const packageJsonPath of packageJsonPaths) {
+    if (!packagedFiles.has(packageJsonPath)) {
+      throw new Error(`Missing staged MCP runtime package from app.asar: ${packageJsonPath}`);
+    }
+  }
+}
+
 function signComputerUseHelper(context) {
   const appPath = resolveMacAppPath(context);
   if (!appPath) return;
@@ -84,6 +130,7 @@ function copyExecutableTargetToAlias(sidecarsDir, targetName, aliasName) {
 }
 
 async function afterPack(context) {
+  verifyRuntimeDependencies(context);
   const triple = targetTriple(context.electronPlatformName, context.arch);
   if (!triple) return;
 

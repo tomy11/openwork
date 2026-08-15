@@ -381,7 +381,6 @@ export function BackgroundAgentsScreen() {
   return (
     <DashboardPageTemplate
       icon={Bot}
-      badgeLabel="Alpha"
       title="Background Tasks"
       description="Run selected workflows in the background without asking each teammate to run them locally. Coming soon."
       colors={["#E9FFE0", "#3E9A1D", "#B3F750", "#51F0A3"]}

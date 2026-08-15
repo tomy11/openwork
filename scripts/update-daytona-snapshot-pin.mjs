@@ -182,12 +182,14 @@ export const USAGE = `Update or check the Daytona sandbox snapshot pin (DAYTONA_
 Usage:
   node scripts/update-daytona-snapshot-pin.mjs --env-group-id <id> --snapshot <name> [--dry-run]
   node scripts/update-daytona-snapshot-pin.mjs --env-group-id <id> --snapshot <name> --compare
+  node scripts/update-daytona-snapshot-pin.mjs --env-group-id <id> --read
 
 Options:
   --env-group-id <id>  Render env group holding DAYTONA_SNAPSHOT (e.g. evg-...).
   --snapshot <name>    Desired snapshot name (e.g. openwork-0.18.11).
   --dry-run            Print the request that would be sent; write nothing.
   --compare            Read-only drift check; exits non-zero when the pin differs.
+  --read               Print the current snapshot pin; write nothing.
   -h, --help           Show this help.
 
 Environment:
@@ -201,6 +203,7 @@ export function parseArgs(args) {
     snapshotName: "",
     dryRun: false,
     compare: false,
+    read: false,
     help: false,
   }
 
@@ -216,6 +219,8 @@ export function parseArgs(args) {
       options.dryRun = true
     } else if (argument === "--compare") {
       options.compare = true
+    } else if (argument === "--read") {
+      options.read = true
     } else if (argument === "--help" || argument === "-h") {
       options.help = true
     } else {
@@ -229,6 +234,9 @@ export function parseArgs(args) {
 
   if (options.dryRun && options.compare) {
     throw new Error("--dry-run and --compare cannot be used together.")
+  }
+  if (options.read && (options.dryRun || options.compare)) {
+    throw new Error("--read cannot be used with --dry-run or --compare.")
   }
 
   return options
@@ -244,6 +252,12 @@ export async function main(args, environment = process.env) {
     envGroupId: options.envGroupId,
     snapshotName: options.snapshotName,
     apiKey: environment.RENDER_API_KEY,
+  }
+
+  if (options.read) {
+    const current = await readDaytonaSnapshotPin(input)
+    console.log(current)
+    return { status: "read", current }
   }
 
   if (options.compare) {

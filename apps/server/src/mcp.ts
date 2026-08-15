@@ -4,7 +4,7 @@ import type { McpItem, ServerConfig } from "./types.js";
 import { sanitizeDiagnosticString } from "./diagnostic-sanitizer.js";
 import { readJsoncFile } from "./jsonc.js";
 import { opencodeConfigPath } from "./workspace-files.js";
-import { validateMcpConfig, validateMcpName } from "./validators.js";
+import { validateMcpConfig, validateMcpName, validateUserMcpName } from "./validators.js";
 import {
   readRuntimeOpencodeConfig,
   runtimeMcpMap,
@@ -665,7 +665,7 @@ export async function addMcp(
   name: string,
   config: Record<string, unknown>,
 ): Promise<{ action: "added" | "updated" }> {
-  validateMcpName(name);
+  validateUserMcpName(name);
   validateMcpConfig(config);
   const runtimeConfig = await readRuntimeOpencodeConfig(serverConfig, workspaceId);
   const mcpMap = { ...runtimeMcpMap(runtimeConfig) };

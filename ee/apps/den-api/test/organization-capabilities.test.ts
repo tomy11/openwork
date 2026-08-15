@@ -5,7 +5,7 @@ import {
   readOrganizationCapabilityOverrides,
 } from "../src/organization-capabilities.js"
 
-const defaultCapabilities = { installLinks: false, mcpConnections: false, cloud: false }
+const defaultCapabilities = { installLinks: false, mcpConnections: false, codemodeScripts: false, cloud: false }
 
 describe("normalizeOrganizationCapabilities", () => {
   test("defaults every capability to false when metadata is empty", () => {
@@ -16,14 +16,15 @@ describe("normalizeOrganizationCapabilities", () => {
   })
 
   test("reads an explicit opt-in from record metadata", () => {
-    expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: true } })).toEqual({ installLinks: true, mcpConnections: false, cloud: false })
-    expect(normalizeOrganizationCapabilities({ capabilities: { mcpConnections: true } })).toEqual({ installLinks: false, mcpConnections: true, cloud: false })
-    expect(normalizeOrganizationCapabilities({ capabilities: { cloud: true } })).toEqual({ installLinks: false, mcpConnections: false, cloud: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: true } })).toEqual({ ...defaultCapabilities, installLinks: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { mcpConnections: true } })).toEqual({ ...defaultCapabilities, mcpConnections: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { codemodeScripts: true } })).toEqual({ ...defaultCapabilities, codemodeScripts: true })
+    expect(normalizeOrganizationCapabilities({ capabilities: { cloud: true } })).toEqual({ ...defaultCapabilities, cloud: true })
     expect(normalizeOrganizationCapabilities({ capabilities: { installLinks: false, mcpConnections: false } })).toEqual(defaultCapabilities)
   })
 
   test("reads an explicit opt-in from JSON string metadata", () => {
-    expect(normalizeOrganizationCapabilities(JSON.stringify({ capabilities: { installLinks: true, mcpConnections: true, cloud: true } }))).toEqual({ installLinks: true, mcpConnections: true, cloud: true })
+    expect(normalizeOrganizationCapabilities(JSON.stringify({ capabilities: { installLinks: true, mcpConnections: true, codemodeScripts: true, cloud: true } }))).toEqual({ installLinks: true, mcpConnections: true, codemodeScripts: true, cloud: true })
   })
 
   test("treats anything but literal true as off", () => {
@@ -40,7 +41,7 @@ describe("normalizeOrganizationCapabilities", () => {
       plan: { tier: "enterprise", source: "manual" },
       capabilities: { installLinks: true, mcpConnections: true, cloud: true },
     }
-    expect(normalizeOrganizationCapabilities(metadata)).toEqual({ installLinks: true, mcpConnections: true, cloud: true })
+    expect(normalizeOrganizationCapabilities(metadata)).toEqual({ ...defaultCapabilities, installLinks: true, mcpConnections: true, cloud: true })
   })
 })
 

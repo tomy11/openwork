@@ -2,14 +2,22 @@ import { and, eq, gt, lt, lte } from "@openwork-ee/den-db/drizzle"
 import { AuthSessionTable, AuthUserTable } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto"
-import type { MiddlewareHandler } from "hono"
+import type { Context, MiddlewareHandler } from "hono"
+import { getSignedCookie } from "hono/cookie"
 import { DEN_API_KEY_HEADER, getApiKeySessionById, type DenApiKeySession } from "./api-keys.js"
-import { auth } from "./auth.js"
+import { cache, type CachedAuthSession } from "./cache.js"
 import { db } from "./db.js"
+import { env } from "./env.js"
 import { getDenSessionExpiresAt, getDenSessionRefreshCutoff } from "./session-lifetime.js"
 
-type AuthSessionLike = Awaited<ReturnType<typeof auth.api.getSession>>
-type AuthSessionValue = NonNullable<AuthSessionLike>
+type AuthSessionValue = {
+  user: CachedAuthSession["user"]
+  session: Omit<CachedAuthSession["session"], "id" | "token"> & {
+    id: string
+    token: string
+  }
+}
+type AuthSessionLike = AuthSessionValue | null
 
 export type AuthContextVariables = {
   user: AuthSessionValue["user"] | null
@@ -19,6 +27,12 @@ export type AuthContextVariables = {
 
 const INTERNAL_MCP_PRINCIPAL_HEADER = "x-den-internal-mcp-principal"
 const INTERNAL_MCP_PRINCIPAL_TTL_MS = 60_000
+export const INTERNAL_CAPABILITY_CONNECTOR_HEADER = "x-den-internal-capability-connector"
+const BETTER_AUTH_SESSION_COOKIE_NAMES = [
+  "better-auth.session_token",
+  "__Secure-better-auth.session_token",
+  "better-auth-session_token",
+] as const
 
 // Per-process secret used exclusively to sign the internal MCP principal header.
 // It is generated fresh at startup, lives only in memory, and is never derived
@@ -33,8 +47,30 @@ type InternalMcpPrincipal = {
   expiresAt: number
 }
 
+type InternalCapabilityConnector = InternalMcpPrincipal & {
+  connectorId: string
+}
+
+function isInternalCapabilityConnector(value: unknown): value is InternalCapabilityConnector {
+  return typeof value === "object"
+    && value !== null
+    && "userId" in value
+    && typeof value.userId === "string"
+    && "organizationId" in value
+    && typeof value.organizationId === "string"
+    && "connectorId" in value
+    && typeof value.connectorId === "string"
+    && value.connectorId.length > 0
+    && "expiresAt" in value
+    && typeof value.expiresAt === "number"
+}
+
 function signPrincipalPayload(payload: string) {
   return createHmac("sha256", INTERNAL_MCP_PRINCIPAL_SECRET).update(payload).digest("base64url")
+}
+
+function signCapabilityConnectorPayload(payload: string) {
+  return createHmac("sha256", INTERNAL_MCP_PRINCIPAL_SECRET).update(`capability-connector:${payload}`).digest("base64url")
 }
 
 function verifySignature(payload: string, signature: string) {
@@ -52,6 +88,21 @@ export function createInternalMcpPrincipalHeader(input: { userId: string; organi
   }
   const payload = Buffer.from(JSON.stringify(principal), "utf8").toString("base64url")
   return `${payload}.${signPrincipalPayload(payload)}`
+}
+
+export function createInternalCapabilityConnectorHeader(input: {
+  userId: string
+  organizationId: string
+  connectorId: string
+}) {
+  const connector: InternalCapabilityConnector = {
+    userId: normalizeDenTypeId("user", input.userId),
+    organizationId: normalizeDenTypeId("organization", input.organizationId),
+    connectorId: input.connectorId,
+    expiresAt: Date.now() + INTERNAL_MCP_PRINCIPAL_TTL_MS,
+  }
+  const payload = Buffer.from(JSON.stringify(connector), "utf8").toString("base64url")
+  return `${payload}.${signCapabilityConnectorPayload(payload)}`
 }
 
 // Verifies and parses the internal MCP principal header WITHOUT any DB access.
@@ -80,6 +131,32 @@ export function verifyInternalMcpPrincipalHeader(header: string | null): Interna
   }
 
   return parsed
+}
+
+export function readInternalCapabilityConnectorId(headers: Headers): string | null {
+  const principal = verifyInternalMcpPrincipalHeader(headers.get(INTERNAL_MCP_PRINCIPAL_HEADER))
+  const header = headers.get(INTERNAL_CAPABILITY_CONNECTOR_HEADER)
+  if (!principal || !header) return null
+  const [payload, signature] = header.split(".")
+  if (!payload || !signature) return null
+  const expected = signCapabilityConnectorPayload(payload)
+  const expectedBuffer = new Uint8Array(Buffer.from(expected))
+  const receivedBuffer = new Uint8Array(Buffer.from(signature))
+  if (expectedBuffer.length !== receivedBuffer.length || !timingSafeEqual(expectedBuffer, receivedBuffer)) return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"))
+  } catch {
+    return null
+  }
+  if (!isInternalCapabilityConnector(parsed)
+    || parsed.expiresAt < Date.now()
+    || parsed.userId !== principal.userId
+    || parsed.organizationId !== principal.organizationId) {
+    return null
+  }
+  return parsed.connectorId
 }
 
 async function getSessionFromInternalMcpPrincipal(headers: Headers): Promise<(AuthSessionValue & { activeOrganizationId: string }) | null> {
@@ -143,40 +220,7 @@ function readBearerToken(headers: Headers): string | null {
   return token || null
 }
 
-async function findActiveBearerSession(token: string, now: Date) {
-  const rows = await db
-    .select({
-      session: {
-        id: AuthSessionTable.id,
-        token: AuthSessionTable.token,
-        userId: AuthSessionTable.userId,
-        activeOrganizationId: AuthSessionTable.activeOrganizationId,
-        activeTeamId: AuthSessionTable.activeTeamId,
-        expiresAt: AuthSessionTable.expiresAt,
-        createdAt: AuthSessionTable.createdAt,
-        updatedAt: AuthSessionTable.updatedAt,
-        ipAddress: AuthSessionTable.ipAddress,
-        userAgent: AuthSessionTable.userAgent,
-      },
-      user: {
-        id: AuthUserTable.id,
-        name: AuthUserTable.name,
-        email: AuthUserTable.email,
-        emailVerified: AuthUserTable.emailVerified,
-        image: AuthUserTable.image,
-        createdAt: AuthUserTable.createdAt,
-        updatedAt: AuthUserTable.updatedAt,
-      },
-    })
-    .from(AuthSessionTable)
-    .innerJoin(AuthUserTable, eq(AuthSessionTable.userId, AuthUserTable.id))
-    .where(and(eq(AuthSessionTable.token, token), gt(AuthSessionTable.expiresAt, now)))
-    .limit(1)
-
-  return rows[0] ?? null
-}
-
-function bearerSessionValue(row: NonNullable<Awaited<ReturnType<typeof findActiveBearerSession>>>): AuthSessionValue {
+function bearerSessionValue(row: CachedAuthSession): AuthSessionValue {
   return {
     session: row.session,
     user: {
@@ -186,8 +230,8 @@ function bearerSessionValue(row: NonNullable<Awaited<ReturnType<typeof findActiv
   }
 }
 
-async function getSessionFromBearerToken(token: string): Promise<AuthSessionLike> {
-  const row = await findActiveBearerSession(token, new Date())
+async function getSessionFromToken(token: string): Promise<AuthSessionLike> {
+  const row = await cache.auth.session(token)
   if (!row) {
     return null
   }
@@ -212,8 +256,22 @@ async function getSessionFromBearerToken(token: string): Promise<AuthSessionLike
       lt(AuthSessionTable.expiresAt, nextExpiresAt),
     ))
 
-  const renewed = await findActiveBearerSession(token, now)
-  return renewed ? bearerSessionValue(renewed) : null
+  await cache.auth.deleteSession(token)
+  const renewed = await cache.auth.session(token)
+  if (!renewed) {
+    return null
+  }
+  return bearerSessionValue(renewed)
+}
+
+export async function readSignedSessionCookieToken(c: Context) {
+  for (const cookieName of BETTER_AUTH_SESSION_COOKIE_NAMES) {
+    const token = await getSignedCookie(c, env.betterAuthSecret, cookieName).catch(() => null)
+    if (typeof token === "string" && token.length > 0) {
+      return token
+    }
+  }
+  return null
 }
 
 export async function revokeBearerSession(headers: Headers) {
@@ -223,29 +281,21 @@ export async function revokeBearerSession(headers: Headers) {
   }
 
   await db.delete(AuthSessionTable).where(eq(AuthSessionTable.token, token))
+  await cache.auth.deleteSession(token)
   return true
 }
 
-export async function getRequestSession(headers: Headers): Promise<AuthSessionLike> {
+export async function getRequestSession(headers: Headers, context?: Context): Promise<AuthSessionLike> {
   const internalMcpSession = await getSessionFromInternalMcpPrincipal(headers)
   if (internalMcpSession) {
     return internalMcpSession
   }
 
-  let cookieSession: AuthSessionLike
-  try {
-    cookieSession = await auth.api.getSession({ headers })
-  } catch {
-    return null
-  }
-
-  if (cookieSession?.user?.id) {
-    return {
-      ...cookieSession,
-      user: {
-        ...cookieSession.user,
-        id: normalizeDenTypeId("user", cookieSession.user.id),
-      },
+  const cookieToken = context ? await readSignedSessionCookieToken(context) : null
+  if (cookieToken) {
+    const cookieSession = await getSessionFromToken(cookieToken)
+    if (cookieSession?.user?.id) {
+      return cookieSession
     }
   }
 
@@ -254,7 +304,7 @@ export async function getRequestSession(headers: Headers): Promise<AuthSessionLi
     return null
   }
 
-  return getSessionFromBearerToken(bearerToken)
+  return getSessionFromToken(bearerToken)
 }
 
 export function shouldSkipRequestSession(request: Request) {
@@ -273,7 +323,7 @@ async function getRequestApiKeySession(headers: Headers, session: AuthSessionLik
 export const sessionMiddleware: MiddlewareHandler<{ Variables: AuthContextVariables }> = async (c, next) => {
   const resolved = shouldSkipRequestSession(c.req.raw)
     ? null
-    : await getRequestSession(c.req.raw.headers)
+    : await getRequestSession(c.req.raw.headers, c)
   const apiKey = await getRequestApiKeySession(c.req.raw.headers, resolved)
   c.set("user", resolved?.user ?? null)
   c.set("session", resolved?.session ?? null)

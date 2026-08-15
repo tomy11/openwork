@@ -1,7 +1,7 @@
 import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js"
 import type { OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import type { Tool } from "@modelcontextprotocol/sdk/types.js"
+import type { Implementation, ServerCapabilities, Tool } from "@modelcontextprotocol/sdk/types.js"
 
 /** Epoch milliseconds. The package never reads a database or environment clock. */
 export type EnterpriseMcpEpochMs = number
@@ -156,6 +156,8 @@ export type EnterpriseMcpRequestPhase =
   | "mcp-initialize"
   | "mcp-tool-discovery"
   | "mcp-tool-execution"
+  | "mcp-resource-discovery"
+  | "mcp-resource-read"
   | "unknown-request"
 
 export type EnterpriseMcpOperationPhase =
@@ -166,6 +168,8 @@ export type EnterpriseMcpOperationPhase =
   | "protocol-initialize"
   | "tool-discovery"
   | "tool-execution"
+  | "resource-discovery"
+  | "resource-read"
   | "shutdown"
 
 export type EnterpriseMcpDiagnosticEvent =
@@ -177,6 +181,8 @@ export type EnterpriseMcpDiagnosticEvent =
     outcome: "started" | "succeeded" | "failed"
     durationMs?: number
     httpStatus?: number
+    responseBodyExcerpt?: string
+    protocolVersionFallback?: string
   }
   | {
     kind: "credential-invalidation"
@@ -241,7 +247,32 @@ export type EnterpriseMcpCallToolInput = {
   arguments: Record<string, unknown>
 }
 
+export type EnterpriseMcpListResourcesInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+}
+
+export type EnterpriseMcpReadResourceInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+  uri: string
+}
+
+export type EnterpriseMcpListResourceTemplatesInput = {
+  connection: EnterpriseMcpConnection
+  redirectUri: string
+}
+
 export type EnterpriseMcpToolResult = Awaited<ReturnType<Client["callTool"]>>
+export type EnterpriseMcpResourceList = Awaited<ReturnType<Client["listResources"]>>["resources"]
+export type EnterpriseMcpResourceTemplateList = Awaited<ReturnType<Client["listResourceTemplates"]>>["resourceTemplates"]
+export type EnterpriseMcpResourceResult = Awaited<ReturnType<Client["readResource"]>>
+
+export type EnterpriseMcpServerDescriptor = {
+  capabilities: ServerCapabilities
+  serverInfo?: Implementation
+  instructions?: string
+}
 
 export type EnterpriseMcpRequirementWarning = {
   code: string
@@ -330,4 +361,9 @@ export interface EnterpriseMcpClient {
   abandonAuthorization(input: EnterpriseMcpAbandonAuthorizationInput): Promise<void>
   listTools(input: EnterpriseMcpListToolsInput): Promise<Tool[]>
   callTool(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
+  callToolRaw(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
+  listResources(input: EnterpriseMcpListResourcesInput): Promise<EnterpriseMcpResourceList>
+  readResource(input: EnterpriseMcpReadResourceInput): Promise<EnterpriseMcpResourceResult>
+  listResourceTemplates(input: EnterpriseMcpListResourceTemplatesInput): Promise<EnterpriseMcpResourceTemplateList>
+  describeServer(input: EnterpriseMcpListResourcesInput): Promise<EnterpriseMcpServerDescriptor>
 }

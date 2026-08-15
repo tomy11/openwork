@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseExtensionsPath, parseSettingsPath } from "../src/react-app/shell/settings-route";
 import {
+  extensionsPathForRoute,
+  parseExtensionsPath,
+  parseSettingsPath,
+  settingsPathForRoute,
+} from "../src/react-app/shell/settings-route";
+import {
+  getSettingsTabLabel,
   getWorkspaceSettingsTabs,
   isSettingsTabActive,
 } from "../src/react-app/domains/settings/shell/settings-page";
@@ -15,7 +21,6 @@ describe("settings route parsing", () => {
     expect(parseExtensionsPath(pathname)).toEqual(route);
     expect(isSettingsTabActive(route.tab, "extensions")).toBe(true);
     expect(isSettingsTabActive(route.tab, "general")).toBe(false);
-    expect(getWorkspaceSettingsTabs()).toEqual(["preferences", "permissions", "advanced"]);
   });
 
   test("preserves top-level Extensions section and detail deep links", () => {
@@ -50,6 +55,20 @@ describe("settings route parsing", () => {
     expect(parseSettingsPath("/settings/extensions/plugins")).toEqual({ tab: "extensions", redirectPath: null, extensionsSection: "plugins" });
   });
 
+  test("round-trips Library state sections through settings and first-class route writers", () => {
+    const sections: Array<"needs-sign-in" | "needs-admin-setup"> = ["needs-sign-in", "needs-admin-setup"];
+    for (const section of sections) {
+      const settingsRoute = parseSettingsPath(`/settings/extensions/${section}`);
+      expect(settingsRoute).toEqual({ tab: "extensions", redirectPath: null, extensionsSection: section });
+      expect(settingsPathForRoute(settingsRoute)).toBe(`extensions/${section}`);
+      expect(parseSettingsPath(`/settings/${settingsPathForRoute(settingsRoute)}`)).toEqual(settingsRoute);
+
+      const extensionsRoute = parseExtensionsPath(`/extensions/${section}`);
+      expect(extensionsPathForRoute(extensionsRoute)).toBe(section);
+      expect(parseExtensionsPath(`/extensions/${extensionsPathForRoute(extensionsRoute)}`)).toEqual(extensionsRoute);
+    }
+  });
+
   test("redirects the old mcp section to the MCPs filter", () => {
     expect(parseSettingsPath("/settings/extensions/mcp")).toEqual({
       tab: "extensions",
@@ -76,5 +95,12 @@ describe("settings route parsing", () => {
       extensionsSection: "all",
       extensionDetailId: "skill:briefing",
     });
+  });
+});
+
+describe("settings navigation", () => {
+  test("includes Library in workspace settings", () => {
+    expect(getWorkspaceSettingsTabs()).toEqual(["preferences", "permissions", "extensions", "advanced"]);
+    expect(getSettingsTabLabel("extensions")).toBe("Library");
   });
 });

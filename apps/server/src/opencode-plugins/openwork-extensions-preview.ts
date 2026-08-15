@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { z } from "zod";
 import type { OpenworkAffordanceEffects } from "@openwork/types/openwork-affordance";
+import { automationProposalSchema } from "@openwork/types/automations";
 import {
   combineInstructionSections,
   composeAgentInstructions,
@@ -10,6 +11,7 @@ import {
 } from "./agent-instruction-compose.js";
 import {
   composeSkillAuthoringInstruction,
+  resolveOpenWorkAutomationInstruction,
   resolveOpenWorkConnectSkillInstruction,
   resolveOpenWorkExtensionDiscoveryInstruction,
   type OpenCodeContext,
@@ -188,9 +190,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const MAX_PRESERVED_MCP_APP_RESULT_BYTES = 1024 * 1024;
+
+function preserveMcpResult(output: unknown): void {
+  if (!isRecord(output) || !Array.isArray(output.content)) return;
+
+  const appResult = {
+    content: output.content,
+    ...(output.structuredContent !== undefined ? { structuredContent: output.structuredContent } : {}),
+    ...(isRecord(output._meta) ? { _meta: output._meta } : {}),
+  };
+  try {
+    if (new TextEncoder().encode(JSON.stringify(appResult)).byteLength > MAX_PRESERVED_MCP_APP_RESULT_BYTES) return;
+  } catch {
+    return;
+  }
+
+  const existing = isRecord(output.metadata) ? output.metadata : {};
+  output.metadata = {
+    ...existing,
+    // This is transport-only result preservation. Whether the completed tool
+    // owns an MCP App is determined later from its current tool definition.
+    openworkMcpApp: appResult,
+  };
+}
+
 const affordanceReadEffects: OpenworkAffordanceEffects = { data: "read", ui: "none", external: false };
 const affordanceWriteEffects: OpenworkAffordanceEffects = { data: "write", ui: "none", external: false };
 const affordanceExternalWriteEffects: OpenworkAffordanceEffects = { data: "write", ui: "none", external: true };
+// A proposal writes nothing anywhere: it is rendered for a person to act on.
+const affordanceProposalEffects: OpenworkAffordanceEffects = { data: "none", ui: "none", external: false };
 
 function affordanceResult(
   id: string,
@@ -451,6 +480,13 @@ async function executeOpenworkAffordance(
       request.id,
       await createOpenWorkSessions(request.args ?? {}, context),
       affordanceWriteEffects,
+    );
+  }
+  if (request.id === "automation.propose") {
+    return affordanceResult(
+      request.id,
+      proposeAutomation(request.args ?? {}),
+      affordanceProposalEffects,
     );
   }
   if (request.id === "extension.call") {
@@ -832,6 +868,24 @@ async function createOpenWorkSessions(rawArgs: unknown, context: OpenCodeContext
   };
 }
 
+/**
+ * Validates a proposed Automation and hands it back for the renderer to show.
+ *
+ * Deliberately does no I/O. Automations are active from the moment they exist,
+ * and the Den credential lives in the renderer, so an agent can describe an
+ * Automation but only a person can create one.
+ */
+function proposeAutomation(rawArgs: unknown): object {
+  const proposal = automationProposalSchema.parse(rawArgs);
+  return {
+    ok: true,
+    kind: "automation-proposal",
+    proposal,
+    created: false,
+    limitation: "This Desktop proposal creates Desktop placement and runs only while a signed-in desktop runner is connected. Use Web or Cloud Chat to create headless Cloud placement.",
+  };
+}
+
 async function postJson(path: string, body: ExtensionActionPayload | Record<string, unknown>): Promise<unknown> {
   const { url, token } = requireOpenWorkServer();
   const response = await fetch(url + path, {
@@ -865,14 +919,22 @@ export const OpenWorkExtensionsPreview = async (factoryInput?: unknown) => {
   const engineMcpStatusClient = readEngineMcpStatusClient(factoryInput);
   const engineMcpStatusDirectory = factoryContext.directory ?? factoryContext.worktree;
   return {
+  "tool.execute.after": async (_input: unknown, output: unknown) => {
+    // OpenCode 1.17.x keeps the text projection of an MCP result but drops
+    // structuredContent and result _meta before persisting the completed tool
+    // part. Preserve those standard fields in the existing metadata channel
+    // so OpenWork can host the UI without replaying the tool call.
+    preserveMcpResult(output);
+  },
   "experimental.chat.system.transform": async (input: unknown, output: { system: string[] }) => {
     const mergedInput = mergeTransformInputWithFactoryContext(input, factoryContext);
-    const [extensionInstruction, skillInstruction] = await Promise.all([
+    const [extensionInstruction, skillInstruction, automationInstruction] = await Promise.all([
       resolveOpenWorkExtensionDiscoveryInstruction(mergedInput, fetch, {
         client: engineMcpStatusClient,
         directory: engineMcpStatusDirectory,
       }),
       resolveOpenWorkConnectSkillInstruction(mergedInput, fetch),
+      resolveOpenWorkAutomationInstruction(mergedInput, fetch),
     ]);
     const skillAuthoring = composeSkillAuthoringInstruction(extensionInstruction);
     if (process.env.OPENWORK_DEV_MODE === "1") {
@@ -889,6 +951,7 @@ export const OpenWorkExtensionsPreview = async (factoryInput?: unknown) => {
       createInstructionSection("agent-surface", OPENWORK_AGENT_SURFACE_INSTRUCTION),
       createInstructionSection("skill-authoring", skillAuthoring.prompt),
       createInstructionSection("connect-skills", skillInstruction),
+      createInstructionSection("automations", automationInstruction),
       createInstructionSection("browser", OPENWORK_BROWSER_INSTRUCTION),
     );
     output.system.push(...composeAgentInstructions(sections));

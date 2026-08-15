@@ -37,6 +37,10 @@ export type McpDirectoryInfo = {
   type?: "remote" | "local";
   command?: string[];
   oauth: boolean;
+  /** Route OAuth through the local OpenWork gateway instead of delegating it to OpenCode. */
+  managedOAuth?: boolean;
+  /** Identifies MCP entries owned by OpenWork Connect instead of workspace configuration. */
+  managedBy?: "openwork-connect";
   oauthConfig?: {
     clientId?: string;
     clientSecret?: string;
@@ -169,6 +173,7 @@ export const MCP_QUICK_CONNECT: McpDirectoryInfo[] = [
     },
     type: "remote",
     oauth: true,
+    managedBy: "openwork-connect",
     kind: "mcp",
     iconSrc: "/openwork-mark.svg",
     // Auto-managed by the signed-in cloud reconciler (syncCloudControlMcp):

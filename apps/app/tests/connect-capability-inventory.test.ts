@@ -1,10 +1,41 @@
 import { describe, expect, test } from "bun:test";
 
+import { createDenClient } from "../src/app/lib/den";
 import {
   listAssignedConnectCapabilities,
 } from "../src/react-app/domains/session/surface/connect-capability-inventory";
 
 describe("assigned OpenWork Connect capability inventory", () => {
+  test("keeps assigned scripts returned by Den", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock: typeof fetch = async () => new Response(JSON.stringify({
+      items: [{
+        marketplaceId: "marketplace_1",
+        pluginId: "plugin_1",
+        configObjectId: "script_1",
+        objectType: "script",
+      }],
+    }), {
+      headers: { "Content-Type": "application/json" },
+      status: 200,
+    });
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: fetchMock });
+
+    try {
+      const capabilities = await createDenClient({ baseUrl: "http://den.local", token: "token" })
+        .listAssignedMarketplaceCapabilities("organization_1");
+
+      expect(capabilities).toEqual([{
+        marketplaceId: "marketplace_1",
+        pluginId: "plugin_1",
+        configObjectId: "script_1",
+        objectType: "script",
+      }]);
+    } finally {
+      Object.defineProperty(globalThis, "fetch", { configurable: true, value: originalFetch });
+    }
+  });
+
   test("returns active marketplace skills and MCPs with Connect provenance", async () => {
     const inventory = await listAssignedConnectCapabilities({
       organizationId: "org_1",

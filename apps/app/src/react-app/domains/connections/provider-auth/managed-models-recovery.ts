@@ -16,6 +16,24 @@ export function isOrganizationModelsEmpty(input: OrganizationModelsEmptyInput) {
   );
 }
 
+export type ManagedModelAvailabilityPendingInput = {
+  signedIn: boolean;
+  selectedModelUsesCloudProvider: boolean;
+  cloudProviderSyncReady: boolean;
+  openWorkModelsSyncing: boolean;
+};
+
+/** A cloud model can temporarily disappear while its provider is being reconciled. */
+export function isManagedModelAvailabilityPending(
+  input: ManagedModelAvailabilityPendingInput,
+) {
+  return (
+    input.signedIn &&
+    input.selectedModelUsesCloudProvider &&
+    (!input.cloudProviderSyncReady || input.openWorkModelsSyncing)
+  );
+}
+
 export type UnavailableModelPickerAutoOpenInput = {
   selectedModelUnavailableKey: string | null;
   signedIn: boolean;
@@ -55,14 +73,23 @@ export function shouldWaitForCloudProviderSyncBeforePolicyReconcile(
   );
 }
 
-export type OrganizationModelsRefreshInput = {
-  runCloudProviderSync: (reason: "manual") => Promise<unknown>;
-  refreshProviders: () => Promise<unknown> | unknown;
+export type OrganizationModelsRefreshInput<T> = {
+  runCloudProviderSync: (reason: OrganizationModelsRefreshReason) => Promise<unknown>;
+  refreshProviders: () => Promise<T> | T;
 };
 
-export async function refreshOrganizationModels(
-  input: OrganizationModelsRefreshInput,
-) {
-  await input.runCloudProviderSync("manual");
-  await input.refreshProviders();
+export type OrganizationModelsRefreshReason =
+  | "sign_in"
+  | "app_launch"
+  | "app_resume"
+  | "model_picker_open"
+  | "new_chat"
+  | "manual";
+
+export async function refreshOrganizationModels<T>(
+  input: OrganizationModelsRefreshInput<T>,
+  reason: OrganizationModelsRefreshReason = "manual",
+): Promise<T> {
+  await input.runCloudProviderSync(reason);
+  return input.refreshProviders();
 }

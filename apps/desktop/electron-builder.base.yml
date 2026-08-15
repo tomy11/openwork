@@ -7,7 +7,11 @@ files:
   - server/**/*
   - "!server/dist/opencode-plugins/**"
   - package.json
+  - from: .electron-runtime/node_modules
+    to: node_modules
 extraResources:
+  - from: .electron-runtime/openwork-sentry.json
+    to: openwork-sentry.json
   - from: ../app/dist
     to: app-dist
   - from: server/dist/opencode-plugins
@@ -82,6 +86,8 @@ linux:
 win:
   icon: resources/icons/icon.ico
   extraResources:
+    - from: resources/icons/icon.png
+      to: icons/icon.png
     - from: resources/sidecars
       to: sidecars
       filter:

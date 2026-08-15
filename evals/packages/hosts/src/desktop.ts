@@ -1,5 +1,6 @@
+import { readFile } from "node:fs/promises";
 import { timed } from "@openwork/timeline";
-import { attachSurface, describeAppState, isInteractive, probeAppState } from "@openwork/cdp";
+import { attachSurface, describeAppState, dumpScreenState, isInteractive, probeAppState } from "@openwork/cdp";
 import { resolveHost } from "./resolve.ts";
 import type { AppStateProbe, AppSurfaceState, AttachedSurface, Surface, SurfaceHandle } from "@openwork/cdp";
 import type { Host } from "./types.ts";
@@ -15,6 +16,19 @@ function messageText(error: unknown): string {
 
 function logCleanupError(name: string, error: unknown): void {
   console.warn(`[openwork/evals] Desktop ${name} cleanup failed: ${messageText(error)}`);
+}
+
+async function appendDesktopLog(error: unknown, handle: SurfaceHandle): Promise<unknown> {
+  const logPath = handle.meta?.log;
+  if (!logPath) return error;
+  try {
+    const log = await readFile(logPath, "utf8");
+    if (!log.trim()) return error;
+    const tail = log.trimEnd().split(/\r?\n/).slice(-40).join("\n");
+    return new Error(`${messageText(error)}\n\nLast 40 lines of ${logPath}:\n${tail}`, { cause: error });
+  } catch {
+    return error;
+  }
 }
 
 export interface DesktopOptions {
@@ -33,6 +47,8 @@ export interface DesktopOptions {
     requireSignin?: boolean;
   };
   env?: Record<string, string>;
+  /** Exact caller-owned Electron profile root, for restart scenarios. */
+  profileDir?: string;
   timeoutMs?: number;
 }
 
@@ -58,20 +74,21 @@ async function waitForReadiness(app: Surface, timeoutMs: number): Promise<AppRea
   const deadline = Date.now() + timeoutMs;
   // Short per-probe timeout so a briefly-busy renderer is retried rather than
   // consuming the whole readiness budget in one stuck call.
-  const probeTimeoutMs = Math.min(timeoutMs, 15_000);
   let last: AppStateProbe = { controlReady: false, transitional: null, surface: null, workspaceId: null, route: "", text: "" };
   while (Date.now() < deadline) {
     try {
-      last = await probeAppState(app.client, { timeoutMs: probeTimeoutMs });
+      last = await probeAppState(app.client, { timeoutMs: Math.min(8_000, Math.max(0, deadline - Date.now())) });
       if (isInteractive(last) && last.surface) {
         return { state: last.surface, workspaceId: last.workspaceId, route: last.route };
       }
     } catch {
       // Navigations briefly destroy the execution context while the app boots.
     }
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
   }
-  throw new Error(`OpenWork desktop did not become ready after ${timeoutMs}ms: ${describeAppState(last)}`);
+  throw new Error(
+    `OpenWork desktop did not become ready after ${timeoutMs}ms: ${describeAppState(last)} On screen: ${await dumpScreenState(app)}.`,
+  );
 }
 
 async function closeSpawnedSurface(
@@ -107,6 +124,7 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
     host = opts.host ?? await resolveHost();
     handle = await host.spawnElectron(opts.name ?? "spec", {
       profile: "fresh",
+      profileDir: opts.profileDir,
       bootstrap: opts.bootstrap,
       env: opts.env,
     });
@@ -135,8 +153,9 @@ export async function desktop(opts: DesktopOptions = {}): Promise<DesktopHandle>
       [Symbol.asyncDispose]: dispose,
     };
   } catch (error) {
+    const readinessError = attached ? await appendDesktopLog(error, handle) : error;
     await closeSpawnedSurface(attached, host, handle)
       .catch((cleanupError: unknown) => logCleanupError(handle.name, cleanupError));
-    throw error;
+    throw readinessError;
   }
 }

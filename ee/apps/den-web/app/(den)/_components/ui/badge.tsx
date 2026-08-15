@@ -1,12 +1,13 @@
 import type { ElementType, ReactNode } from "react";
 
-export type DenBadgeTone = "neutral" | "info" | "success" | "warning";
+export type DenBadgeTone = "neutral" | "info" | "success" | "warning" | "danger";
 
 const toneClasses: Record<DenBadgeTone, string> = {
   neutral: "bg-gray-100 text-gray-600",
   info: "bg-blue-50 text-blue-700",
   success: "bg-emerald-50 text-emerald-700",
   warning: "bg-amber-50 text-amber-700",
+  danger: "bg-red-50 text-red-600",
 };
 
 export type DenBadgeProps = {

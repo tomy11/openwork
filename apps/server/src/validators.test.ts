@@ -5,6 +5,7 @@ import {
   validateMcpName,
   validateSkillName,
   validateMcpConfig,
+  validateUserMcpName,
 } from "./validators.js";
 
 describe("sanitizeCommandName", () => {
@@ -68,6 +69,18 @@ describe("validateMcpName", () => {
     expect(() => validateMcpName("foo.bar")).toThrow();
     expect(() => validateMcpName("foo bar")).toThrow();
     expect(() => validateMcpName("foo/bar")).toThrow();
+  });
+});
+
+describe("validateUserMcpName", () => {
+  test("reserves the OpenWork Connect runtime name", () => {
+    expect(() => validateUserMcpName("openwork-cloud")).toThrow("reserved for OpenWork Connect");
+    expect(() => validateUserMcpName("OPENWORK-CLOUD")).toThrow("reserved for OpenWork Connect");
+    expect(() => validateUserMcpName("openwork-connect-1234")).toThrow("reserved for OpenWork Connect");
+  });
+
+  test("allows ordinary workspace MCP names", () => {
+    expect(() => validateUserMcpName("bigquery")).not.toThrow();
   });
 });
 

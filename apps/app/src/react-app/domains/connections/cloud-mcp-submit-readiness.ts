@@ -86,6 +86,12 @@ export const IDLE_CLOUD_MCP_SUBMISSION_GATE_STATE: CloudMcpSubmissionGateState =
   maxAttempts: 1 + CLOUD_MCP_SUBMISSION_RETRY_DELAYS_MS.length,
 };
 
+export function clearCloudMcpSubmissionFailure(
+  state: CloudMcpSubmissionGateState,
+): CloudMcpSubmissionGateState {
+  return state.status === "failed" ? IDLE_CLOUD_MCP_SUBMISSION_GATE_STATE : state;
+}
+
 function normalize(value: string | null | undefined): string {
   return value?.trim().replace(/\/+$/, "") ?? "";
 }
@@ -204,10 +210,9 @@ export async function resolveCloudMcpSubmissionAuth(
 }
 
 /**
- * A connected MCP transport and generic model tool-calling support are not
- * evidence that the selected provider/model received these two MCP tools.
- * The strongest honest proof available today is the provider/model-scoped
- * OpenCode experimental tool listing plus the direct MCP tools/list probe.
+ * Direct tools/list proves the Cloud tools are registered and reachable. The
+ * selected model must then either expose those exact tools through OpenCode's
+ * experimental listing or be verified as tool-capable by its provider.
  */
 export function assessCloudMcpSubmissionReadiness(input: {
   health: OpenworkCloudMcpHealth | null;
@@ -252,7 +257,41 @@ export function assessCloudMcpSubmissionReadiness(input: {
       }),
     };
   }
-  if (!projection.checked || projection.source !== "experimental_tool") {
+  if (!projection.checked) {
+    return {
+      ready: false,
+      health,
+      issue: genericSubmissionIssue({
+        code: "provider_tool_projection_unverified",
+        stage: "provider_projection",
+        message: "OpenWork could not read tool capability information for the selected provider and model.",
+        recommendedAction: "Retry, or check Settings → Advanced → Agent access diagnostics if the problem continues.",
+      }),
+    };
+  }
+  if (projection.source === "provider_capability") {
+    if (health.usableByCurrentModel === true) return { ready: true, health };
+    const modelMissing = projection.modelExists === false;
+    const toolCallingUnavailable = projection.toolCalling === false;
+    return {
+      ready: false,
+      health,
+      issue: genericSubmissionIssue({
+        code: modelMissing ? "provider_model_not_found" : "provider_tool_calling_unavailable",
+        stage: "provider_projection",
+        retryable: false,
+        message: modelMissing
+          ? "The selected model was not found for this provider."
+          : toolCallingUnavailable
+            ? "The selected model does not support tool calling."
+            : "OpenWork could not confirm that the selected model supports tool calling.",
+        recommendedAction: modelMissing
+          ? "Choose a model available from this provider, or check Settings → Advanced → Agent access diagnostics."
+          : "Choose a model with tool calling, or check Settings → Advanced → Agent access diagnostics.",
+      }),
+    };
+  }
+  if (projection.source !== "experimental_tool") {
     return {
       ready: false,
       health,
@@ -260,8 +299,8 @@ export function assessCloudMcpSubmissionReadiness(input: {
         code: "provider_tool_projection_unverified",
         stage: "provider_projection",
         retryable: false,
-        message: "The current engine cannot prove that connected service tools were injected into the selected model.",
-        recommendedAction: "Update or restart OpenWork, then Retry. Open Connect for detailed diagnostics.",
+        message: "OpenWork received an unsupported tool capability result for the selected provider and model.",
+        recommendedAction: "Choose a model with tool calling, or check Settings → Advanced → Agent access diagnostics.",
       }),
     };
   }

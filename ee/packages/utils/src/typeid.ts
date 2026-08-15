@@ -73,6 +73,14 @@ export const idTypesMapNameToPrefix = {
   daytonaSandbox: "dts",
   workerToken: "wkt",
   workerBundle: "wkb",
+  automation: "atm",
+  automationRevision: "atv",
+  automationRun: "atr",
+  automationRunEvent: "ate",
+  automationThread: "ath",
+  codemodeRun: "cmr",
+  artifactView: "arv",
+  artifactViewRevision: "avr",
   auditEvent: "aev",
   telemetryEvent: "tev",
   telemetrySessionDimension: "tsd",
@@ -90,6 +98,7 @@ export const idTypesMapNameToPrefix = {
   telegramUpdate: "tgu",
   memory: "mem",
   memctx: "mctx",
+  tempFile: "tmpf",
 } as const
 
 export const denTypeIdPrefixes = idTypesMapNameToPrefix

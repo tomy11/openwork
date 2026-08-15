@@ -395,7 +395,7 @@ function parseSentryConfig(env: ObservabilityEnv): SentryObservabilityConfig {
   return {
     dsn: validateSentryDsn(dsn),
     tracesSampleRate: sampleRate === undefined
-      ? 1
+      ? 0.01
       : parseUnitInterval(sampleRate, "SENTRY_TRACES_SAMPLE_RATE"),
   }
 }

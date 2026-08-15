@@ -53,7 +53,7 @@ const faqSchema = {
 export default async function Home() {
   const github = await getGithubData();
   const cal = process.env.NEXT_PUBLIC_CAL_URL || "/enterprise#book";
-  const userAgent = headers().get("user-agent")?.toLowerCase() || "";
+  const userAgent = (await headers()).get("user-agent")?.toLowerCase() || "";
   const isMobileVisitor = /android|iphone|ipad|ipod|mobile/.test(userAgent);
 
   return (
@@ -63,6 +63,8 @@ export default async function Home() {
       <LandingHome
         stars={github.stars}
         downloadHref={github.downloads.macos}
+        windowsDownloadHref={github.downloads.windows}
+        linuxDownloadHref={github.downloads.linux}
         callHref={cal}
         isMobileVisitor={isMobileVisitor}
       />

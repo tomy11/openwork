@@ -23,6 +23,7 @@ function writeToolPart(
   status: "pending" | "running" | "completed" | "error",
   input: Record<string, unknown>,
   overrides: Partial<Extract<Part, { type: "tool" }>> = {},
+  error = "failed",
 ): Extract<Part, { type: "tool" }> {
   const base = {
     id: "part-write",
@@ -55,7 +56,7 @@ function writeToolPart(
       state: {
         status: "error",
         input,
-        error: "failed",
+        error,
         time: { start: 1, end: 2 },
       },
     };
@@ -110,6 +111,40 @@ describe("tool part mapper", () => {
       input: { content: "hello", filePath: "src/a.ts" },
       output: "ok",
     });
+  });
+
+  test("preserves MCP Apps result metadata for the chat host", () => {
+    const part = writeToolPart("completed", { configObjectId: "script_1" });
+    if (part.state.status !== "completed") throw new Error("Expected completed fixture");
+    part.state.metadata = {
+      openworkMcpApp: {
+        content: [{ type: "text", text: "Fallback" }],
+        structuredContent: { schemaVersion: "1", value: 42 },
+        _meta: { receiptId: "receipt_1" },
+      },
+    };
+
+    expect(parseDynamicToolUIPart(part)?.callProviderMetadata).toEqual({
+      opencode: { partId: "part-write" },
+      openwork: {
+        mcpResult: {
+          content: [{ type: "text", text: "Fallback" }],
+          structuredContent: { schemaVersion: "1", value: 42 },
+          _meta: { receiptId: "receipt_1" },
+        },
+      },
+    });
+  });
+
+  test("summarizes and clamps huge HTML tool errors at ingestion", () => {
+    const htmlError = `<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>${"x".repeat(1_024 * 1_024)}</body></html>`;
+    const parsed = parseDynamicToolUIPart(writeToolPart("error", {}, {}, htmlError));
+
+    expect(parsed?.state).toBe("output-error");
+    if (!parsed || parsed.state !== "output-error") throw new Error("Expected a parsed tool error");
+    expect(parsed.errorText).toContain("Upstream returned an HTML error page (502 Bad Gateway)");
+    expect(parsed.errorText.length).toBeLessThanOrEqual(4_096);
+    expect(parsed.errorText.toLowerCase()).not.toContain("<!doctype");
   });
 
   test("maps env var request tools for rich chat rendering", () => {

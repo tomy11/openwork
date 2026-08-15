@@ -80,6 +80,8 @@ export function useDesktopRuntimeBoot() {
 
     void (async () => {
       try {
+        const evalFatalFailure = window.__OPENWORK_ELECTRON__?.meta?.evalFatalBootstrapFailure;
+        if (evalFatalFailure) throw new Error(evalFatalFailure);
         // On Electron specifically: if the previous Tauri install dropped
         // a migration snapshot, fold it into localStorage before any of
         // the boot code reads workspace preferences. Idempotent across
@@ -125,6 +127,7 @@ export function useDesktopRuntimeBoot() {
             return;
           }
           publishOpenworkServerInfo(serverInfo);
+          await window.__OPENWORK_ELECTRON__?.recovery?.recordHealthy?.().catch(() => undefined);
           markReady();
         };
 
@@ -185,6 +188,7 @@ export function useDesktopRuntimeBoot() {
             if (isOpenworkServerInfoLike(restarted)) serverInfo = restarted;
           }
           publishOpenworkServerInfo(serverInfo);
+          await window.__OPENWORK_ELECTRON__?.recovery?.recordHealthy?.().catch(() => undefined);
           markReady();
           return;
         }

@@ -27,6 +27,12 @@ export const KUBE_NAMESPACE = "default";
 export const KUBE_CHART_PATH = "packaging/helm/openwork-ee";
 const KUBE_FIXTURE_DIR = "evals/fixtures/kube";
 const KUBE_MYSQL_MANIFEST = `${KUBE_FIXTURE_DIR}/mysql.yaml`;
+const KUBE_EGRESS_KIND_CONFIG = `${KUBE_FIXTURE_DIR}/kind-config-egress.yaml`;
+const KUBE_NETPOL_DIR = `${KUBE_FIXTURE_DIR}/netpol`;
+const KUBE_DEFAULT_DENY_EGRESS_MANIFEST = `${KUBE_NETPOL_DIR}/default-deny-egress.yaml`;
+const KUBE_ALLOW_CORE_EGRESS_MANIFEST = `${KUBE_NETPOL_DIR}/allow-core.yaml`;
+const KUBE_ALLOW_EXTERNAL_EGRESS_TEMPLATE = `${KUBE_NETPOL_DIR}/allow-external.template.yaml`;
+const CALICO_MANIFEST_URL = "https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml";
 const DEN_API_SERVICE = `${KUBE_RELEASE_NAME}-den-api`;
 const DEN_WEB_SERVICE = `${KUBE_RELEASE_NAME}-den-web`;
 const MYSQL_DEPLOYMENT = "openwork-mysql";
@@ -47,6 +53,7 @@ const LOCAL_DEN_WEB_REPOSITORY = "openwork-den-web";
 type DenOrgMode = "single_org" | "multi_org";
 export type KubeProfile = "single-org" | "multi-org";
 export type KubeImageMode = "published" | "local";
+export type KubeEgressMode = "allowlist";
 
 export interface KubeExecResult {
   stdout: string;
@@ -123,6 +130,7 @@ export interface EnsureKubeStackOptions extends KubeLayerOptions {
   skipApp?: boolean;
   profile?: KubeProfile;
   images?: KubeImageMode;
+  egress?: KubeEgressMode;
 }
 
 export interface KubeStackDownOptions extends KubeLayerOptions {
@@ -434,8 +442,8 @@ export function helmImageSetArgs(plan: KubeImagePlan): string[] {
   return args;
 }
 
-export function helmUpgradeArgs(profile: KubeProfileConfig, plan: KubeImagePlan): string[] {
-  return [
+export function helmUpgradeArgs(profile: KubeProfileConfig, plan: KubeImagePlan, egress?: KubeEgressMode): string[] {
+  const args = [
     "upgrade",
     "--install",
     KUBE_RELEASE_NAME,
@@ -451,6 +459,13 @@ export function helmUpgradeArgs(profile: KubeProfileConfig, plan: KubeImagePlan)
     "--timeout",
     "10m",
   ];
+  if (egress === "allowlist") {
+    args.push(
+      "--set", "config.openworkDevMode=0",
+      "--set", "config.public.allowPrivateMcpUrls=1",
+    );
+  }
+  return args;
 }
 
 export function helmTestArgs(): string[] {
@@ -493,16 +508,61 @@ async function ensureRollout(runtime: KubeRuntime, deployment: string, timeout: 
   throw new Error(`kubectl rollout status deployment/${deployment} failed with exit ${result.code}:\n${detail}`);
 }
 
-export async function ensureCluster(options: KubeLayerOptions = {}): Promise<void> {
+async function waitForCalico(runtime: KubeRuntime): Promise<void> {
+  await checkedExec(
+    runtime,
+    "kubectl",
+    kubectlArgs(["rollout", "status", "daemonset/calico-node", "--namespace", "kube-system", "--timeout=300s"]),
+    "waiting for calico-node DaemonSet",
+    { timeoutMs: 360_000 },
+  );
+  await checkedExec(
+    runtime,
+    "kubectl",
+    kubectlArgs(["wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s"]),
+    "waiting for kind nodes to become Ready",
+    { timeoutMs: 360_000 },
+  );
+}
+
+export async function ensureCluster(options: KubeLayerOptions & { egress?: KubeEgressMode } = {}): Promise<void> {
   const runtime = createRuntime(options);
   const clusters = await runtime.run("kind", ["get", "clusters"], { timeoutMs: 60_000 });
-  if (clusters.code === 0 && clusters.stdout.split(/\r?\n/).map((line) => line.trim()).includes(KUBE_CLUSTER_NAME)) {
+  const exists = clusters.code === 0 && clusters.stdout.split(/\r?\n/).map((line) => line.trim()).includes(KUBE_CLUSTER_NAME);
+  if (exists) {
+    if (options.egress === "allowlist") {
+      const calico = await runtime.run(
+        "kubectl",
+        kubectlArgs(["get", "daemonset/calico-node", "--namespace", "kube-system"]),
+        { timeoutMs: 60_000 },
+      );
+      if (calico.code !== 0) {
+        throw new Error(
+          `Existing kind cluster ${KUBE_CLUSTER_NAME} does not have Calico, so it cannot enforce --kube-egress allowlist. Run --stack-down --delete-cluster first.`,
+        );
+      }
+    }
     runtime.log(`Reusing kind cluster ${KUBE_CLUSTER_NAME}`);
   } else {
     runtime.log(`Creating kind cluster ${KUBE_CLUSTER_NAME} (endpoints use kubectl port-forward)`);
-    await checkedExec(runtime, "kind", ["create", "cluster", "--name", KUBE_CLUSTER_NAME], `kind create cluster --name ${KUBE_CLUSTER_NAME}`, { timeoutMs: 300_000 });
+    const args = ["create", "cluster", "--name", KUBE_CLUSTER_NAME];
+    if (options.egress === "allowlist") args.push("--config", KUBE_EGRESS_KIND_CONFIG);
+    await checkedExec(runtime, "kind", args, `kind create cluster --name ${KUBE_CLUSTER_NAME}`, { timeoutMs: 300_000 });
   }
   await checkedExec(runtime, "kubectl", kubectlArgs(["cluster-info"]), `kubectl cluster-info --context ${KUBE_CONTEXT}`, { timeoutMs: 60_000 });
+  if (options.egress === "allowlist") {
+    if (!exists) {
+      runtime.log("Installing Calico v3.28.2");
+      await checkedExec(
+        runtime,
+        "kubectl",
+        kubectlArgs(["create", "-f", CALICO_MANIFEST_URL]),
+        "installing Calico",
+        { timeoutMs: 180_000 },
+      );
+    }
+    await waitForCalico(runtime);
+  }
 }
 
 export async function ensureImages(plan: KubeImagePlan, options: KubeLayerOptions = {}): Promise<void> {
@@ -524,9 +584,9 @@ export async function ensureDatabase(options: KubeLayerOptions = {}): Promise<vo
   await ensureRollout(runtime, MYSQL_DEPLOYMENT, "180s");
 }
 
-export async function ensureRelease(profile: KubeProfileConfig, plan: KubeImagePlan, options: KubeLayerOptions = {}): Promise<void> {
+export async function ensureRelease(profile: KubeProfileConfig, plan: KubeImagePlan, options: KubeLayerOptions & { egress?: KubeEgressMode } = {}): Promise<void> {
   const runtime = createRuntime(options);
-  const helmArgs = helmUpgradeArgs(profile, plan);
+  const helmArgs = helmUpgradeArgs(profile, plan, options.egress);
   const result = await runtime.run("helm", helmArgs, { timeoutMs: 12 * 60_000 });
   if (result.code !== 0) {
     const diagnostics = await collectTroubleshooting(runtime);
@@ -535,6 +595,118 @@ export async function ensureRelease(profile: KubeProfileConfig, plan: KubeImageP
   }
   await ensureRollout(runtime, `${KUBE_RELEASE_NAME}-den-api`, "300s");
   await ensureRollout(runtime, `${KUBE_RELEASE_NAME}-den-web`, "300s");
+}
+
+function parseIpv4(output: string): string | null {
+  for (const token of output.split(/\s+/)) {
+    const parts = token.split(".");
+    if (parts.length !== 4) continue;
+    if (parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)) return token;
+  }
+  return null;
+}
+
+async function resolveAllowedHostIp(runtime: KubeRuntime): Promise<string> {
+  const nodeLookup = await runtime.run("docker", [
+    "exec",
+    `${KUBE_CLUSTER_NAME}-control-plane`,
+    "sh",
+    "-lc",
+    "getent hosts host.docker.internal | awk '{print $1}'",
+  ], { timeoutMs: 30_000 });
+  const nodeIp = nodeLookup.code === 0 ? parseIpv4(nodeLookup.stdout) : null;
+  if (nodeIp) return nodeIp;
+
+  const gateway = await checkedExec(
+    runtime,
+    "docker",
+    ["network", "inspect", "kind", "--format", "{{range .IPAM.Config}}{{println .Gateway}}{{end}}"],
+    "resolving the kind Docker network gateway",
+    { timeoutMs: 30_000 },
+  );
+  const gatewayIp = parseIpv4(gateway.stdout);
+  if (!gatewayIp) throw new Error(`Could not resolve an IPv4 host gateway for kind. docker network inspect returned: ${gateway.stdout.trim() || "(empty)"}`);
+  return gatewayIp;
+}
+
+function mockPort(envName: string, defaultPort: number): number {
+  const raw = process.env[envName]?.trim();
+  if (!raw) return defaultPort;
+  if (!/^\d+$/.test(raw)) throw new Error(`${envName} must be an integer port, got ${raw}.`);
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error(`${envName} must be between 1 and 65535, got ${raw}.`);
+  return port;
+}
+
+async function ensureHostMockMasquerade(runtime: KubeRuntime, hostIp: string, port: number): Promise<void> {
+  const rule = [
+    "-t", "nat",
+    "-C", "POSTROUTING",
+    "-s", "192.168.0.0/16",
+    "-d", `${hostIp}/32`,
+    "-p", "tcp",
+    "--dport", String(port),
+    "-j", "MASQUERADE",
+  ];
+  const check = await runtime.run(
+    "docker",
+    ["exec", `${KUBE_CLUSTER_NAME}-control-plane`, "iptables", ...rule],
+    { timeoutMs: 30_000 },
+  );
+  if (check.code === 0) return;
+  rule[2] = "-I";
+  rule.splice(4, 0, "1");
+  await checkedExec(
+    runtime,
+    "docker",
+    ["exec", `${KUBE_CLUSTER_NAME}-control-plane`, "iptables", ...rule],
+    "installing kind host-mock masquerade rule",
+    { timeoutMs: 30_000 },
+  );
+}
+
+export async function ensureEgressAllowlist(options: KubeLayerOptions = {}): Promise<void> {
+  const runtime = createRuntime(options);
+  const allowedHostIp = await resolveAllowedHostIp(runtime);
+  const allowedMockPort = mockPort("OPENWORK_EVAL_KUBE_ALLOWED_MOCK_PORT", 4791);
+  const deniedMockPort = mockPort("OPENWORK_EVAL_KUBE_DENIED_MOCK_PORT", 4792);
+  const template = await readFile(resolve(REPO_ROOT, KUBE_ALLOW_EXTERNAL_EGRESS_TEMPLATE), "utf8");
+  const externalManifest = template
+    .replaceAll("${OPENWORK_EVAL_KUBE_ALLOWED_HOST_IP}", allowedHostIp)
+    .replaceAll("${OPENWORK_EVAL_KUBE_ALLOWED_MOCK_PORT}", String(allowedMockPort));
+  if (externalManifest.includes("${OPENWORK_EVAL_")) {
+    throw new Error(`Unresolved placeholder in ${KUBE_ALLOW_EXTERNAL_EGRESS_TEMPLATE}.`);
+  }
+  await ensureHostMockMasquerade(runtime, allowedHostIp, allowedMockPort);
+
+  await checkedExec(
+    runtime,
+    "kubectl",
+    kubectlArgs(["apply", "-f", KUBE_DEFAULT_DENY_EGRESS_MANIFEST]),
+    `kubectl apply -f ${KUBE_DEFAULT_DENY_EGRESS_MANIFEST}`,
+    { timeoutMs: 60_000 },
+  );
+  await checkedExec(
+    runtime,
+    "kubectl",
+    kubectlArgs(["apply", "-f", KUBE_ALLOW_CORE_EGRESS_MANIFEST]),
+    `kubectl apply -f ${KUBE_ALLOW_CORE_EGRESS_MANIFEST}`,
+    { timeoutMs: 60_000 },
+  );
+  await checkedExec(
+    runtime,
+    "kubectl",
+    kubectlArgs(["apply", "-f", "-"]),
+    `rendering and applying ${KUBE_ALLOW_EXTERNAL_EGRESS_TEMPLATE}`,
+    { input: externalManifest, timeoutMs: 60_000 },
+  );
+
+  process.env.OPENWORK_EVAL_KUBE_EGRESS_SPEC = "1";
+  process.env.OPENWORK_EVAL_KUBE_ALLOWED_HOST_IP = allowedHostIp;
+  process.env.OPENWORK_EVAL_KUBE_ALLOWED_MOCK_PORT = String(allowedMockPort);
+  process.env.OPENWORK_EVAL_KUBE_DENIED_MOCK_PORT = String(deniedMockPort);
+  runtime.log("Kube egress allowlist enforced for den-api and den-web");
+  runtime.log(`export OPENWORK_EVAL_KUBE_EGRESS_SPEC=1 OPENWORK_EVAL_KUBE_ALLOWED_HOST_IP=${allowedHostIp} OPENWORK_EVAL_KUBE_ALLOWED_MOCK_PORT=${allowedMockPort} OPENWORK_EVAL_KUBE_DENIED_MOCK_PORT=${deniedMockPort}`);
 }
 
 export async function kubeStackTest(options: KubeLayerOptions = {}): Promise<void> {
@@ -817,6 +989,9 @@ export async function ensureKubeStack(options: EnsureKubeStackOptions): Promise<
   });
   await phase(runtime, "database", () => ensureDatabase(options));
   await phase(runtime, "release", () => ensureRelease(profile, imagePlan, options));
+  if (options.egress === "allowlist") {
+    await phase(runtime, "egress-allowlist", () => ensureEgressAllowlist(options));
+  }
   await phase(runtime, "schema", () => ensureSchema(options));
   await phase(runtime, "helm-test", () => kubeStackTest(options));
   await phase(runtime, "seed", () => ensureSeed(options));

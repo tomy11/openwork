@@ -291,7 +291,6 @@ export function ApiKeysScreen() {
         return (
             <DashboardPageTemplate
                 icon={KeyRound}
-                badgeLabel="Admin"
                 title="API Keys"
                 description="Create named, rate-limited API keys for your own org membership and revoke any key in the workspace when needed."
                 colors={["#E6FFFA", "#0F766E", "#14B8A6", "#99F6E4"]}
@@ -306,7 +305,6 @@ export function ApiKeysScreen() {
     return (
         <DashboardPageTemplate
             icon={KeyRound}
-            badgeLabel="Admin"
             title="API Keys"
             description="Manage your OpenWork API keys."
             colors={["#E6FFFA", "#0F766E", "#14B8A6", "#99F6E4"]}

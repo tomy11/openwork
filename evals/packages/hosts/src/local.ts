@@ -55,6 +55,10 @@ interface KillLocalPidOptions {
   log?: (message: string) => void;
 }
 
+export interface FreePortOptions {
+  log?: (message: string) => void;
+}
+
 const CDP_WAIT_TIMEOUT_MS = 120_000;
 const KILL_GRACE_MS = 5_000;
 const POLL_INTERVAL_MS = 250;
@@ -146,13 +150,87 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
   }
 }
 
+function processGroupIsAlive(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ESRCH";
+  }
+}
+
 async function waitUntilGone(pid: number, timeoutMs: number): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (!pidIsAlive(pid)) return true;
+    if (!pidIsAlive(pid) && !processGroupIsAlive(pid)) return true;
     await delay(POLL_INTERVAL_MS);
   }
-  return !pidIsAlive(pid);
+  return !pidIsAlive(pid) && !processGroupIsAlive(pid);
+}
+
+function listeningPids(port: number): Promise<number[]> {
+  if (process.platform !== "darwin" && process.platform !== "linux") return Promise.resolve([]);
+  return new Promise((resolve, reject) => {
+    execFile(
+      "lsof",
+      [`-tiTCP:${port}`, "-sTCP:LISTEN"],
+      { encoding: "utf8", timeout: 5_000 },
+      (error, stdout) => {
+        const code = isRecord(error) ? error.code : null;
+        if (error && code !== 1 && code !== "1") {
+          reject(error);
+          return;
+        }
+        const pids = stdout.split(/\s+/)
+          .map((value) => Number(value))
+          .filter((value) => Number.isInteger(value) && value > 0);
+        resolve([...new Set(pids)]);
+      },
+    );
+  });
+}
+
+function processGroupId(pid: number): Promise<number | null> {
+  if (process.platform === "win32") return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 }, (error, stdout) => {
+      if (error) {
+        resolve(null);
+        return;
+      }
+      const pgid = Number(stdout.trim());
+      resolve(Number.isInteger(pgid) && pgid > 1 ? pgid : null);
+    });
+  });
+}
+
+/** Ensure no process is listening on a local TCP port, killing stale owners. */
+export async function freePort(port: number, { log }: FreePortOptions = {}): Promise<void> {
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    throw new Error(`Port must be an integer from 1 to 65535, got ${port}.`);
+  }
+  if (process.platform !== "darwin" && process.platform !== "linux") return;
+  const deadline = Date.now() + 10_000;
+  const currentProcessGroup = await processGroupId(process.pid);
+  let pids = await listeningPids(port);
+  while (pids.length > 0 && Date.now() < deadline) {
+    for (const pid of pids) {
+      if (pid === process.pid) throw new Error(`Refusing to kill the current process listening on port ${port}.`);
+      const listenerGroup = await processGroupId(pid);
+      const killPid = listenerGroup !== null && currentProcessGroup !== null && listenerGroup !== currentProcessGroup
+        ? listenerGroup
+        : pid;
+      const groupDetail = killPid === pid ? "" : ` in process group ${killPid}`;
+      log?.(`Port ${port} is still held by listener pid ${pid}${groupDetail}; stopping it.`);
+      await killLocalPid(killPid, { graceMs: 1_000, log });
+    }
+    await delay(100);
+    pids = await listeningPids(port);
+  }
+  if (pids.length > 0) {
+    throw new Error(`Port ${port} is still held by listener pid${pids.length === 1 ? "" : "s"} ${pids.join(", ")} after cleanup.`);
+  }
 }
 
 async function tailLines(filePath: string, lineCount: number): Promise<string> {
@@ -169,14 +247,18 @@ async function waitForPageTarget(cdpUrl: string, timeoutMs: number): Promise<voi
   let lastDetail = "no page targets yet";
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      await waitForCdp(cdpUrl, { timeoutMs: 1_000 });
-      const targets = await listTargets(cdpUrl);
+      await waitForCdp(cdpUrl, {
+        timeoutMs: Math.min(1_000, Math.max(0, timeoutMs - (Date.now() - startedAt))),
+      });
+      const targets = await listTargets(cdpUrl, {
+        timeoutMs: Math.min(1_000, Math.max(0, timeoutMs - (Date.now() - startedAt))),
+      });
       if (targets.some((target) => target.type === "page" && target.webSocketDebuggerUrl)) return;
       lastDetail = `saw ${targets.length} targets, none were pages`;
     } catch (error) {
       lastDetail = messageText(error);
     }
-    await delay(POLL_INTERVAL_MS);
+    await delay(Math.min(POLL_INTERVAL_MS, Math.max(0, timeoutMs - (Date.now() - startedAt))));
   }
   throw new Error(`Timed out after ${timeoutMs}ms waiting for a page target at ${cdpUrl} (${lastDetail})`);
 }
@@ -302,7 +384,7 @@ function isOrgMode(value: unknown): value is OrgMode {
 }
 
 async function runtimeOrgMode(webUrl: string): Promise<OrgMode> {
-  const response = await fetch(`${cleanUrl(webUrl)}/api/runtime-config`);
+  const response = await fetch(`${cleanUrl(webUrl)}/api/runtime-config`, { signal: AbortSignal.timeout(8_000) });
   if (!response.ok) throw new Error(`runtime-config returned HTTP ${response.status}`);
   const body: unknown = await response.json();
   if (isRecord(body) && isOrgMode(body.orgMode)) return body.orgMode;
@@ -404,24 +486,65 @@ export function resolveChromeBinary(env: NodeJS.ProcessEnv = process.env, platfo
 
 export async function killLocalPid(pid: number, options: KillLocalPidOptions = {}): Promise<boolean> {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  if (!pidIsAlive(pid)) return false;
+  const rootWasAlive = pidIsAlive(pid);
   const graceMs = options.graceMs ?? KILL_GRACE_MS;
   const sentGroup = signalProcessGroup(pid, "SIGINT");
-  const sentDirect = sentGroup ? true : signalPid(pid, "SIGINT");
+  const sentDirect = !sentGroup && rootWasAlive ? signalPid(pid, "SIGINT") : false;
+  if (!sentGroup && !sentDirect) return false;
   if (sentGroup) options.log?.(`Sent SIGINT to process group ${pid}`);
-  else if (sentDirect) options.log?.(`Sent SIGINT to pid ${pid}`);
+  if (sentDirect && !sentGroup) options.log?.(`Sent SIGINT to pid ${pid}`);
   if (await waitUntilGone(pid, graceMs)) return true;
   const killedGroup = signalProcessGroup(pid, "SIGKILL");
-  if (!killedGroup) signalPid(pid, "SIGKILL");
-  options.log?.(`Sent SIGKILL to pid ${pid}`);
+  const killedDirect = pidIsAlive(pid) ? signalPid(pid, "SIGKILL") : false;
+  if (killedGroup) options.log?.(`Sent SIGKILL to process group ${pid}`);
+  else if (killedDirect) options.log?.(`Sent SIGKILL to pid ${pid}`);
   await waitUntilGone(pid, 1_000);
   return true;
 }
 
+function explicitPort(url: string): number | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost" && parsed.hostname !== "::1") return null;
+    const port = Number(parsed.port);
+    return Number.isInteger(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+function surfacePorts(handle: SurfaceHandle): number[] {
+  const ports = new Set<number>();
+  const fromUrl = explicitPort(handle.cdpUrl);
+  if (fromUrl !== null) ports.add(fromUrl);
+  for (const value of [handle.meta?.vitePort, handle.meta?.cdpPort]) {
+    const port = Number(value);
+    if (Number.isInteger(port) && port > 0 && port <= 65_535) ports.add(port);
+  }
+  return [...ports];
+}
+
 export function createLocalHost(options: LocalHostOptions): DisposableHost {
-  const rootDir = options.rootDir ?? join(options.repoRoot, "evals", "results", ".surfaces");
+  // Surface profiles become the Electron process HOME. node-gyp/electron-rebuild
+  // generate Makefiles with unquoted include paths under that HOME, so a repo
+  // checkout on a path containing spaces breaks every native rebuild. The env
+  // override lets such machines park surfaces on a space-free path (e.g. /tmp).
+  const surfacesRootOverride = process.env.OPENWORK_EVAL_SURFACES_DIR?.trim();
+  const rootDir = options.rootDir ?? (surfacesRootOverride
+    ? surfacesRootOverride
+    : join(options.repoRoot, "evals", "results", ".surfaces"));
   const log = options.log;
   const spawnedSurfaces = new Set<SurfaceHandle>();
+  const denPorts = new Set<number>();
+
+  async function disposeKnownPorts(handle: SurfaceHandle): Promise<void> {
+    for (const port of surfacePorts(handle)) await freePort(port, { log });
+  }
+
+  async function disposeDenPorts(): Promise<void> {
+    for (const port of denPorts) await freePort(port, { log });
+    denPorts.clear();
+  }
 
 
 // Containers (Daytona sandboxes) cannot use Chromium's SUID sandbox: the helper
@@ -513,8 +636,12 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
       const spawnEnvForChecks: NodeJS.ProcessEnv = { ...process.env, ...opts.env };
       if (insideContainerSandbox() && (spawnEnvForChecks.DISPLAY ?? "").trim().length === 0) spawnEnvForChecks.DISPLAY = ":99";
       await ensureDisplay(options.repoRoot, spawnEnvForChecks, log);
-      await clearStaleSurfaces(rootDir, log);
-      const profileRoot = join(rootDir, `${sanitizeSlug(name)}-${timestamp()}-${process.pid}`);
+      if (opts.profileDir !== undefined && !opts.profileDir.trim()) {
+        throw new Error("Electron profileDir must not be empty.");
+      }
+      const callerOwnedProfile = opts.profileDir !== undefined;
+      if (!callerOwnedProfile) await clearStaleSurfaces(rootDir, log);
+      const profileRoot = opts.profileDir ?? join(rootDir, `${sanitizeSlug(name)}-${timestamp()}-${process.pid}`);
       const paths = electronProfilePaths(profileRoot);
       await ensureElectronProfile(paths);
       await writeBootstrap(paths.bootstrapPath, opts.bootstrap);
@@ -535,13 +662,27 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
       // segfaults instead of opening a window.
       if (insideContainerSandbox() && (env.DISPLAY ?? "").trim().length === 0) env.DISPLAY = ":99";
       const logPath = join(profileRoot, "electron.log");
-      log(`Starting local Electron surface ${name} (Vite :${port}, CDP :${cdpPort})...`);
-      const spawned = spawnDetached(pnpmCommand(), ["dev:electron"], { cwd: options.repoRoot, env, logPath });
+      const packagedBinary = process.env.OPENWORK_EVAL_ELECTRON_BINARY?.trim();
+      let spawned: SpawnedDetached;
+      if (packagedBinary) {
+        await access(packagedBinary, constants.F_OK).catch(() => {
+          throw new Error(`OPENWORK_EVAL_ELECTRON_BINARY does not exist: ${packagedBinary}`);
+        });
+        log(`Starting local Electron surface ${name} from packaged binary ${packagedBinary} (CDP :${cdpPort})...`);
+        spawned = spawnDetached(packagedBinary, [], { cwd: options.repoRoot, env, logPath });
+      } else {
+        log(`Starting local Electron surface ${name} (Vite :${port}, CDP :${cdpPort})...`);
+        spawned = spawnDetached(pnpmCommand(), ["dev:electron"], { cwd: options.repoRoot, env, logPath });
+      }
       const cdpUrl = `http://127.0.0.1:${cdpPort}`;
       try {
         await waitForCdpOrExit("Electron", cdpUrl, spawned, logPath, true);
       } catch (error) {
         await killLocalPid(spawned.pid, { log });
+        await Promise.all([
+          freePort(port, { log }),
+          freePort(cdpPort, { log }),
+        ]).catch((cleanupError: unknown) => log(`Electron port cleanup failed: ${messageText(cleanupError)}`));
         throw error;
       }
       const handle: SurfaceHandle = {
@@ -551,7 +692,7 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
         cdpUrl,
         pid: spawned.pid,
         profileDir: profileRoot,
-        meta: { vitePort: String(port), log: logPath },
+        meta: { vitePort: String(port), cdpPort: String(cdpPort), log: logPath, profileOwner: callerOwnedProfile ? "caller" : "host" },
       };
       spawnedSurfaces.add(handle);
       return handle;
@@ -574,6 +715,8 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
           await waitForCdpOrExit("Chrome", cdpUrl, spawned, logPath);
         } catch (error) {
           await killLocalPid(spawned.pid, { log });
+          await freePort(cdpPort, { log })
+            .catch((cleanupError: unknown) => log(`Chrome port cleanup failed: ${messageText(cleanupError)}`));
           throw error;
         }
         return spawned;
@@ -593,6 +736,7 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
         cdpUrl,
         pid: spawned.pid,
         profileDir,
+        meta: { cdpPort: String(cdpPort), log: logPath },
       };
       spawnedSurfaces.add(handle);
       return handle;
@@ -607,6 +751,10 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
       const webUrl = process.env.OPENWORK_EVAL_DEN_WEB_URL?.trim();
       if (!apiUrl || !webUrl) throw new Error("Den stack did not export OPENWORK_EVAL_DEN_API_URL / OPENWORK_EVAL_DEN_WEB_URL.");
       const orgMode = await runtimeOrgMode(webUrl);
+      const apiPort = explicitPort(apiUrl);
+      const webPort = explicitPort(webUrl);
+      if (apiPort !== null) denPorts.add(apiPort);
+      if (webPort !== null) denPorts.add(webPort);
       return { webUrl, apiUrl, orgMode, hostKind: "local" };
     },
 
@@ -623,7 +771,8 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
       if (handle.pid !== undefined) {
         await killLocalPid(handle.pid, { log });
       }
-      if (handle.kind === "electron" && handle.profileDir) {
+      await disposeKnownPorts(handle);
+      if (handle.kind === "electron" && handle.profileDir && handle.meta?.profileOwner !== "caller") {
         await rm(handle.profileDir, { recursive: true, force: true });
       }
       spawnedSurfaces.delete(handle);
@@ -631,6 +780,7 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
 
     async stop(): Promise<void> {
       for (const handle of [...spawnedSurfaces]) await this.disposeSurface(handle);
+      await disposeDenPorts();
     },
 
     async [Symbol.asyncDispose](): Promise<void> {
@@ -638,6 +788,8 @@ async function clearStaleSurfaces(rootDir: string, log: (message: string) => voi
         await this.disposeSurface(handle)
           .catch((error: unknown) => log(`Local surface ${handle.name} cleanup failed: ${messageText(error)}`));
       }
+      await disposeDenPorts()
+        .catch((error: unknown) => log(`Local Den port cleanup failed: ${messageText(error)}`));
     },
   };
 }

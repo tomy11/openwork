@@ -74,11 +74,14 @@ body{font:15px/1.5 system-ui,sans-serif;max-width:1100px;margin:40px auto;paddin
 function summaryLine(roll: PhotoRollRecord): string {
   const summary = roll.summary;
   const icon = summary.ok ? "✅" : summary.failedFrames > 0 || summary.failedExpectations > 0 ? "❌" : "⚪";
-  return `${icon} **${summary.passedFrames}/${summary.totalFrames} frames passed** · ${summary.failedFrames} failed · ${summary.unvalidatedFrames} unvalidated · ${summary.passedExpectations} expectations passed · ${summary.failedExpectations} failed`;
+  return `${icon} **${frameVerdict(roll)}** · ${summary.passedExpectations} expectations passed · ${summary.failedExpectations} failed`;
 }
 
 function renderFrame(frame: RollFrame, sequence: number, imageUrl: string | undefined): string {
-  const lines = [`### ${sequence}. ${html(frame.caption)}`, ""];
+  const fact = frame.fileName.length === 0;
+  const marker = fact ? (frame.ok === false ? "❌ FAIL FACT" : "ℹ️ FACT") : frame.ok === false ? "❌ FAIL" : frame.ok === true ? "✅ PASS" : "⚪ UNVALIDATED";
+  const lines = [`### ${marker} — ${sequence}. ${html(frame.caption)}`, ""];
+  if (fact && frame.description) lines.push(html(frame.description), "");
   if (frame.results.length === 0) {
     lines.push("- ⚪ **UNVALIDATED** — no visual expectations recorded.");
   } else {
@@ -92,6 +95,13 @@ function renderFrame(frame: RollFrame, sequence: number, imageUrl: string | unde
   return lines.join("\n");
 }
 
+function frameVerdict(roll: PhotoRollRecord): string {
+  const frames = roll.frames.filter((frame) => frame.fileName.length > 0);
+  const passed = frames.filter((frame) => frame.ok === true).length;
+  const facts = roll.frames.length - frames.length;
+  return `${passed}/${frames.length} frames passed${facts > 0 ? ` · ${facts} fact${facts === 1 ? "" : "s"}` : ""}`;
+}
+
 export function renderPrMarkdown(
   roll: PhotoRollRecord,
   urls: Record<string, string>,
@@ -100,7 +110,8 @@ export function renderPrMarkdown(
   const title = opts.title ?? `Photo roll — ${roll.name}`;
   const lines = [
     "<!-- photo-roll -->",
-    `## ${html(title)}`,
+    "<!-- fraimz -->",
+    `## ${html(title)} — ${frameVerdict(roll)}`,
     "",
     summaryLine(roll),
   ];

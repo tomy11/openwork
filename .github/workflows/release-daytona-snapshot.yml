@@ -98,51 +98,31 @@ jobs:
           echo "Verified tag: ${RELEASE_TAG}"
 
       - name: Checkout release source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           ref: refs/tags/${{ steps.resolve.outputs.release_tag }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.9.0
 
       - name: Install Daytona CLI
+        # Pinned and checksum-verified because the CLI runs with DAYTONA_API_KEY.
+        # Bump the version and SHA together (Warden MZE-XC3).
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          DAYTONA_CLI_VERSION: v0.190.0
+          DAYTONA_CLI_SHA256: 1d3591a1ea61d801696110e1b5f3381f223a56a623a882940d0d85742862fd44
         run: |
           set -euo pipefail
 
-          case "$(uname -s)" in
-            Linux) platform="linux" ;;
-            Darwin) platform="darwin" ;;
-            *)
-              echo "Unsupported OS: $(uname -s)" >&2
-              exit 1
-              ;;
-          esac
-
-          case "$(uname -m)" in
-            x86_64|amd64) arch="amd64" ;;
-            aarch64|arm64) arch="arm64" ;;
-            *)
-              echo "Unsupported architecture: $(uname -m)" >&2
-              exit 1
-              ;;
-          esac
-
-          asset_name="daytona-${platform}-${arch}"
-          install_dir="$HOME/.local/bin"
-          mkdir -p "$install_dir"
-
-          release_json="$(gh api repos/daytonaio/daytona/releases/latest)"
-          asset_url="$(python3 -c 'import json, sys; data = json.load(sys.stdin); name = sys.argv[1]; print(next(asset["browser_download_url"] for asset in data["assets"] if asset["name"] == name))' "$asset_name" <<<"$release_json")"
-
-          curl -fL "$asset_url" -o "$install_dir/daytona"
-          chmod +x "$install_dir/daytona"
-
-          echo "$install_dir" >> "$GITHUB_PATH"
-          export PATH="$install_dir:$PATH"
+          mkdir -p "$HOME/.local/bin"
+          curl -fL "https://github.com/daytonaio/daytona/releases/download/${DAYTONA_CLI_VERSION}/daytona-linux-amd64" \
+            -o "$HOME/.local/bin/daytona"
+          printf '%s  %s\n' "$DAYTONA_CLI_SHA256" "$HOME/.local/bin/daytona" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/daytona"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
 
           daytona version
 
@@ -170,9 +150,16 @@ jobs:
           echo "Publishing Daytona snapshot: ${DAYTONA_SNAPSHOT_NAME}"
           ./scripts/create-daytona-openwork-snapshot.sh "${DAYTONA_SNAPSHOT_NAME}"
 
+      - name: Note skipped release pin
+        if: vars.DAYTONA_PIN_CHANNEL == 'dev'
+        shell: bash
+        run: |
+          echo "::notice::web engine channel is 'dev'; release snapshot pin skipped (set DAYTONA_PIN_CHANNEL=release to restore release pinning)"
+          echo "Skipped release snapshot pin: web engine channel is \`dev\`. Set \`DAYTONA_PIN_CHANNEL=release\` to restore release pinning." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout snapshot pin automation
-        if: steps.publish.outcome == 'success' && vars.DAYTONA_CLOUD_ENV_GROUP_ID != ''
-        uses: actions/checkout@v6
+        if: steps.publish.outcome == 'success' && vars.DAYTONA_CLOUD_ENV_GROUP_ID != '' && vars.DAYTONA_PIN_CHANNEL != 'dev'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
           path: .snapshot-pin-automation
@@ -181,7 +168,7 @@ jobs:
 
       - name: Update production snapshot pin
         id: pin
-        if: steps.publish.outcome == 'success'
+        if: steps.publish.outcome == 'success' && vars.DAYTONA_PIN_CHANNEL != 'dev'
         shell: bash
         env:
           DAYTONA_CLOUD_ENV_GROUP_ID: ${{ vars.DAYTONA_CLOUD_ENV_GROUP_ID }}
@@ -219,7 +206,7 @@ jobs:
         # den-api keeps serving the previous DAYTONA_SNAPSHOT until it redeploys.
         # Without this the pin moves but `latestVersion` stays stale and no
         # sandbox ever recycles - observed for real on v0.18.11.
-        if: steps.pin.outcome == 'success'
+        if: steps.pin.outcome == 'success' && vars.DAYTONA_PIN_CHANNEL != 'dev'
         shell: bash
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}

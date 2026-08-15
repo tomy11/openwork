@@ -4,9 +4,18 @@ import { DenApiError } from "../src/app/lib/den";
 import {
   DEN_AUTH_SIGNAL_RETRY_COOLDOWN_MS,
   hasRetainedDenSession,
+  isDenSessionRestoring,
+  resolveDenActiveOrganizationWithRetry,
   resolveDenAuthFailureStatus,
   shouldRetryDenAuthOnSignal,
 } from "../src/react-app/domains/cloud/den-auth-provider";
+
+const resolvedOrganization = {
+  id: "org_invited",
+  name: "Invited organization",
+  slug: "invited-organization",
+  role: "member",
+};
 
 describe("resolveDenAuthFailureStatus", () => {
   test("only treats a confirmed unauthorized response as signed out", () => {
@@ -33,6 +42,25 @@ describe("retained Den sessions", () => {
     expect(hasRetainedDenSession("unavailable")).toBe(true);
     expect(hasRetainedDenSession("checking")).toBe(false);
     expect(hasRetainedDenSession("signed_out")).toBe(false);
+  });
+});
+
+describe("isDenSessionRestoring", () => {
+  test("a retained account without a confirmed user is restoring, never signed out", () => {
+    // Initial check in flight.
+    expect(isDenSessionRestoring({ status: "checking", hasUser: false })).toBe(true);
+    // First check failed transiently (local restart, control-plane blip)
+    // before any user was confirmed: the account UI must keep showing the
+    // restoring state instead of flashing "Sign in".
+    expect(isDenSessionRestoring({ status: "unavailable", hasUser: false })).toBe(true);
+  });
+
+  test("settled sessions are not restoring", () => {
+    expect(isDenSessionRestoring({ status: "signed_in", hasUser: true })).toBe(false);
+    // A previously confirmed user stays rendered as the account during an
+    // availability blip.
+    expect(isDenSessionRestoring({ status: "unavailable", hasUser: true })).toBe(false);
+    expect(isDenSessionRestoring({ status: "signed_out", hasUser: false })).toBe(false);
   });
 });
 
@@ -81,5 +109,28 @@ describe("shouldRetryDenAuthOnSignal", () => {
         lastAttemptAt: 1_000,
       }),
     ).toBe(true);
+  });
+});
+
+describe("resolveDenActiveOrganizationWithRetry", () => {
+  test("recovers when an invited organization is temporarily unavailable", async () => {
+    let attempts = 0;
+    const waits: number[] = [];
+
+    const result = await resolveDenActiveOrganizationWithRetry(
+      async () => {
+        attempts += 1;
+        if (attempts === 1) throw new TypeError("Failed to fetch");
+        if (attempts === 2) return null;
+        return resolvedOrganization;
+      },
+      async (delayMs) => {
+        waits.push(delayMs);
+      },
+    );
+
+    expect(result).toEqual(resolvedOrganization);
+    expect(attempts).toBe(3);
+    expect(waits).toEqual([200, 600]);
   });
 });

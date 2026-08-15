@@ -111,8 +111,7 @@ function normalizeRetryAfter(headers: Headers, status: number) {
   if (retryAfter) headers.set("Retry-After", retryAfter)
 }
 
-function normalizeOperationalHeaders(headers: Headers, path: string, status: number, requestId: string) {
-  headers.set("X-Request-Id", requestId)
+function normalizeOperationalHeaders(headers: Headers, path: string, status: number) {
   normalizeRetryAfter(headers, status)
   if (isOAuthOperationalPath(path)) {
     headers.set("Cache-Control", "no-store")
@@ -131,7 +130,7 @@ export async function normalizeOperationalErrorResponse(path: string, response: 
   }
 
   const headers = new Headers(response.headers)
-  normalizeOperationalHeaders(headers, path, response.status, requestId)
+  normalizeOperationalHeaders(headers, path, response.status)
   const jsonBody = await readOperationalJsonBody(path, response, headers)
   if (jsonBody === null) {
     return new Response(response.body, {
@@ -166,7 +165,6 @@ export function operationalErrorResponse(error: Error, c: Context, requestId: st
 
   const headers = new Headers({
     "content-type": "application/json",
-    "X-Request-Id": requestId,
   })
   if (isOAuthOperationalPath(path)) {
     headers.set("Cache-Control", "no-store")

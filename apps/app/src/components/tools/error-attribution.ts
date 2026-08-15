@@ -22,6 +22,8 @@ const OPENWORK_CLOUD_CAPABILITY_TOOLS = new Set([
   "openwork-cloud_execute_capability",
 ])
 
+const MAX_PARSED_RESULT_LENGTH = 64 * 1_024
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -29,6 +31,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseResultRecord(result: unknown): Record<string, unknown> | null {
   if (isRecord(result)) return result
   if (typeof result !== "string") return null
+  if (result.length > MAX_PARSED_RESULT_LENGTH) return null
 
   const trimmed = result.trim()
   const jsonStart = trimmed.indexOf("{")
@@ -112,6 +115,7 @@ export function reconnectActionFromChatToolResult(
 }
 
 export function attributeChatToolError(errorText: string): ToolErrorAttribution | null {
+  if (errorText.length > MAX_PARSED_RESULT_LENGTH) return null
   const diagnostic = diagnosticFromError(errorText)
   const code = stringValue(diagnostic, "code")
   const category = stringValue(diagnostic, "category")

@@ -15,6 +15,7 @@ export type ComposerSessionState = {
   attachments: ComposerAttachment[];
   mentions: Record<string, ComposerMentionKind>;
   pasteParts: ComposerPastePart[];
+  revertMessageId: string | null;
 };
 
 export type ComposerStateStore = {
@@ -27,6 +28,8 @@ export type ComposerStateStore = {
    */
   history: Record<string, string[]>;
   setDraft: (sessionId: string, draft: string) => void;
+  replaceDraft: (sessionId: string, draft: string, revertMessageId?: string | null) => void;
+  clearRevertTarget: (sessionId: string) => void;
   setAttachments: (sessionId: string, attachments: ComposerAttachment[]) => void;
   setMentions: (sessionId: string, mentions: Record<string, ComposerMentionKind>) => void;
   setPasteParts: (sessionId: string, pasteParts: ComposerPastePart[]) => void;
@@ -51,6 +54,7 @@ function createEmptyComposerSession(): ComposerSessionState {
     attachments: [],
     mentions: {},
     pasteParts: [],
+    revertMessageId: null,
   };
 }
 
@@ -64,8 +68,25 @@ export const useComposerStateStore = create<ComposerStateStore>((set) => ({
   history: {},
   setDraft: (sessionId, draft) => set((state) => {
     const current = getWritableSession(state, sessionId);
-    if (current.draft === draft) return state;
-    return { sessions: { ...state.sessions, [sessionId]: { ...current, draft } } };
+    const revertMessageId = draft ? current.revertMessageId : null;
+    if (current.draft === draft && current.revertMessageId === revertMessageId) return state;
+    return { sessions: { ...state.sessions, [sessionId]: { ...current, draft, revertMessageId } } };
+  }),
+  replaceDraft: (sessionId, draft, revertMessageId = null) => set((state) => {
+    const current = getWritableSession(state, sessionId);
+    const target = revertMessageId?.trim() || null;
+    if (current.draft === draft && current.revertMessageId === target) return state;
+    return { sessions: { ...state.sessions, [sessionId]: { ...current, draft, revertMessageId: target } } };
+  }),
+  clearRevertTarget: (sessionId) => set((state) => {
+    const current = state.sessions[sessionId];
+    if (!current?.revertMessageId) return state;
+    return {
+      sessions: {
+        ...state.sessions,
+        [sessionId]: { ...current, revertMessageId: null },
+      },
+    };
   }),
   setAttachments: (sessionId, attachments) => set((state) => {
     const current = getWritableSession(state, sessionId);
@@ -147,4 +168,8 @@ export function getComposerHistory(state: ComposerStateStore, sessionId: string)
 
 export function getComposerQueuedDrafts(state: ComposerStateStore, sessionId: string): ComposerDraft[] {
   return state.queuedDrafts[sessionId] ?? EMPTY_QUEUED_DRAFTS;
+}
+
+export function getComposerRevertMessageId(state: ComposerStateStore, sessionId: string): string | null {
+  return state.sessions[sessionId]?.revertMessageId ?? null;
 }

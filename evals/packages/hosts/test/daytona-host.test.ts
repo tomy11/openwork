@@ -115,8 +115,10 @@ test("spawnElectron starts isolated Daytona Electron profiles and writes bootstr
 
   assert.equal(first.meta?.cdpPort, "9825");
   assert.equal(second.meta?.cdpPort, "9830");
-  assert.match(first.profileDir ?? "", /\/workspace\/\.openwork-daytona\/profiles\/owner-\d{17}\/electron-userdata$/);
-  assert.match(second.profileDir ?? "", /\/workspace\/\.openwork-daytona\/profiles\/member-\d{17}\/electron-userdata$/);
+  assert.match(first.profileDir ?? "", /\/workspace\/\.openwork-daytona\/profiles\/owner-\d{17}$/);
+  assert.match(second.profileDir ?? "", /\/workspace\/\.openwork-daytona\/profiles\/member-\d{17}$/);
+  assert.equal(first.meta?.profileOwner, "host");
+  assert.equal(second.meta?.profileOwner, "host");
   assert.deepEqual(polled, ["https://cdp-9825.example.test/json/list", "https://cdp-9830.example.test/json/list"]);
 
   const bootstrapCall = findCall(calls, "base64 -d");
@@ -145,6 +147,35 @@ test("spawnElectron starts isolated Daytona Electron profiles and writes bootstr
   assert(secondStart.includes("OPENWORK_ELECTRON_USERDATA="));
   assert(secondStart.includes("/workspace/.openwork-daytona/profiles/member-"));
   assert(secondStart.includes("/electron-userdata"));
+});
+
+test("spawnElectron preserves a caller-owned Daytona profile while generated profiles are removed", async () => {
+  const { exec, calls } = createFakeExec((port) => `https://cdp-${port}.example.test`);
+  const host = createDaytonaHost({
+    sandboxId: "openwork-test-profile-owner",
+    log: () => undefined,
+    exec,
+    repoRoot: "/repo",
+    waitForCdp: successfulPolls(),
+  });
+  const suppliedProfile = "/tmp/reliable-recovery-profile";
+
+  const callerOwned = await host.spawnElectron("caller-owned", { profileDir: suppliedProfile });
+  const generated = await host.spawnElectron("generated");
+
+  assert.equal(callerOwned.profileDir, suppliedProfile);
+  assert.equal(callerOwned.meta?.profileOwner, "caller");
+  assert.equal(generated.meta?.profileOwner, "host");
+  const startCalls = calls.filter((call) => argsText(call).includes("/workspace/.devcontainer/start-daytona-electron.sh"));
+  assert(argsText(startCalls[0] ?? { args: [] }).includes(`${suppliedProfile}/electron-userdata`));
+
+  await host.disposeSurface(callerOwned);
+  await host.disposeSurface(generated);
+
+  const removalCalls = calls.filter((call) => argsText(call).includes("rm -rf"));
+  assert.equal(removalCalls.length, 1);
+  assert(argsText(removalCalls[0] ?? { args: [] }).includes(generated.profileDir ?? "missing-generated-profile"));
+  assert(!removalCalls.some((call) => argsText(call).includes(suppliedProfile)));
 });
 
 test("spawnElectron skips reserved Daytona CDP ports", async () => {
@@ -208,7 +239,7 @@ test("disposeSurface uses self-match-safe pkill patterns in separate execs", asy
     hostKind: "daytona",
     cdpUrl: "https://unused.example.test",
     sandboxId: "openwork-test-dispose",
-    profileDir: "/workspace/.openwork-daytona/profiles/desktop/electron-userdata",
+    profileDir: "/workspace/.openwork-daytona/profiles/desktop",
     meta: { cdpPort: "9825", log: "/tmp/electron-desktop.log" },
   };
   const chromeHandle: SurfaceHandle = {

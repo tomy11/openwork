@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, jest, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, setSystemTime, test } from "bun:test";
 
 type SyncInput = {
   workspaceId: string;
@@ -18,6 +18,7 @@ const subscriptions: Subscription[] = [];
 const {
   __disposeWorkspaceSessionSyncForTest,
   __hasWorkspaceSessionSyncForTest,
+  __setWorkspaceSessionSyncStatusFetcherForTest,
   __setWorkspaceSessionSyncSubscriptionFactoryForTest,
   ensureWorkspaceSessionSync,
 } = await import("../src/react-app/domains/session/sync/session-sync");
@@ -56,12 +57,17 @@ async function waitForSubscriptions(count: number) {
   expect(subscriptions).toHaveLength(count);
 }
 
+beforeEach(() => {
+  __setWorkspaceSessionSyncStatusFetcherForTest(async () => ({}));
+});
+
 afterEach(() => {
   jest.useRealTimers();
   for (const syncInput of inputs) __disposeWorkspaceSessionSyncForTest(syncInput);
   inputs.length = 0;
   subscriptions.length = 0;
   __setWorkspaceSessionSyncSubscriptionFactoryForTest(null);
+  __setWorkspaceSessionSyncStatusFetcherForTest(null);
   setSystemTime();
   Object.defineProperty(globalThis, "setInterval", {
     configurable: true,
