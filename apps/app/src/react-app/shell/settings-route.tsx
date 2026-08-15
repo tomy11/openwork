@@ -64,6 +64,7 @@ import { createProviderAuthStore, useProviderAuthStoreSnapshot } from "@/react-a
 import ProviderAuthModal from "@/react-app/domains/connections/provider-auth/provider-auth-modal";
 import ConnectionsModals from "@/react-app/domains/connections/modals";
 import { AiSettingsView } from "@/react-app/domains/settings/pages/ai-view";
+import { CustomProviderForm, type CustomProviderInput } from "@/react-app/domains/settings/pages/custom-provider-form";
 // Side-effect imports: register extension config components into the registry.
 import "@/react-app/domains/settings/ollama-config";
 import "@/react-app/domains/settings/computer-use-config";
@@ -519,6 +520,9 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [customProviderBusy, setCustomProviderBusy] = useState(false);
+  const [customProviderStatus, setCustomProviderStatus] = useState<string | null>(null);
+  const [customProviderError, setCustomProviderError] = useState<string | null>(null);
   const [userEnvKeys, setUserEnvKeys] = useState<string[]>([]);
   const [cloudMcpHealth, setCloudMcpHealth] = useState<OpenworkCloudMcpHealth | null>(null);
   const emptyWorkspaceDisplay = useMemo<WorkspaceDisplay>(
@@ -1194,6 +1198,45 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
       setVoiceBusy(false);
     }
   }, [openworkClient]);
+
+  const addCustomProvider = useCallback(async (input: CustomProviderInput) => {
+    setCustomProviderError(null);
+    setCustomProviderStatus(null);
+    if (!openworkClient) {
+      setCustomProviderError("OpenWork server is not connected.");
+      return;
+    }
+    setCustomProviderBusy(true);
+    try {
+      // Keep the secret out of the runtime config: store it as a user env var
+      // and reference it from options.apiKey, matching how the engine resolves
+      // credentials elsewhere.
+      let envVar: string | undefined;
+      if (input.apiKey) {
+        envVar = `${input.id.replace(/[^a-zA-Z0-9]/g, "_").toUpperCase()}_API_KEY`;
+        await openworkClient.upsertUserEnv([{ key: envVar, value: input.apiKey }]);
+        const savedVar = envVar;
+        setUserEnvKeys((current) => Array.from(new Set([...current, savedVar])));
+      }
+      await openworkClient.patchRuntimeProviders({
+        [input.id]: {
+          npm: "@ai-sdk/openai-compatible",
+          name: input.name,
+          options: {
+            baseURL: input.baseURL,
+            ...(envVar ? { apiKey: `{env:${envVar}}` } : {}),
+          },
+          models: Object.fromEntries(input.models.map((model) => [model, {}])),
+        },
+      });
+      await providerAuthStore.refreshProviders();
+      setCustomProviderStatus(`Added ${input.name} with ${input.models.length} model(s).`);
+    } catch (error) {
+      setCustomProviderError(describeRouteError(error));
+    } finally {
+      setCustomProviderBusy(false);
+    }
+  }, [openworkClient, providerAuthStore]);
 
   const testVoiceSession = useCallback(async () => {
     if (!openworkClient) {
@@ -2256,6 +2299,15 @@ function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
                 refreshCloudOrgProviders={providerAuthStore.refreshCloudOrgProviders}
                 runCloudProviderSync={providerAuthStore.runCloudProviderSync}
                 serverSync={providerAuthSnapshot.cloudProviderServerSync}
+              />
+            }
+            customProvidersView={
+              <CustomProviderForm
+                onAddCustomProvider={addCustomProvider}
+                busy={customProviderBusy}
+                status={customProviderStatus}
+                error={customProviderError}
+                disabled={!openworkClient}
               />
             }
           />

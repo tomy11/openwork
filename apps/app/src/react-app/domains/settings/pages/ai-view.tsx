@@ -52,6 +52,8 @@ export type AiSettingsViewProps = {
   onSubscribeOpenWorkModels?: () => void | Promise<void>;
   onDismissOpenWorkModels?: () => void | Promise<void>;
   cloudProvidersView?: ReactNode;
+  /** Local "add a custom / local provider" form, injected by the settings route. */
+  customProvidersView?: ReactNode;
 };
 
 function providerSourceLabel(source?: ConnectedProvider["source"]) {
@@ -270,6 +272,8 @@ export function AiSettingsView(props: AiSettingsViewProps) {
       </LayoutSection>
 
       {props.cloudProvidersView}
+
+      {props.customProvidersView}
 
     </LayoutStack>
   );

@@ -2372,6 +2372,25 @@ export function createOpenworkServerClient(options: { baseUrl: string; token?: s
         timeoutMs: timeouts.config,
       }),
 
+    // Add or remove entries in the engine's global runtime provider map. Each
+    // value is a full OpenCode provider definition (npm, options.baseURL,
+    // models, …); pass null for a provider id to delete it. This is the local,
+    // no-cloud path behind PATCH /runtime-config/providers.
+    patchRuntimeProviders: (provider: Record<string, unknown>) =>
+      requestJson<{
+        ok: true;
+        changed: boolean;
+        provider: Record<string, unknown>;
+        runtimeConfigPath: string;
+        reload: "reloaded" | "deferred" | "skipped";
+      }>(baseUrl, "/runtime-config/providers", {
+        token,
+        hostToken,
+        method: "PATCH",
+        body: { provider },
+        timeoutMs: timeouts.config,
+      }),
+
     createVoiceRealtimeSession: (payload?: { model?: string; sessionContext?: string }) =>
       requestJson<{
         ok: true;
